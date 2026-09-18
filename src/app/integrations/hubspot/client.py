@@ -1,7 +1,12 @@
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 from app.integrations.hubspot.context import TenantContext
-from app.integrations.hubspot.models import HubSpotRecord, HubSpotTaskCreate
+from app.integrations.hubspot.models import (
+    HubSpotContactsPage,
+    HubSpotRecord,
+    HubSpotTaskCreate,
+)
 
 
 class HubSpotClient(ABC):
@@ -18,6 +23,17 @@ class HubSpotClient(ABC):
 
     @abstractmethod
     async def get_ticket(self, context: TenantContext, ticket_id: str) -> HubSpotRecord: ...
+
+    @abstractmethod
+    async def list_contacts(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContactsPage: ...
 
     @abstractmethod
     async def create_task(
