@@ -12,7 +12,7 @@ def oauth_settings() -> Settings:
     return Settings(
         hubspot_client_id="test-client-id",
         hubspot_redirect_uri="http://testserver/api/v1/auth/hubspot/callback",
-        hubspot_oauth_scopes="oauth crm.objects.contacts.read",
+        hubspot_oauth_scopes="crm.objects.contacts.read crm.objects.contacts.write",
     )
 
 
@@ -35,7 +35,7 @@ def test_oauth_start_builds_tenant_bound_authorization_contract():
     assert query["redirect_uri"] == [
         "http://testserver/api/v1/auth/hubspot/callback"
     ]
-    assert query["scope"] == ["oauth crm.objects.contacts.read"]
+    assert query["scope"] == ["crm.objects.contacts.read crm.objects.contacts.write"]
     assert query["state"] == [state.nonce]
     assert state.tenant_id == "tenant-a"
 
@@ -52,7 +52,13 @@ def test_oauth_start_route_does_not_require_real_credentials():
 
 
 def test_oauth_start_returns_safe_configuration_error_when_unconfigured():
-    with TestClient(create_app(Settings())) as client:
+    unconfigured = Settings(
+        hubspot_client_id=None,
+        hubspot_client_secret=None,
+        hubspot_redirect_uri=None,
+        hubspot_token_encryption_key=None,
+    )
+    with TestClient(create_app(unconfigured)) as client:
         response = client.get("/api/v1/auth/hubspot/start?tenant_id=tenant-a")
 
     assert response.status_code == 503

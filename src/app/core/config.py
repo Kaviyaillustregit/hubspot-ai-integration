@@ -3,7 +3,7 @@ from functools import lru_cache
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_DATABASE_URL = "postgresql+asyncpg://app:app@localhost:5432/hubspot_ai"
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://app:app@postgres:5432/hubspot_ai"
 
 
 class Settings(BaseSettings):
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     hubspot_redirect_uri: str | None = None
     hubspot_oauth_authorize_url: str = "https://app.hubspot.com/oauth/authorize"
     hubspot_oauth_token_url: str = "https://api.hubapi.com/oauth/v3/token"
-    hubspot_oauth_scopes: str = "oauth"
+    hubspot_oauth_scopes: str = "crm.objects.contacts.read crm.objects.contacts.write"
     hubspot_token_encryption_key: str | None = None
     hubspot_webhook_secret: str | None = None
     tavily_api_key: str | None = None
