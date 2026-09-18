@@ -18,6 +18,17 @@ def oauth_settings() -> Settings:
     )
 
 
+def test_default_oauth_scopes_match_app_and_omit_implicit_oauth_scope():
+    settings = Settings(_env_file=None)
+
+    assert settings.hubspot_oauth_scopes.split() == [
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write",
+        "crm.objects.companies.read",
+    ]
+    assert "oauth" not in settings.hubspot_oauth_scopes.split()
+
+
 class FakeRouteOAuthService:
     async def start(self, tenant_id: str) -> tuple[str, str]:
         return "https://app.hubspot.com/oauth/authorize?state=test-state", "test-state"
