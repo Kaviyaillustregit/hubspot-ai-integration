@@ -6,9 +6,11 @@
     "name": "My Get Started app",
     "distribution": "private",
     "auth": {
-      "type": "static",
+      "type": "oauth",
+      "redirectUrls": [
+        "http://localhost:8000/api/v1/auth/hubspot/callback"
+      ],
       "requiredScopes": [
-        "oauth",
         "crm.objects.contacts.read",
         "crm.objects.contacts.write"
       ],
