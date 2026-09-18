@@ -57,12 +57,21 @@ async def test_association_client_uses_current_read_endpoint_and_maps_camel_case
             200,
             json=[
                 {
-                    "toObjectId": "company-1",
+                    "toObjectId": 347402103497,
                     "associationTypes": [
+                        {
+                            "category": "HUBSPOT_DEFINED",
+                            "typeId": 279,
+                            "label": None,
+                            "fromObjectTypeId": None,
+                            "toObjectTypeId": None,
+                        },
                         {
                             "category": "HUBSPOT_DEFINED",
                             "typeId": 1,
                             "label": "Primary",
+                            "fromObjectTypeId": None,
+                            "toObjectTypeId": None,
                         }
                     ],
                 }
@@ -78,9 +87,11 @@ async def test_association_client_uses_current_read_endpoint_and_maps_camel_case
         "method": "GET",
         "url": "https://api.hubapi.com/crm/objects/2026-09/contacts/contact-1/associations/companies",
     }
-    assert result.results[0].company_id == "company-1"
-    assert result.results[0].association_types[0].type_id == 1
-    assert result.results[0].association_types[0].label == "Primary"
+    assert result.results[0].company_id == "347402103497"
+    assert result.results[0].association_types[0].type_id == 279
+    assert result.results[0].association_types[0].label is None
+    assert result.results[0].association_types[1].type_id == 1
+    assert result.results[0].association_types[1].label == "Primary"
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class HubSpotRecord(BaseModel):
@@ -51,6 +51,11 @@ class HubSpotContactCompanyAssociation(BaseModel):
     association_types: list[HubSpotAssociationType] = Field(
         validation_alias="associationTypes"
     )
+
+    @field_validator("company_id", mode="before")
+    @classmethod
+    def normalize_company_id(cls, value: object) -> str:
+        return str(value)
 
 
 class HubSpotContactCompanyAssociations(BaseModel):
