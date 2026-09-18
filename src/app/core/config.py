@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     hubspot_client_id: str | None = None
     hubspot_client_secret: str | None = None
     hubspot_redirect_uri: str | None = None
+    hubspot_oauth_authorize_url: str = "https://app.hubspot.com/oauth/authorize"
+    hubspot_oauth_token_url: str = "https://api.hubapi.com/oauth/v3/token"
+    hubspot_oauth_scopes: str = "oauth"
+    hubspot_token_encryption_key: str | None = None
     hubspot_webhook_secret: str | None = None
     tavily_api_key: str | None = None
     bright_data_api_key: str | None = None
@@ -31,6 +35,14 @@ class Settings(BaseSettings):
         if self.app_env.lower() in {"staging", "production"}:
             if self.database_url == DEFAULT_DATABASE_URL:
                 raise ValueError("DATABASE_URL must be explicitly configured outside development")
+            if not self.hubspot_client_id or not self.hubspot_client_secret:
+                raise ValueError(
+                    "HubSpot OAuth client credentials are required outside development"
+                )
+            if not self.hubspot_redirect_uri:
+                raise ValueError("HUBSPOT_REDIRECT_URI is required outside development")
+            if not self.hubspot_token_encryption_key:
+                raise ValueError("HUBSPOT_TOKEN_ENCRYPTION_KEY is required outside development")
         return self
 
 

@@ -13,6 +13,7 @@ from app.api.errors import (
     validation_error_handler,
 )
 from app.api.health import router as health_router
+from app.api.hubspot_oauth import router as hubspot_oauth_router
 from app.api.middleware import RequestIdMiddleware
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
@@ -26,6 +27,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.settings = settings
         app.state.session_factory = session_factory
         app.state.db_engine = db_engine
         yield
@@ -38,4 +40,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.add_exception_handler(Exception, unhandled_error_handler)
     application.add_middleware(RequestIdMiddleware)
     application.include_router(health_router, prefix="/api/v1")
+    application.include_router(hubspot_oauth_router, prefix="/api/v1")
     return application

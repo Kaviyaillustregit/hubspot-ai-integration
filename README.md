@@ -25,7 +25,7 @@ Repositories + PostgreSQL transaction boundary
 - `src/app/api`: FastAPI application factory, versioned routes, request IDs, health checks.
 - `src/app/core`: environment-backed settings and structured logging context.
 - `src/app/db`: async SQLAlchemy engine/session setup, declarative base, and Alembic integration.
-- `src/app/services`: business workflows and audit authorization boundaries.
+- `src/app/services`: business workflows, audit authorization boundaries, and HubSpot OAuth orchestration.
 - `src/app/ai`: provider-neutral structured generation contracts and schema validation entry points.
 - `src/app/integrations`: isolated contracts for HubSpot, Slack, Tavily, Bright Data, and inbound webhooks.
 - `src/app/repositories`: application-owned persistence abstractions.
@@ -35,6 +35,8 @@ Repositories + PostgreSQL transaction boundary
 Business services must depend on the contracts in `ai`, `integrations`, and `repositories`, never on SDK-specific implementation details. Write tools and sensitive mutations should be introduced later with explicit authorization, human confirmation, idempotency, and audit records.
 
 Tenant-aware integration calls receive an explicit `TenantContext`; credentials are represented by a reference, not passed as global process configuration. Future mutations must pass through recommendation, authorization, approval, execution, and audit boundaries. Services own `UnitOfWork` transaction boundaries; repositories must not commit independently. Inbound webhook verification and idempotency are separate from outbound integration clients.
+
+The HubSpot OAuth slice uses HubSpot's current developer-platform `POST /oauth/v3/token` endpoint for authorization-code exchange and refresh. Access and refresh tokens are encrypted with the configured Fernet key before persistence, and OAuth state is stored and consumed once per tenant. Token exchange and refresh results never include token values in API responses.
 
 ## Local setup
 
