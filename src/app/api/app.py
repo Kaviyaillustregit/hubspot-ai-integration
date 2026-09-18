@@ -17,6 +17,7 @@ from app.api.hubspot_companies import router as hubspot_companies_router
 from app.api.hubspot_contacts import router as hubspot_contacts_router
 from app.api.hubspot_oauth import router as hubspot_oauth_router
 from app.api.middleware import RequestIdMiddleware
+from app.api.slack import router as slack_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import create_database
@@ -45,4 +46,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(hubspot_oauth_router, prefix="/api/v1")
     application.include_router(hubspot_contacts_router, prefix="/api/v1")
     application.include_router(hubspot_companies_router, prefix="/api/v1")
+    application.include_router(slack_router, prefix="/api/v1")
     return application

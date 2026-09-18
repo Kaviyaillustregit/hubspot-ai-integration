@@ -65,6 +65,35 @@ python -m pytest
 python -m compileall -q src tests migrations
 ```
 
+## Account Intelligence Slack slice
+
+Employees can ask the Slack app for a named account, for example: `Give me the latest
+information about Test AI Company.` The signed Slack Events request is acknowledged
+immediately, then the independent account-intelligence agent retrieves only the HubSpot
+company data it needs and posts a response. Responses always label CRM facts separately
+from AI observations/suggestions.
+
+Configure these server-side environment values (never commit them):
+
+```text
+SLACK_SIGNING_SECRET=...
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_TEAM_TENANT_MAP={"T01234567":"your-internal-tenant-id"}
+ANTHROPIC_API_KEY=...
+HUBSPOT_TOKEN_ENCRYPTION_KEY=...
+```
+
+`SLACK_TEAM_TENANT_MAP` is an application-owned workspace-to-tenant authorization map;
+the endpoint never accepts a tenant ID from a Slack message. The relevant tenant must
+already have completed the existing HubSpot OAuth connection flow.
+
+To run locally, expose the FastAPI server through an HTTPS tunnel, configure that public
+URL plus `/api/v1/slack/events` as the Slack app's Event Subscriptions Request URL, and
+subscribe to the bot message event appropriate for the channels where the app is used.
+Install the app with permission to post messages. Slack's URL verification challenge is
+handled by the same endpoint. Unit tests mock Slack, HubSpot, OAuth, and LLM boundaries;
+they do not prove a live Slack installation or provider credentials.
+
 ## Not implemented yet
 
 There is no client connection, OAuth flow, webhook receiver, Slack authentication, Claude request, research API call, CRM mutation, AI agent, queue, or feature workflow in this foundation. Before implementing those modules, decide the deployment target, tenant model, OAuth token storage/encryption strategy, queue choice, authorization model, retention policy, and approval UX for sensitive actions.

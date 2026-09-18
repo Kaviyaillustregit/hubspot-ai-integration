@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     tavily_api_key: str | None = None
     bright_data_api_key: str | None = None
     slack_signing_secret: str | None = None
+    slack_bot_token: str | None = None
+    # JSON object of Slack workspace IDs to application tenant IDs, e.g.
+    # {"T0123": "tenant-a"}. This is server-owned authorization data.
+    slack_team_tenant_map: str | None = None
 
     @model_validator(mode="after")
     def validate_deployment_settings(self) -> "Settings":
