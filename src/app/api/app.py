@@ -13,6 +13,7 @@ from app.api.errors import (
     validation_error_handler,
 )
 from app.api.health import router as health_router
+from app.api.hubspot_companies import router as hubspot_companies_router
 from app.api.hubspot_contacts import router as hubspot_contacts_router
 from app.api.hubspot_oauth import router as hubspot_oauth_router
 from app.api.middleware import RequestIdMiddleware
@@ -43,4 +44,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(health_router, prefix="/api/v1")
     application.include_router(hubspot_oauth_router, prefix="/api/v1")
     application.include_router(hubspot_contacts_router, prefix="/api/v1")
+    application.include_router(hubspot_companies_router, prefix="/api/v1")
     return application
