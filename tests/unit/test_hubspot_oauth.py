@@ -12,7 +12,9 @@ def oauth_settings() -> Settings:
     return Settings(
         hubspot_client_id="test-client-id",
         hubspot_redirect_uri="http://testserver/api/v1/auth/hubspot/callback",
-        hubspot_oauth_scopes="crm.objects.contacts.read crm.objects.contacts.write",
+        hubspot_oauth_scopes=(
+            "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read"
+        ),
     )
 
 
@@ -35,7 +37,9 @@ def test_oauth_start_builds_tenant_bound_authorization_contract():
     assert query["redirect_uri"] == [
         "http://testserver/api/v1/auth/hubspot/callback"
     ]
-    assert query["scope"] == ["crm.objects.contacts.read crm.objects.contacts.write"]
+    assert query["scope"] == [
+        "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read"
+    ]
     assert query["state"] == [state.nonce]
     assert state.tenant_id == "tenant-a"
 

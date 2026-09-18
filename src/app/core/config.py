@@ -23,7 +23,9 @@ class Settings(BaseSettings):
     hubspot_redirect_uri: str | None = None
     hubspot_oauth_authorize_url: str = "https://app.hubspot.com/oauth/authorize"
     hubspot_oauth_token_url: str = "https://api.hubapi.com/oauth/v3/token"
-    hubspot_oauth_scopes: str = "crm.objects.contacts.read crm.objects.contacts.write"
+    hubspot_oauth_scopes: str = (
+        "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read"
+    )
     hubspot_token_encryption_key: str | None = None
     hubspot_webhook_secret: str | None = None
     tavily_api_key: str | None = None
