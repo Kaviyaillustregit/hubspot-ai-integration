@@ -90,6 +90,52 @@ def test_invalid_slack_signature_is_rejected_without_agent_routing():
     assert "signing" not in response.text
 
 
+def test_url_verification_returns_slack_challenge_after_signature_validation():
+    app = create_app(Settings(slack_signing_secret="signing"))
+    body = json.dumps({"type": "url_verification", "challenge": "challenge-value"}).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/slack/events", content=body, headers=signed_headers(body, "signing")
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"challenge": "challenge-value"}
+
+
+def test_app_mention_routes_to_agent():
+    received: dict[str, str] = {}
+
+    class Agent:
+        async def respond(self, request):
+            received["tenant_id"] = request.tenant_id
+            return AgentResponse(status="ok", text="answer", request_id=request.request_id)
+
+    class Client:
+        async def post_message(self, channel: str, text: str) -> None:
+            received["channel"] = channel
+
+    app = create_app(
+        Settings(slack_signing_secret="signing", slack_team_tenant_map='{"T1":"tenant-a"}')
+    )
+    app.dependency_overrides[get_agent] = lambda: Agent()
+    app.dependency_overrides[get_slack_client] = lambda: Client()
+    payload = event_payload()
+    payload["event"] = {
+        "type": "app_mention",
+        "user": "U1",
+        "channel": "C1",
+        "text": "<@bot> Tell me about Test AI Company",
+    }
+    body = json.dumps(payload).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/slack/events", content=body, headers=signed_headers(body, "signing")
+        )
+
+    assert response.status_code == 200
+    assert received == {"tenant_id": "tenant-a", "channel": "C1"}
+
+
 def test_verifier_rejects_old_replay_requests():
     body = b"{}"
     timestamp = str(int(time.time()) - 301)

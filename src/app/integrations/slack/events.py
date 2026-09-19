@@ -60,10 +60,13 @@ class SlackMessage:
 
 
 def parse_message(payload: object) -> SlackMessage | None:
+    """Parse employee messages and app mentions from a verified Events API payload."""
     if not isinstance(payload, dict) or payload.get("type") != "event_callback":
         return None
     event = payload.get("event")
-    if not isinstance(event, dict) or event.get("type") != "message" or event.get("bot_id"):
+    if not isinstance(event, dict) or event.get("type") not in {"message", "app_mention"}:
+        return None
+    if event.get("type") == "message" and event.get("bot_id"):
         return None
     values = (
         payload.get("team_id"),

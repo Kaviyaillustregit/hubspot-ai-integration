@@ -15,9 +15,14 @@ class Settings(BaseSettings):
     database_url: str = DEFAULT_DATABASE_URL
     request_timeout_seconds: float = 15.0
     max_retries: int = 3
+    ai_provider: str = "anthropic"
 
+    openrouter_api_key: str | None = None
+    openrouter_model: str = "openrouter/free"
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-4-20250514"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.5-flash-lite"
     hubspot_client_id: str | None = None
     hubspot_client_secret: str | None = None
     hubspot_redirect_uri: str | None = None

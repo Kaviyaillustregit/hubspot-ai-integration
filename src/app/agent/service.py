@@ -53,7 +53,7 @@ class AccountIntelligenceAgent:
                 "hubspot_not_authorized", "HubSpot is not connected for this workspace.", request
             )
         except IntegrationError:
-            logger.error(
+            logger.exception(
                 "Account intelligence integration failed", extra={"tenant_id": request.tenant_id}
             )
             return self._safe(

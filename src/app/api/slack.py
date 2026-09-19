@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, Response
 from app.agent.schemas import AgentRequest
 from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
-from app.ai.anthropic import AnthropicProvider
+from app.ai.factory import create_ai_provider
 from app.ai.service import AIService
 from app.api.hubspot_companies import get_companies_service
 from app.api.hubspot_contacts import get_contacts_service
@@ -31,7 +31,7 @@ def get_agent(request: Request) -> AccountIntelligenceAgent:
         get_companies_service(request), get_contacts_service(request)
     )
     return AccountIntelligenceAgent(
-        tools, AIService(AnthropicProvider(request.app.state.settings))
+        tools, AIService(create_ai_provider(request.app.state.settings))
     )
 
 
