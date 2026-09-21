@@ -20,6 +20,10 @@ class HubSpotContact(BaseModel):
     id: str
     properties: dict[str, str | None]
 
+class HubSpotContactCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    properties: dict[str, str | None]
 
 class HubSpotContactsPage(BaseModel):
     results: list[HubSpotContact]

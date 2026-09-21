@@ -81,6 +81,15 @@ class HubSpotToolRegistry:
             if any(item.company_id == company_id for item in associations.results):
                 matches.append(contact)
         return matches
+    async def create_contact(
+        self,
+        tenant_id: str,
+        properties: dict[str, str | None],
+    ) -> HubSpotContact:
+        return await self._contacts.create_contact(
+            self._context(tenant_id),
+            properties=properties,
+        )
 
     @property
     def names(self) -> Sequence[str]:

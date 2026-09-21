@@ -21,6 +21,7 @@ from app.integrations.slack.events import (
     parse_message,
 )
 from app.integrations.slack.http_client import SlackWebApiClient
+from app.services.action_safety import ActionSafetyService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/slack", tags=["slack"])
@@ -28,10 +29,18 @@ router = APIRouter(prefix="/slack", tags=["slack"])
 
 def get_agent(request: Request) -> AccountIntelligenceAgent:
     tools = HubSpotToolRegistry(
-        get_companies_service(request), get_contacts_service(request)
+        get_companies_service(request),
+        get_contacts_service(request),
     )
+
+    action_safety = ActionSafetyService(
+        request.app.state.session_factory,
+    )
+
     return AccountIntelligenceAgent(
-        tools, AIService(create_ai_provider(request.app.state.settings))
+        tools,
+        AIService(create_ai_provider(request.app.state.settings)),
+        action_safety,
     )
 
 
@@ -49,6 +58,7 @@ async def _respond(
     parsed = parse_message(message)
     if parsed is None:
         return
+
     response = await agent.respond(
         AgentRequest(
             tenant_id=tenant_id,
@@ -57,44 +67,95 @@ async def _respond(
             request_id=request_id,
         )
     )
+
     try:
-        await client.post_message(parsed.channel_id, response.text)
+        await client.post_message(
+            parsed.channel_id,
+            response.text,
+        )
     except IntegrationError:
-        logger.error("Slack response delivery failed", extra={"tenant_id": tenant_id})
+        logger.error(
+            "Slack response delivery failed",
+            extra={"tenant_id": tenant_id},
+        )
 
 
 @router.post("/events")
 async def events(
     request: Request,
     background_tasks: BackgroundTasks,
-    agent: Annotated[AccountIntelligenceAgent, Depends(get_agent)],
-    client: Annotated[SlackClient, Depends(get_slack_client)],
+    agent: Annotated[
+        AccountIntelligenceAgent,
+        Depends(get_agent),
+    ],
+    client: Annotated[
+        SlackClient,
+        Depends(get_slack_client),
+    ],
 ) -> Response:
     settings = request.app.state.settings
+
     if not settings.slack_signing_secret:
         return JSONResponse(
-            {"code": "slack_not_configured", "message": "Slack is not configured"},
+            {
+                "code": "slack_not_configured",
+                "message": "Slack is not configured",
+            },
             status_code=503,
         )
+
     raw_body = await request.body()
+
     try:
-        SlackRequestVerifier(settings.slack_signing_secret).verify(
-            request.headers, raw_body
+        SlackRequestVerifier(
+            settings.slack_signing_secret
+        ).verify(
+            request.headers,
+            raw_body,
         )
         payload = json.loads(raw_body)
-    except (SlackSignatureError, json.JSONDecodeError):
+    except (
+        SlackSignatureError,
+        json.JSONDecodeError,
+    ):
         return JSONResponse(
-            {"code": "invalid_slack_request", "message": "Invalid Slack request"},
+            {
+                "code": "invalid_slack_request",
+                "message": "Invalid Slack request",
+            },
             status_code=401,
         )
-    if payload.get("type") == "url_verification" and isinstance(payload.get("challenge"), str):
-        return JSONResponse({"challenge": payload["challenge"]})
+
+    if (
+        payload.get("type") == "url_verification"
+        and isinstance(payload.get("challenge"), str)
+    ):
+        return JSONResponse(
+            {"challenge": payload["challenge"]}
+        )
+
     parsed = parse_message(payload)
+
     if parsed is None:
         return Response(status_code=200)
-    tenant_id = SlackTenantResolver(settings.slack_team_tenant_map).resolve(parsed.team_id)
+
+    tenant_id = SlackTenantResolver(
+        settings.slack_team_tenant_map
+    ).resolve(parsed.team_id)
+
     if tenant_id is None:
-        logger.warning("Slack workspace is not mapped to a tenant")
+        logger.warning(
+            "Slack workspace is not mapped to a tenant"
+        )
         return Response(status_code=200)
-    background_tasks.add_task(_respond, agent, client, payload, tenant_id, request.state.request_id)
+
+    background_tasks.add_task(
+        _respond,
+        agent,
+        client,
+        payload,
+        tenant_id,
+        request.state.request_id,
+    )
+
     return Response(status_code=200)
