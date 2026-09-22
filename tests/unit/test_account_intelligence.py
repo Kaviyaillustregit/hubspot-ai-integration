@@ -15,13 +15,24 @@ from app.integrations.hubspot.models import (
 
 
 class Provider:
-    async def generate_structured(self, *, prompt_name, variables, output_schema):
+    async def generate_structured(
+        self,
+        *,
+        prompt_name,
+        variables,
+        output_schema,
+    ):
         assert prompt_name == "account-intelligence/v1"
-        assert variables["crm"]["company"]["properties"]["name"] == "Test AI Company"
+        assert (
+            variables["crm"]["company"]["properties"]["name"]
+            == "Test AI Company"
+        )
 
         return output_schema(
             crm_facts=["Company: Test AI Company", "Industry: Software"],
-            observations=["Suggestion: confirm the next account touchpoint."],
+            observations=[
+                "Suggestion: confirm the next account touchpoint."
+            ],
         )
 
 
@@ -41,7 +52,11 @@ class Companies:
             ]
         )
 
-    async def get_contact_company_associations(self, context, contact_id):
+    async def get_contact_company_associations(
+        self,
+        context,
+        contact_id,
+    ):
         assert context.tenant_id == "tenant-a"
         return HubSpotContactCompanyAssociations(results=[])
 
@@ -77,7 +92,10 @@ def request(message: str) -> AgentRequest:
 async def test_company_lookup_tool_uses_tenant_context():
     tools = HubSpotToolRegistry(Companies(), Contacts())
 
-    company = await tools.find_company("tenant-a", "Test AI Company")
+    company = await tools.find_company(
+        "tenant-a",
+        "Test AI Company",
+    )
 
     assert company is not None
     assert company.id == "company-1"
@@ -87,7 +105,10 @@ async def test_company_lookup_tool_uses_tenant_context():
 async def test_contact_and_association_tools_are_read_only_and_tenant_scoped():
     tools = HubSpotToolRegistry(Companies(), Contacts())
 
-    contacts = await tools.find_contacts("tenant-a", "example.com")
+    contacts = await tools.find_contacts(
+        "tenant-a",
+        "example.com",
+    )
     associations = await tools.contact_company_associations(
         "tenant-a",
         "contact-1",
@@ -106,7 +127,9 @@ async def test_agent_selects_company_tool_and_returns_labeled_grounded_summary()
     )
 
     result = await agent.respond(
-        request("Give me the latest information about Test AI Company.")
+        request(
+            "Give me the latest information about Test AI Company."
+        )
     )
 
     assert result.status == "ok"
@@ -128,7 +151,9 @@ async def test_agent_returns_safe_company_not_found_response():
         ActionSafety(),  # type: ignore[arg-type]
     )
 
-    result = await agent.respond(request("Tell me about Missing Company"))
+    result = await agent.respond(
+        request("Tell me about Missing Company")
+    )
 
     assert result.status == "not_found"
     assert "couldn't find" in result.text
@@ -173,7 +198,10 @@ async def test_create_contact_tool_uses_tenant_context():
             properties: dict[str, str | None],
         ):
             assert context.tenant_id == "tenant-a"
-            assert context.credential_reference == "hubspot-oauth-token"
+            assert (
+                context.credential_reference
+                == "hubspot-oauth-token"
+            )
             assert properties == {
                 "email": "new@example.com",
                 "firstname": "New",
@@ -181,7 +209,10 @@ async def test_create_contact_tool_uses_tenant_context():
             }
             return expected_contact
 
-    tools = HubSpotToolRegistry(Companies(), CreateContacts())
+    tools = HubSpotToolRegistry(
+        Companies(),
+        CreateContacts(),
+    )
 
     contact = await tools.create_contact(
         "tenant-a",
@@ -197,7 +228,8 @@ async def test_create_contact_tool_uses_tenant_context():
 
 def test_agent_detects_contact_create_intent():
     intent = AccountIntelligenceAgent._contact_create_intent(
-        "Create a contact firstname Arun lastname Kumar email arun@test.com"
+        "Create a contact firstname Arun lastname Kumar "
+        "email arun@test.com"
     )
 
     assert intent is not None
@@ -212,6 +244,8 @@ def test_agent_returns_no_contact_create_intent_without_email():
     )
 
     assert intent is None
+
+
 @pytest.mark.asyncio
 async def test_agent_creates_pending_action_for_contact_creation():
     created: dict[str, object] = {}
@@ -263,12 +297,14 @@ async def test_agent_creates_pending_action_for_contact_creation():
         },
     }
 
+
 def test_agent_extracts_confirmation_action_id():
     action_id = AccountIntelligenceAgent._confirmation_action_id(
         "confirm 0123456789abcdef0123456789abcdef"
     )
 
     assert action_id == "0123456789abcdef0123456789abcdef"
+
 
 def test_agent_rejects_invalid_confirmation_action_id():
     assert (
@@ -277,3 +313,358 @@ def test_agent_rejects_invalid_confirmation_action_id():
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_confirms_pending_contact_creation():
+    class FakeActionSafety:
+        def __init__(self):
+            self.completed: dict[str, object] | None = None
+            self.failed: dict[str, object] | None = None
+
+        async def confirm_and_claim_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_fingerprint: str,
+        ):
+            assert action_id == "0123456789abcdef0123456789abcdef"
+            assert tenant_id == "tenant-a"
+            assert actor_id == "user-a"
+            assert request_fingerprint == (
+                "confirm 0123456789abcdef0123456789abcdef"
+            )
+
+            return type(
+                "ConfirmedAction",
+                (),
+                {
+                    "id": action_id,
+                    "payload": {
+                        "email": "arun@test.com",
+                        "firstname": "Arun",
+                        "lastname": "Kumar",
+                    },
+                },
+            )()
+
+        async def complete_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            resource_id: str | None,
+            result: dict[str, object],
+        ) -> None:
+            self.completed = {
+                "action_id": action_id,
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "result": result,
+            }
+
+        async def fail_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            error_code: str,
+        ) -> None:
+            self.failed = {
+                "action_id": action_id,
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "resource_type": resource_type,
+                "error_code": error_code,
+            }
+
+    class CreateContacts(Contacts):
+        async def create_contact(
+            self,
+            context,
+            *,
+            properties: dict[str, str | None],
+        ):
+            assert context.tenant_id == "tenant-a"
+            assert (
+                context.credential_reference
+                == "hubspot-oauth-token"
+            )
+            assert properties == {
+                "email": "arun@test.com",
+                "firstname": "Arun",
+                "lastname": "Kumar",
+            }
+
+            return HubSpotContact(
+                id="contact-2",
+                properties=properties,
+            )
+
+    action_safety = FakeActionSafety()
+
+    agent = AccountIntelligenceAgent(
+        HubSpotToolRegistry(
+            Companies(),
+            CreateContacts(),
+        ),
+        AIService(Provider()),
+        action_safety,  # type: ignore[arg-type]
+    )
+
+    result = await agent.respond(
+        request(
+            "confirm 0123456789abcdef0123456789abcdef"
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.request_id == "req-1"
+    assert (
+        "Contact created successfully in HubSpot."
+        in result.text
+    )
+    assert "contact-2" in result.text
+    assert result.tools_used == ["create_contact"]
+
+    assert action_safety.completed == {
+        "action_id": "0123456789abcdef0123456789abcdef",
+        "tenant_id": "tenant-a",
+        "actor_id": "user-a",
+        "request_id": "req-1",
+        "resource_type": "contact",
+        "resource_id": "contact-2",
+        "result": {
+            "contact_id": "contact-2",
+        },
+    }
+    assert action_safety.failed is None
+
+@pytest.mark.asyncio
+async def test_agent_marks_contact_creation_failed_on_hubspot_error():
+    class FakeActionSafety:
+        def __init__(self):
+            self.completed = None
+            self.failed = None
+
+        async def confirm_and_claim_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_fingerprint: str,
+        ):
+            return type(
+                "ConfirmedAction",
+                (),
+                {
+                    "id": action_id,
+                    "payload": {
+                        "email": "arun@test.com",
+                        "firstname": "Arun",
+                        "lastname": "Kumar",
+                    },
+                },
+            )()
+
+        async def complete_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            error_code: str,
+        ) -> None:
+            self.completed = {
+                "action_id": action_id,
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "resource_type": resource_type,
+                "error_code": error_code,
+            }
+
+        async def fail_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            error_code: str,
+
+        ) -> None:
+            self.failed = {
+                "action_id": action_id,
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "resource_type": resource_type,
+                "error_code": error_code,
+            }
+
+    class FailingContacts(Contacts):
+        async def create_contact(
+            self,
+            context,
+            *,
+            properties: dict[str, str | None],
+        ):
+            raise IntegrationError("HubSpot create failed")
+
+    action_safety = FakeActionSafety()
+
+    agent = AccountIntelligenceAgent(
+        HubSpotToolRegistry(
+            Companies(),
+            FailingContacts(),
+        ),
+        AIService(Provider()),
+        action_safety,  # type: ignore[arg-type]
+    )
+
+    result = await agent.respond(
+        request(
+            "confirm 0123456789abcdef0123456789abcdef"
+        )
+    )
+
+    assert result.status == "unavailable"
+    assert "couldn't create the HubSpot contact" in result.text
+    assert result.tools_used == ["create_contact"]
+
+    assert action_safety.completed is None
+    assert action_safety.failed == {
+        "action_id": "0123456789abcdef0123456789abcdef",
+        "tenant_id": "tenant-a",
+        "actor_id": "user-a",
+        "request_id": "req-1",
+        "resource_type": "contact",
+        "error_code": "integration_error",
+    }
+
+@pytest.mark.asyncio
+async def test_agent_marks_contact_creation_duplicate_as_failed():
+    class FakeActionSafety:
+        def __init__(self):
+            self.completed = None
+            self.failed = None
+
+        async def confirm_and_claim_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_fingerprint: str,
+        ):
+            return type(
+                "ConfirmedAction",
+                (),
+                {
+                    "id": action_id,
+                    "payload": {
+                        "email": "arun@test.com",
+                        "firstname": "Arun",
+                        "lastname": "Kumar",
+                    },
+                },
+            )()
+
+        async def complete_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            resource_id: str | None,
+            result: dict[str, object],
+        ) -> None:
+            self.completed = {
+                "action_id": action_id,
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "result": result,
+            }
+
+        async def fail_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            error_code: str,
+        ) -> None:
+            self.failed = {
+                "action_id": action_id,
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "resource_type": resource_type,
+                "error_code": error_code,
+            }
+
+    class DuplicateContacts(Contacts):
+        async def create_contact(
+            self,
+            context,
+            *,
+            properties: dict[str, str | None],
+        ):
+            raise ValueError(
+                "HubSpot contact with email 'arun@test.com' already exists"
+            )
+
+    action_safety = FakeActionSafety()
+
+    agent = AccountIntelligenceAgent(
+        HubSpotToolRegistry(
+            Companies(),
+            DuplicateContacts(),
+        ),
+        AIService(Provider()),
+        action_safety,  # type: ignore[arg-type]
+    )
+
+    result = await agent.respond(
+        request(
+            "confirm 0123456789abcdef0123456789abcdef"
+        )
+    )
+
+    assert result.status == "duplicate"
+    assert "already exists" in result.text
+    assert result.tools_used == ["create_contact"]
+
+    assert action_safety.completed is None
+    assert action_safety.failed == {
+        "action_id": "0123456789abcdef0123456789abcdef",
+        "tenant_id": "tenant-a",
+        "actor_id": "user-a",
+        "request_id": "req-1",
+        "resource_type": "contact",
+        "error_code": "duplicate",
+    }

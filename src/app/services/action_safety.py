@@ -81,9 +81,10 @@ class ActionSafetyService:
             )
 
             action = await pending_repository.confirm(
-                action_id,
-                tenant_id,
-                actor_id,
+                action_id=action_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+
             )
 
             if action is None:

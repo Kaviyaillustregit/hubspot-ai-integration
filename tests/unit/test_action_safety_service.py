@@ -305,9 +305,9 @@ async def test_confirm_and_claim_action_returns_confirmed_action(safety_mocks):
     }
 
     pending.confirm.assert_awaited_once_with(
-        "action-123",
-        "tenant-a",
-        "user-a",
+        action_id="action-123",
+        tenant_id="tenant-a",
+        actor_id="user-a",
     )
 
     idempotency.claim.assert_awaited_once_with(
