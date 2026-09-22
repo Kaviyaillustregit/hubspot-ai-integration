@@ -79,7 +79,11 @@ class PendingActionRepository:
         tenant_id: str,
         status: str,
     ) -> bool:
-        if status not in {"completed", "failed"}:
+        if status not in {
+            "completed",
+            "failed",
+            "reconciliation_required",
+        }:
             return False
 
         result = await self._session.execute(

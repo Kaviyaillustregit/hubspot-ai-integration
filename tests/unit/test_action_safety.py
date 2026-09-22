@@ -286,3 +286,21 @@ async def test_idempotency_claim_returns_true_for_new_key():
 
     assert params["claimed_at"] is not None
     assert params["created_at"] == params["claimed_at"]
+
+@pytest.mark.asyncio
+async def test_pending_action_set_status_allows_reconciliation_required():
+    session = MagicMock()
+    session.execute = AsyncMock(
+        return_value=SimpleNamespace(rowcount=1)
+    )
+
+    repository = PendingActionRepository(session)
+
+    updated = await repository.set_status(
+        action_id="action-1",
+        tenant_id="tenant-a",
+        status="reconciliation_required",
+    )
+
+    assert updated is True
+    session.execute.assert_awaited_once()
