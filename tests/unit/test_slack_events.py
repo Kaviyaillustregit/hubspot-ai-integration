@@ -6,10 +6,16 @@ import time
 from fastapi.testclient import TestClient
 
 from app.agent.schemas import AgentResponse
+from app.agent.service import AccountIntelligenceAgent
+from app.agent.tools import HubSpotToolRegistry
+from app.ai.service import AIService
 from app.api.app import create_app
 from app.api.slack import get_agent, get_slack_client
 from app.core.config import Settings
-from app.integrations.slack.events import SlackRequestVerifier, SlackSignatureError
+from app.integrations.slack.events import (
+    SlackRequestVerifier,
+    SlackSignatureError,
+)
 
 
 def signed_headers(body: bytes, secret: str) -> dict[str, str]:
@@ -152,3 +158,272 @@ def test_verifier_rejects_old_replay_requests():
         pass
     else:
         raise AssertionError("old Slack request should be rejected")
+
+def test_slack_contact_create_request_creates_pending_action_and_confirmation():
+    received: dict[str, str] = {}
+    created_action: dict[str, object] = {}
+
+    class Provider:
+        async def generate_structured(
+            self,
+            *,
+            prompt_name,
+            variables,
+            output_schema,
+        ):
+            raise AssertionError(
+                "AI provider should not be called for contact creation"
+            )
+
+    class ActionSafety:
+        async def create_pending_action(
+            self,
+            *,
+            tenant_id: str,
+            actor_id: str,
+            action_type: str,
+            resource_type: str,
+            payload: dict[str, object],
+        ) -> str:
+            created_action.update(
+                {
+                    "tenant_id": tenant_id,
+                    "actor_id": actor_id,
+                    "action_type": action_type,
+                    "resource_type": resource_type,
+                    "payload": payload,
+                }
+            )
+            return "0123456789abcdef0123456789abcdef"
+
+    class Companies:
+        pass
+
+    class Contacts:
+        pass
+
+    class Client:
+        async def post_message(
+            self,
+            channel: str,
+            text: str,
+        ) -> None:
+            received["channel"] = channel
+            received["text"] = text
+
+    agent = AccountIntelligenceAgent(
+        HubSpotToolRegistry(
+            Companies(),
+            Contacts(),
+        ),
+        AIService(Provider()),
+        ActionSafety(),  # type: ignore[arg-type]
+    )
+
+    app = create_app(
+        Settings(
+            slack_signing_secret="signing",
+            slack_team_tenant_map='{"T1":"tenant-a"}',
+        )
+    )
+    app.dependency_overrides[get_agent] = lambda: agent
+    app.dependency_overrides[get_slack_client] = lambda: Client()
+
+    payload = event_payload()
+    payload["event"]["text"] = (
+        "Create a contact firstname Arun "
+        "lastname Kumar email arun@test.com"
+    )
+
+    body = json.dumps(payload).encode()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/slack/events",
+            content=body,
+            headers=signed_headers(body, "signing"),
+        )
+
+    assert response.status_code == 200
+
+    assert created_action == {
+        "tenant_id": "tenant-a",
+        "actor_id": "U1",
+        "action_type": "create_contact",
+        "resource_type": "contact",
+        "payload": {
+            "email": "arun@test.com",
+            "firstname": "Arun",
+            "lastname": "Kumar",
+        },
+    }
+
+    assert received["channel"] == "C1"
+    assert "pending_confirmation" not in received["text"]
+    assert "arun@test.com" in received["text"]
+    assert "0123456789abcdef0123456789abcdef" in received["text"]
+    assert "confirm" in received["text"].lower()
+
+def test_slack_confirmation_creates_hubspot_contact_and_completes_action():
+    received: dict[str, str] = {}
+    completed: dict[str, object] = {}
+
+    class ActionSafety:
+        async def confirm_and_claim_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_fingerprint: str,
+        ):
+            assert action_id == "0123456789abcdef0123456789abcdef"
+            assert tenant_id == "tenant-a"
+            assert actor_id == "U1"
+            assert request_fingerprint == (
+                "confirm 0123456789abcdef0123456789abcdef"
+            )
+
+            return type(
+                "ConfirmedAction",
+                (),
+                {
+                    "id": action_id,
+                    "payload": {
+                        "email": "arun@test.com",
+                        "firstname": "Arun",
+                        "lastname": "Kumar",
+                    },
+                },
+            )()
+
+        async def complete_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            resource_id: str | None,
+            result: dict[str, object],
+        ) -> None:
+            completed.update(
+                {
+                    "action_id": action_id,
+                    "tenant_id": tenant_id,
+                    "actor_id": actor_id,
+                    "request_id": request_id,
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "result": result,
+                }
+            )
+
+        async def fail_action(
+            self,
+            *,
+            action_id: str,
+            tenant_id: str,
+            actor_id: str,
+            request_id: str,
+            resource_type: str,
+            error_code: str,
+        ) -> None:
+            raise AssertionError(
+                "fail_action should not be called on successful creation"
+            )
+
+    class Companies:
+        pass
+
+    class Contacts:
+        async def create_contact(
+            self,
+            context,
+            *,
+            properties: dict[str, str | None],
+        ):
+            assert context.tenant_id == "tenant-a"
+            assert properties == {
+                "email": "arun@test.com",
+                "firstname": "Arun",
+                "lastname": "Kumar",
+            }
+
+            from app.integrations.hubspot.models import HubSpotContact
+
+            return HubSpotContact(
+                id="contact-2",
+                properties=properties,
+            )
+
+    class Client:
+        async def post_message(
+            self,
+            channel: str,
+            text: str,
+        ) -> None:
+            received["channel"] = channel
+            received["text"] = text
+
+    class Provider:
+        async def generate_structured(
+            self,
+            *,
+            prompt_name,
+            variables,
+            output_schema,
+        ):
+            raise AssertionError(
+                "AI provider should not be called for confirmation"
+            )
+
+    agent = AccountIntelligenceAgent(
+        HubSpotToolRegistry(
+            Companies(),
+            Contacts(),
+        ),
+        AIService(Provider()),
+        ActionSafety(),  # type: ignore[arg-type]
+    )
+
+    app = create_app(
+        Settings(
+            slack_signing_secret="signing",
+            slack_team_tenant_map='{"T1":"tenant-a"}',
+        )
+    )
+    app.dependency_overrides[get_agent] = lambda: agent
+    app.dependency_overrides[get_slack_client] = lambda: Client()
+
+    payload = event_payload()
+    payload["event"]["text"] = (
+        "confirm 0123456789abcdef0123456789abcdef"
+    )
+
+    body = json.dumps(payload).encode()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/slack/events",
+            content=body,
+            headers=signed_headers(body, "signing"),
+        )
+
+    assert response.status_code == 200
+    assert received["channel"] == "C1"
+    assert "Contact created successfully in HubSpot." in received["text"]
+    assert "contact-2" in received["text"]
+
+    assert completed == {
+        "action_id": "0123456789abcdef0123456789abcdef",
+        "tenant_id": "tenant-a",
+        "actor_id": "U1",
+        "request_id": completed["request_id"],
+        "resource_type": "contact",
+        "resource_id": "contact-2",
+        "result": {
+            "contact_id": "contact-2",
+        },
+    }
