@@ -24,6 +24,11 @@ class ContactUpdateIntent(BaseModel):
         min_length=1,
     )
 
+class ContactDeleteIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contact_id: str = Field(min_length=1, max_length=128)
+
 class GroundedSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

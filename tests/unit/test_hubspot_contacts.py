@@ -258,6 +258,128 @@ async def test_contacts_client_updates_contact_and_sends_bearer_token():
     )
 
 @pytest.mark.asyncio
+async def test_contacts_client_deletes_contact_and_sends_bearer_token():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers["Authorization"]
+
+        return httpx.Response(204)
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await HubSpotContactsClient(
+            settings,
+            client,
+        ).delete_contact(
+            context,
+            "access-token",
+            contact_id="123",
+        )
+
+    assert result is None
+    assert captured["method"] == "DELETE"
+    assert captured["url"] == (
+        "https://api.hubapi.com/crm/v3/objects/contacts/123"
+    )
+    assert captured["authorization"] == "Bearer access-token"
+
+@pytest.mark.asyncio
+async def test_contacts_client_delete_handles_authentication_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"message": "Unauthorized"},
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationAuthenticationError):
+            await contacts_client.delete_contact(
+                context,
+                "access-token",
+                contact_id="123",
+            )
+
+@pytest.mark.asyncio
+async def test_contacts_client_delete_handles_rate_limit_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"message": "Rate limit exceeded"},
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationRateLimitError):
+            await contacts_client.delete_contact(
+                context,
+                "access-token",
+                contact_id="123",
+            )
+
+@pytest.mark.asyncio
+async def test_contacts_client_delete_handles_timeout():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("request timed out")
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationTimeoutError):
+            await contacts_client.delete_contact(
+                context,
+                "access-token",
+                contact_id="123",
+            )
+
+@pytest.mark.asyncio
+async def test_contacts_client_delete_handles_generic_http_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={"message": "Internal Server Error"},
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationError):
+            await contacts_client.delete_contact(
+                context,
+                "access-token",
+                contact_id="123",
+            )
+
+@pytest.mark.asyncio
 async def test_contacts_client_update_handles_authentication_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -807,3 +929,51 @@ async def test_contacts_service_updates_contact():
     )
 
     assert contact == expected_contact
+
+@pytest.mark.asyncio
+async def test_contacts_service_deletes_contact():
+    class FakeTokenProvider:
+        async def get_access_token(
+            self,
+            tenant_id: str,
+        ) -> tuple[str, StoredOAuthToken]:
+            assert tenant_id == "tenant-a"
+
+            token = StoredOAuthToken(
+                tenant_id="tenant-a",
+                hubspot_account_id="42",
+                encrypted_access_token="encrypted-access",
+                encrypted_refresh_token="encrypted-refresh",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scopes=["crm.objects.contacts.write"],
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+            return "access-token", token
+
+    class FakeContactsClient:
+        async def delete_contact(
+            self,
+            context,
+            access_token: str,
+            *,
+            contact_id: str,
+        ) -> None:
+            assert context.tenant_id == "tenant-a"
+            assert context.hubspot_account_id == "42"
+            assert context.credential_reference == "hubspot-oauth-token"
+            assert access_token == "access-token"
+            assert contact_id == "123"
+
+    service = HubSpotContactsService(
+        FakeContactsClient(),  # type: ignore[arg-type]
+        FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+
+    result = await service.delete_contact(
+        TenantContext("tenant-a", "", "hubspot-oauth-token"),
+        contact_id="123",
+    )
+
+    assert result is None

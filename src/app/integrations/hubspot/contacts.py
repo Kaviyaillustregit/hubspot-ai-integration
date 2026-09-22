@@ -333,3 +333,57 @@ class HubSpotContactsClient:
             raise IntegrationError(
                 "HubSpot Contacts update response was invalid"
             ) from exc
+
+    async def delete_contact(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        contact_id: str,
+    ) -> None:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+        }
+
+        url = (
+            "https://api.hubapi.com/crm/v3/objects/contacts/"
+            f"{contact_id}"
+        )
+
+        try:
+            if self._client is not None:
+                response = await self._client.delete(
+                    url,
+                    headers=headers,
+                )
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.request_timeout_seconds
+                ) as client:
+                    response = await client.delete(
+                        url,
+                        headers=headers,
+                    )
+        except httpx.TimeoutException as exc:
+            raise IntegrationTimeoutError(
+                "HubSpot Contacts delete request timed out"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationError(
+                "HubSpot Contacts delete request failed"
+            ) from exc
+
+        if response.status_code == 401:
+            raise IntegrationAuthenticationError(
+                "HubSpot Contacts delete was rejected"
+            )
+
+        if response.status_code == 429:
+            raise IntegrationRateLimitError(
+                "HubSpot Contacts delete rate limit reached"
+            )
+
+        if response.is_error:
+            raise IntegrationError(
+                "HubSpot Contacts delete request failed"
+            )

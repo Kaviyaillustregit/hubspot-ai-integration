@@ -104,6 +104,16 @@ class HubSpotToolRegistry:
             properties=properties,
         )
 
+    async def delete_contact(
+        self,
+        tenant_id: str,
+        contact_id: str,
+    ) -> None:
+        await self._contacts.delete_contact(
+            self._context(tenant_id),
+            contact_id=contact_id,
+        )
+
     @property
     def names(self) -> Sequence[str]:
         return ("find_company", "find_contacts", "contact_company_associations")

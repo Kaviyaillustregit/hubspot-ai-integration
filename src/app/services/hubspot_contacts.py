@@ -64,6 +64,14 @@ class ContactsClient(Protocol):
         properties: dict[str, str | None],
     ) -> HubSpotContact: ...
 
+    async def delete_contact(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        contact_id: str,
+    ) -> None: ...
+
 
 class HubSpotAccessTokenProvider:
     def __init__(
@@ -253,4 +261,26 @@ class HubSpotContactsService:
             access_token,
             contact_id=contact_id,
             properties=properties,
+        )
+
+    async def delete_contact(
+        self,
+        context: TenantContext,
+        *,
+        contact_id: str,
+    ) -> None:
+        access_token, token = await self._token_provider.get_access_token(
+            context.tenant_id
+        )
+
+        context = TenantContext(
+            tenant_id=context.tenant_id,
+            hubspot_account_id=token.hubspot_account_id,
+            credential_reference="hubspot-oauth-token",
+        )
+
+        await self._client.delete_contact(
+            context,
+            access_token,
+            contact_id=contact_id,
         )

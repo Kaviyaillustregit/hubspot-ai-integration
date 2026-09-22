@@ -5,6 +5,7 @@ from app.agent.schemas import (
     AgentRequest,
     AgentResponse,
     ContactCreateIntent,
+    ContactDeleteIntent,
     ContactUpdateIntent,
     GroundedSummary,
 )
@@ -27,6 +28,11 @@ _CONTACT_CREATE_PATTERN = re.compile(
 
 _CONTACT_UPDATE_PATTERN = re.compile(
     r"\bupdate\s+(?:a\s+)?contact\b",
+    re.IGNORECASE,
+)
+
+_CONTACT_DELETE_PATTERN = re.compile(
+    r"\bdelete\s+(?:a\s+)?contact\b",
     re.IGNORECASE,
 )
 
@@ -150,6 +156,60 @@ class AccountIntelligenceAgent:
                         request,
                         ["update_contact"],
                     )
+            if confirmed_action.action_type == "delete_contact":
+                try:
+                    contact_id = str(
+                        confirmed_action.payload["contact_id"]
+                    )
+
+                    await self._tools.delete_contact(
+                        request.tenant_id,
+                        contact_id,
+                    )
+
+                    await self._action_safety.complete_action(
+                        action_id=confirmed_action.id,
+                        tenant_id=request.tenant_id,
+                        actor_id=request.actor_id,
+                        request_id=request.request_id,
+                        resource_type="contact",
+                        resource_id=contact_id,
+                        result={
+                            "contact_id": contact_id,
+                        },
+                    )
+
+                    return AgentResponse(
+                        status="ok",
+                        text=(
+                            "Contact deleted successfully in HubSpot.\n"
+                            f"• Contact ID: `{contact_id}`"
+                        ),
+                        request_id=request.request_id,
+                        tools_used=["delete_contact"],
+                    )
+
+                except IntegrationError:
+                    await self._action_safety.fail_action(
+                        action_id=confirmed_action.id,
+                        tenant_id=request.tenant_id,
+                        actor_id=request.actor_id,
+                        request_id=request.request_id,
+                        resource_type="contact",
+                        error_code="integration_error",
+                    )
+
+                    logger.exception(
+                        "Contact deletion failed",
+                        extra={"tenant_id": request.tenant_id},
+                    )
+
+                    return self._safe(
+                        "unavailable",
+                        "I couldn't delete the HubSpot contact right now.",
+                        request,
+                        ["delete_contact"],
+                    )
             try:
                 contact = await self._tools.create_contact(
                     request.tenant_id,
@@ -271,6 +331,30 @@ class AccountIntelligenceAgent:
                     f"{', '.join(contact_update_intent.properties.keys())}\n\n"
                     f"Action ID: `{action_id}`\n"
                     f"Reply with `confirm {action_id}` to update this contact."
+                ),
+                request_id=request.request_id,
+                tools_used=[],
+            )
+        contact_delete_intent = self._contact_delete_intent(request.message)
+
+        if contact_delete_intent is not None:
+            action_id = await self._action_safety.create_pending_action(
+                tenant_id=request.tenant_id,
+                actor_id=request.actor_id,
+                action_type="delete_contact",
+                resource_type="contact",
+                payload={
+                    "contact_id": contact_delete_intent.contact_id,
+                },
+            )
+
+            return AgentResponse(
+                status="pending_confirmation",
+                text=(
+                    "I found a request to delete this HubSpot contact:\n"
+                    f"• Contact ID: {contact_delete_intent.contact_id}\n\n"
+                    f"Action ID: `{action_id}`\n"
+                    f"Reply with `confirm {action_id}` to delete this contact."
                 ),
                 request_id=request.request_id,
                 tools_used=[],
@@ -413,6 +497,22 @@ class AccountIntelligenceAgent:
         return ContactUpdateIntent(
             contact_id=contact_id_match.group(1),
             properties=properties,
+        )
+
+    @staticmethod
+    def _contact_delete_intent(
+        message: str,
+    ) -> ContactDeleteIntent | None:
+        if not _CONTACT_DELETE_PATTERN.search(message):
+            return None
+
+        contact_id_match = _CONTACT_ID_PATTERN.search(message)
+
+        if contact_id_match is None:
+            return None
+
+        return ContactDeleteIntent(
+            contact_id=contact_id_match.group(1),
         )
 
     @staticmethod
