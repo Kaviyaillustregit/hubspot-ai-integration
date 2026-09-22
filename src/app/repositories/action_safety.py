@@ -79,14 +79,19 @@ class PendingActionRepository:
         tenant_id: str,
         status: str,
     ) -> bool:
+        if status not in {"completed", "failed"}:
+            return False
+
         result = await self._session.execute(
             update(PendingActionRecord)
             .where(
                 PendingActionRecord.id == action_id,
                 PendingActionRecord.tenant_id == tenant_id,
+                PendingActionRecord.status == "confirmed",
             )
             .values(status=status)
         )
+
         rowcount = getattr(result, "rowcount", 0)
         return int(rowcount) == 1
 

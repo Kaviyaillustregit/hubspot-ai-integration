@@ -316,3 +316,48 @@ async def test_confirm_and_claim_action_returns_confirmed_action(safety_mocks):
         action_type="create_contact",
         request_fingerprint="fingerprint-123",
     )
+
+@pytest.mark.asyncio
+async def test_confirm_and_claim_action_rejects_duplicate_confirmation(
+    safety_mocks,
+):
+    pending, _, idempotency, unit_of_works = safety_mocks
+
+    pending.confirm.return_value = MagicMock(
+        id="action-123",
+        tenant_id="tenant-a",
+        actor_id="user-a",
+        action_type="create_contact",
+        resource_type="contact",
+        payload={
+            "email": "arun@test.com",
+            "firstname": "Arun",
+            "lastname": "Kumar",
+        },
+    )
+
+    idempotency.claim.side_effect = [True, False]
+
+    service = ActionSafetyService(lambda: MagicMock())
+
+    first = await service.confirm_and_claim_action(
+        action_id="action-123",
+        tenant_id="tenant-a",
+        actor_id="user-a",
+        request_fingerprint="fingerprint-123",
+    )
+
+    second = await service.confirm_and_claim_action(
+        action_id="action-123",
+        tenant_id="tenant-a",
+        actor_id="user-a",
+        request_fingerprint="fingerprint-123",
+    )
+
+    assert first is not None
+    assert first.id == "action-123"
+    assert second is None
+
+    assert idempotency.claim.await_count == 2
+    assert unit_of_works[0].committed is True
+    assert unit_of_works[1].rolled_back is True

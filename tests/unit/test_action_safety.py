@@ -245,3 +245,38 @@ async def test_idempotency_complete_returns_false_when_missing():
     )
 
     assert completed is False
+
+@pytest.mark.asyncio
+async def test_pending_action_set_status_rejects_non_confirmed_action():
+    session = MagicMock()
+
+    session.execute = AsyncMock(
+        return_value=SimpleNamespace(rowcount=0)
+    )
+
+    repository = PendingActionRepository(session)
+
+    updated = await repository.set_status(
+        action_id="action-1",
+        tenant_id="tenant-a",
+        status="completed",
+    )
+
+    assert updated is False
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pending_action_set_status_rejects_unsupported_status():
+    session = MagicMock()
+
+    repository = PendingActionRepository(session)
+
+    updated = await repository.set_status(
+        action_id="action-1",
+        tenant_id="tenant-a",
+        status="confirmed",
+    )
+
+    assert updated is False
+    session.execute.assert_not_called()

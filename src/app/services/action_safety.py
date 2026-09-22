@@ -114,6 +114,7 @@ class ActionSafetyService:
             await unit_of_work.commit()
 
             return confirmed_action
+
     async def confirm_and_claim(
         self,
         *,
@@ -122,40 +123,14 @@ class ActionSafetyService:
         actor_id: str,
         request_fingerprint: str,
     ) -> bool:
-        """
-        Atomically confirm a pending action and claim its idempotency key.
+        action = await self.confirm_and_claim_action(
+            action_id=action_id,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            request_fingerprint=request_fingerprint,
+        )
 
-        Only the same tenant and actor that created the action can confirm it.
-        """
-        async with UnitOfWork(self._session_factory) as unit_of_work:
-            if unit_of_work.session is None:
-                raise RuntimeError("UnitOfWork session is unavailable")
-
-            pending_repository = PendingActionRepository(unit_of_work.session)
-            idempotency_repository = IdempotencyRepository(unit_of_work.session)
-
-            action = await pending_repository.confirm(
-                action_id=action_id,
-                tenant_id=tenant_id,
-                actor_id=actor_id,
-            )
-            if action is None:
-                await unit_of_work.rollback()
-                return False
-
-            claimed = await idempotency_repository.claim(
-                key=action_id,
-                tenant_id=tenant_id,
-                action_type=action.action_type,
-                request_fingerprint=request_fingerprint,
-            )
-            if not claimed:
-                await unit_of_work.rollback()
-                return False
-
-            await unit_of_work.commit()
-
-        return True
+        return action is not None
 
     async def complete_action(
         self,
