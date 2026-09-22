@@ -190,6 +190,167 @@ async def test_contacts_client_creates_contact_and_sends_bearer_token():
     )
 
 @pytest.mark.asyncio
+async def test_contacts_client_updates_contact_and_sends_bearer_token():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers["Authorization"]
+        captured["content_type"] = request.headers["Content-Type"]
+        captured["json"] = json.loads(request.read().decode())
+
+        return httpx.Response(
+            200,
+            json={
+                "id": "123",
+                "properties": {
+                    "email": "arun@test.com",
+                    "firstname": "Arun",
+                    "lastname": "Kumar",
+                    "jobtitle": "Senior AI Engineer",
+                },
+            },
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contact = await HubSpotContactsClient(
+            settings,
+            client,
+        ).update_contact(
+            context,
+            "access-token",
+            contact_id="123",
+            properties={
+                "firstname": "Arun",
+                "lastname": "Kumar",
+                "jobtitle": "Senior AI Engineer",
+            },
+        )
+
+    assert captured["method"] == "PATCH"
+    assert captured["url"] == (
+        "https://api.hubapi.com/crm/v3/objects/contacts/123"
+    )
+    assert captured["authorization"] == "Bearer access-token"
+    assert captured["content_type"] == "application/json"
+    assert captured["json"] == {
+        "properties": {
+            "firstname": "Arun",
+            "lastname": "Kumar",
+            "jobtitle": "Senior AI Engineer",
+        }
+    }
+
+    assert contact == HubSpotContact(
+        id="123",
+        properties={
+            "email": "arun@test.com",
+            "firstname": "Arun",
+            "lastname": "Kumar",
+            "jobtitle": "Senior AI Engineer",
+        },
+    )
+
+@pytest.mark.asyncio
+async def test_contacts_client_update_handles_authentication_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"message": "Unauthorized"},
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationAuthenticationError):
+            await contacts_client.update_contact(
+                context,
+                "access-token",
+                contact_id="123",
+                properties={"firstname": "Arun"},
+            )
+
+@pytest.mark.asyncio
+async def test_contacts_client_update_handles_rate_limit_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"message": "Rate limit exceeded"},
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationRateLimitError):
+            await contacts_client.update_contact(
+                context,
+                "access-token",
+                contact_id="123",
+                properties={"firstname": "Arun"},
+            )
+
+@pytest.mark.asyncio
+async def test_contacts_client_update_handles_timeout():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("request timed out")
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationTimeoutError):
+            await contacts_client.update_contact(
+                context,
+                "access-token",
+                contact_id="123",
+                properties={"firstname": "Arun"},
+            )
+
+@pytest.mark.asyncio
+async def test_contacts_client_update_handles_generic_http_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={"message": "Internal Server Error"},
+        )
+
+    settings = Settings()
+    context = TenantContext("tenant-a", "42", "hubspot-oauth-token")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        contacts_client = HubSpotContactsClient(settings, client)
+
+        with pytest.raises(IntegrationError):
+            await contacts_client.update_contact(
+                context,
+                "access-token",
+                contact_id="123",
+                properties={"firstname": "Arun"},
+            )
+
+@pytest.mark.asyncio
 async def test_contacts_client_finds_contact_by_email():
     captured: dict[str, object] = {}
 
@@ -575,3 +736,74 @@ async def test_contacts_service_creates_contact_when_email_is_not_duplicate():
     )
 
     assert contact == created_contact
+
+@pytest.mark.asyncio
+async def test_contacts_service_updates_contact():
+    expected_contact = HubSpotContact(
+        id="123",
+        properties={
+            "email": "arun@test.com",
+            "firstname": "Arun",
+            "lastname": "Kumar",
+            "jobtitle": "Senior AI Engineer",
+        },
+    )
+
+    class FakeTokenProvider:
+        async def get_access_token(
+            self,
+            tenant_id: str,
+        ) -> tuple[str, StoredOAuthToken]:
+            assert tenant_id == "tenant-a"
+
+            token = StoredOAuthToken(
+                tenant_id="tenant-a",
+                hubspot_account_id="42",
+                encrypted_access_token="encrypted-access",
+                encrypted_refresh_token="encrypted-refresh",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scopes=["crm.objects.contacts.write"],
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+            return "access-token", token
+
+    class FakeContactsClient:
+        async def update_contact(
+            self,
+            context,
+            access_token: str,
+            *,
+            contact_id: str,
+            properties: dict[str, str | None],
+        ):
+            assert context.tenant_id == "tenant-a"
+            assert context.hubspot_account_id == "42"
+            assert context.credential_reference == "hubspot-oauth-token"
+            assert access_token == "access-token"
+            assert contact_id == "123"
+            assert properties == {
+                "firstname": "Arun",
+                "lastname": "Kumar",
+                "jobtitle": "Senior AI Engineer",
+            }
+
+            return expected_contact
+
+    service = HubSpotContactsService(
+        FakeContactsClient(),  # type: ignore[arg-type]
+        FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+
+    contact = await service.update_contact(
+        TenantContext("tenant-a", "", "hubspot-oauth-token"),
+        contact_id="123",
+        properties={
+            "firstname": "Arun",
+            "lastname": "Kumar",
+            "jobtitle": "Senior AI Engineer",
+        },
+    )
+
+    assert contact == expected_contact

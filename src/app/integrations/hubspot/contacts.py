@@ -15,6 +15,7 @@ from app.integrations.hubspot.models import (
     HubSpotContact,
     HubSpotContactCreate,
     HubSpotContactsPage,
+    HubSpotContactUpdate,
 )
 
 
@@ -262,4 +263,73 @@ class HubSpotContactsClient:
         except (ValueError, TypeError) as exc:
             raise IntegrationError(
                 "HubSpot Contacts create response was invalid"
+            ) from exc
+
+    async def update_contact(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        contact_id: str,
+        properties: dict[str, str | None],
+    ) -> HubSpotContact:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        url = (
+            "https://api.hubapi.com/crm/v3/objects/contacts/"
+            f"{contact_id}"
+        )
+
+        payload = HubSpotContactUpdate(
+            properties=properties
+        ).model_dump()
+
+        try:
+            if self._client is not None:
+                response = await self._client.patch(
+                    url,
+                    headers=headers,
+                    json=payload,
+                )
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.request_timeout_seconds
+                ) as client:
+                    response = await client.patch(
+                        url,
+                        headers=headers,
+                        json=payload,
+                    )
+        except httpx.TimeoutException as exc:
+            raise IntegrationTimeoutError(
+                "HubSpot Contacts update request timed out"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationError(
+                "HubSpot Contacts update request failed"
+            ) from exc
+
+        if response.status_code == 401:
+            raise IntegrationAuthenticationError(
+                "HubSpot Contacts update was rejected"
+            )
+
+        if response.status_code == 429:
+            raise IntegrationRateLimitError(
+                "HubSpot Contacts update rate limit reached"
+            )
+
+        if response.is_error:
+            raise IntegrationError(
+                "HubSpot Contacts update request failed"
+            )
+
+        try:
+            return HubSpotContact.model_validate(response.json())
+        except (ValueError, TypeError) as exc:
+            raise IntegrationError(
+                "HubSpot Contacts update response was invalid"
             ) from exc

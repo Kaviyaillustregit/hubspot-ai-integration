@@ -55,6 +55,15 @@ class ContactsClient(Protocol):
         properties: dict[str, str | None],
     ) -> HubSpotContact: ...
 
+    async def update_contact(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        contact_id: str,
+        properties: dict[str, str | None],
+    ) -> HubSpotContact: ...
+
 
 class HubSpotAccessTokenProvider:
     def __init__(
@@ -219,5 +228,29 @@ class HubSpotContactsService:
         return await self._client.create_contact(
             context,
             access_token,
+            properties=properties,
+        )
+
+    async def update_contact(
+        self,
+        context: TenantContext,
+        *,
+        contact_id: str,
+        properties: dict[str, str | None],
+    ) -> HubSpotContact:
+        access_token, token = await self._token_provider.get_access_token(
+            context.tenant_id
+        )
+
+        context = TenantContext(
+            tenant_id=context.tenant_id,
+            hubspot_account_id=token.hubspot_account_id,
+            credential_reference="hubspot-oauth-token",
+        )
+
+        return await self._client.update_contact(
+            context,
+            access_token,
+            contact_id=contact_id,
             properties=properties,
         )

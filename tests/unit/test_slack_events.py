@@ -289,6 +289,7 @@ def test_slack_confirmation_creates_hubspot_contact_and_completes_action():
                 (),
                 {
                     "id": action_id,
+                    "action_type": "create_contact",
                     "payload": {
                         "email": "arun@test.com",
                         "firstname": "Arun",

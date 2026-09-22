@@ -16,6 +16,14 @@ class ContactCreateIntent(BaseModel):
     firstname: str | None = Field(default=None, max_length=100)
     lastname: str | None = Field(default=None, max_length=100)
 
+class ContactUpdateIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contact_id: str = Field(min_length=1, max_length=128)
+    properties: dict[str, str | None] = Field(
+        min_length=1,
+    )
+
 class GroundedSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

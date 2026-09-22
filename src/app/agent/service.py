@@ -5,6 +5,7 @@ from app.agent.schemas import (
     AgentRequest,
     AgentResponse,
     ContactCreateIntent,
+    ContactUpdateIntent,
     GroundedSummary,
 )
 from app.agent.tools import HubSpotToolRegistry
@@ -24,6 +25,11 @@ _CONTACT_CREATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_CONTACT_UPDATE_PATTERN = re.compile(
+    r"\bupdate\s+(?:a\s+)?contact\b",
+    re.IGNORECASE,
+)
+
 _CONFIRM_ACTION_PATTERN = re.compile(
     r"^\s*confirm\s+([a-f0-9]{32})\s*$",
     re.IGNORECASE,
@@ -34,6 +40,11 @@ _EMAIL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_CONTACT_ID_PATTERN = re.compile(
+    r"\b(?:contact[_\s-]?id|id)\s*[:=]?\s*([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+
 _FIRSTNAME_PATTERN = re.compile(
     r"\bfirstname\s*[:=]?\s*([A-Za-z][A-Za-z'-]*)",
     re.IGNORECASE,
@@ -41,6 +52,10 @@ _FIRSTNAME_PATTERN = re.compile(
 
 _LASTNAME_PATTERN = re.compile(
     r"\blastname\s*[:=]?\s*([A-Za-z][A-Za-z'-]*)",
+    re.IGNORECASE,
+)
+_JOBTITLE_PATTERN = re.compile(
+    r"\bjobtitle\s*[:=]?\s*(.+?)(?=\s+(?:email|firstname|lastname|jobtitle)\b|$)",
     re.IGNORECASE,
 )
 
@@ -60,13 +75,11 @@ class AccountIntelligenceAgent:
         confirmation_action_id = self._confirmation_action_id(request.message)
 
         if confirmation_action_id is not None:
-            confirmed_action = (
-                await self._action_safety.confirm_and_claim_action(
-                    action_id=confirmation_action_id,
-                    tenant_id=request.tenant_id,
-                    actor_id=request.actor_id,
-                    request_fingerprint=request.message,
-                )
+            confirmed_action = await self._action_safety.confirm_and_claim_action(
+                action_id=confirmation_action_id,
+                tenant_id=request.tenant_id,
+                actor_id=request.actor_id,
+                request_fingerprint=request.message,
             )
 
             if confirmed_action is None:
@@ -78,7 +91,65 @@ class AccountIntelligenceAgent:
                     ),
                     request,
                 )
+            if confirmed_action.action_type == "update_contact":
+                try:
+                    contact_id = str(confirmed_action.payload["contact_id"])
 
+                    properties = {
+                        key: value
+                        for key, value in confirmed_action.payload.items()
+                        if key != "contact_id"
+                    }
+
+                    contact = await self._tools.update_contact(
+                        request.tenant_id,
+                        contact_id,
+                        properties,
+                    )
+
+                    await self._action_safety.complete_action(
+                        action_id=confirmed_action.id,
+                        tenant_id=request.tenant_id,
+                        actor_id=request.actor_id,
+                        request_id=request.request_id,
+                        resource_type="contact",
+                        resource_id=contact.id,
+                        result={
+                            "contact_id": contact.id,
+                        },
+                    )
+
+                    return AgentResponse(
+                        status="ok",
+                        text=(
+                            "Contact updated successfully in HubSpot.\n"
+                            f"• Contact ID: `{contact.id}`"
+                        ),
+                        request_id=request.request_id,
+                        tools_used=["update_contact"],
+                    )
+
+                except IntegrationError:
+                    await self._action_safety.fail_action(
+                        action_id=confirmed_action.id,
+                        tenant_id=request.tenant_id,
+                        actor_id=request.actor_id,
+                        request_id=request.request_id,
+                        resource_type="contact",
+                        error_code="integration_error",
+                    )
+
+                    logger.exception(
+                        "Contact update failed",
+                        extra={"tenant_id": request.tenant_id},
+                    )
+
+                    return self._safe(
+                        "unavailable",
+                        "I couldn't update the HubSpot contact right now.",
+                        request,
+                        ["update_contact"],
+                    )
             try:
                 contact = await self._tools.create_contact(
                     request.tenant_id,
@@ -177,6 +248,34 @@ class AccountIntelligenceAgent:
                 tools_used=[],
             )
 
+        contact_update_intent = self._contact_update_intent(request.message)
+
+        if contact_update_intent is not None:
+            action_id = await self._action_safety.create_pending_action(
+                tenant_id=request.tenant_id,
+                actor_id=request.actor_id,
+                action_type="update_contact",
+                resource_type="contact",
+                payload={
+                    "contact_id": contact_update_intent.contact_id,
+                    **contact_update_intent.properties,
+                },
+            )
+
+            return AgentResponse(
+                status="pending_confirmation",
+                text=(
+                    "I found a request to update this HubSpot contact:\n"
+                    f"• Contact ID: {contact_update_intent.contact_id}\n"
+                    f"• Fields: "
+                    f"{', '.join(contact_update_intent.properties.keys())}\n\n"
+                    f"Action ID: `{action_id}`\n"
+                    f"Reply with `confirm {action_id}` to update this contact."
+                ),
+                request_id=request.request_id,
+                tools_used=[],
+            )
+
         company_name = self._company_name(request.message)
 
         if company_name is None:
@@ -217,10 +316,7 @@ class AccountIntelligenceAgent:
 
             facts = {
                 "company": company.model_dump(),
-                "contacts": [
-                    item.model_dump()
-                    for item in contacts
-                ],
+                "contacts": [item.model_dump() for item in contacts],
             }
 
             summary = await self._ai_service.generate(
@@ -276,16 +372,47 @@ class AccountIntelligenceAgent:
 
         return ContactCreateIntent(
             email=email_match.group(0),
-            firstname=(
-                firstname_match.group(1)
-                if firstname_match
-                else None
-            ),
-            lastname=(
-                lastname_match.group(1)
-                if lastname_match
-                else None
-            ),
+            firstname=(firstname_match.group(1) if firstname_match else None),
+            lastname=(lastname_match.group(1) if lastname_match else None),
+        )
+
+    @staticmethod
+    def _contact_update_intent(
+        message: str,
+    ) -> ContactUpdateIntent | None:
+        if not _CONTACT_UPDATE_PATTERN.search(message):
+            return None
+
+        contact_id_match = _CONTACT_ID_PATTERN.search(message)
+
+        if contact_id_match is None:
+            return None
+
+        properties: dict[str, str | None] = {}
+
+        firstname_match = _FIRSTNAME_PATTERN.search(message)
+        lastname_match = _LASTNAME_PATTERN.search(message)
+        email_match = _EMAIL_PATTERN.search(message)
+        jobtitle_match = _JOBTITLE_PATTERN.search(message)
+
+        if firstname_match:
+            properties["firstname"] = firstname_match.group(1)
+
+        if lastname_match:
+            properties["lastname"] = lastname_match.group(1)
+
+        if email_match:
+            properties["email"] = email_match.group(0)
+
+        if jobtitle_match:
+            properties["jobtitle"] = jobtitle_match.group(1).strip()
+
+        if not properties:
+            return None
+
+        return ContactUpdateIntent(
+            contact_id=contact_id_match.group(1),
+            properties=properties,
         )
 
     @staticmethod
@@ -295,33 +422,17 @@ class AccountIntelligenceAgent:
 
     @staticmethod
     def _needs_contacts(message: str) -> bool:
-        return any(
-            word in message.casefold()
-            for word in ("contact", "people", "stakeholder")
-        )
+        return any(word in message.casefold() for word in ("contact", "people", "stakeholder"))
 
     @staticmethod
     def _format(summary: GroundedSummary) -> str:
-        facts = (
-            "\n".join(
-                f"• {fact}"
-                for fact in summary.crm_facts
-            )
-            or "• No CRM facts returned."
-        )
+        facts = "\n".join(f"• {fact}" for fact in summary.crm_facts) or "• No CRM facts returned."
 
         observations = (
-            "\n".join(
-                f"• {item}"
-                for item in summary.observations
-            )
-            or "• No observations."
+            "\n".join(f"• {item}" for item in summary.observations) or "• No observations."
         )
 
-        return (
-            f"*CRM facts*\n{facts}\n\n"
-            f"*AI observations/suggestions*\n{observations}"
-        )
+        return f"*CRM facts*\n{facts}\n\n*AI observations/suggestions*\n{observations}"
 
     @staticmethod
     def _safe(

@@ -25,6 +25,11 @@ class HubSpotContactCreate(BaseModel):
 
     properties: dict[str, str | None]
 
+class HubSpotContactUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    properties: dict[str, str | None]
+
 class HubSpotContactsPage(BaseModel):
     results: list[HubSpotContact]
     next_after: str | None = None

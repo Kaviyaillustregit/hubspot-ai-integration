@@ -81,6 +81,7 @@ class HubSpotToolRegistry:
             if any(item.company_id == company_id for item in associations.results):
                 matches.append(contact)
         return matches
+
     async def create_contact(
         self,
         tenant_id: str,
@@ -88,6 +89,18 @@ class HubSpotToolRegistry:
     ) -> HubSpotContact:
         return await self._contacts.create_contact(
             self._context(tenant_id),
+            properties=properties,
+        )
+
+    async def update_contact(
+        self,
+        tenant_id: str,
+        contact_id: str,
+        properties: dict[str, str | None],
+    ) -> HubSpotContact:
+        return await self._contacts.update_contact(
+            self._context(tenant_id),
+            contact_id=contact_id,
             properties=properties,
         )
 
