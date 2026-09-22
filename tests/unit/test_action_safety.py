@@ -157,24 +157,6 @@ async def test_audit_log_create_adds_audit_record():
     session.add.assert_called_once_with(record)
 
 
-@pytest.mark.asyncio
-async def test_idempotency_claim_returns_true_for_new_key():
-    session = MagicMock()
-    session.execute = AsyncMock(
-        return_value=SimpleNamespace(rowcount=1)
-    )
-
-    repository = IdempotencyRepository(session)
-
-    claimed = await repository.claim(
-        key="idem-1",
-        tenant_id="tenant-a",
-        action_type="create_contact",
-        request_fingerprint="fingerprint-1",
-    )
-
-    assert claimed is True
-
 
 @pytest.mark.asyncio
 async def test_idempotency_claim_returns_false_for_existing_key():
@@ -280,3 +262,27 @@ async def test_pending_action_set_status_rejects_unsupported_status():
 
     assert updated is False
     session.execute.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_idempotency_claim_returns_true_for_new_key():
+    session = MagicMock()
+    session.execute = AsyncMock(
+        return_value=SimpleNamespace(rowcount=1)
+    )
+
+    repository = IdempotencyRepository(session)
+
+    claimed = await repository.claim(
+        key="idem-1",
+        tenant_id="tenant-a",
+        action_type="create_contact",
+        request_fingerprint="fingerprint-1",
+    )
+
+    assert claimed is True
+
+    statement = session.execute.await_args.args[0]
+    params = statement.compile().params
+
+    assert params["claimed_at"] is not None
+    assert params["created_at"] == params["claimed_at"]

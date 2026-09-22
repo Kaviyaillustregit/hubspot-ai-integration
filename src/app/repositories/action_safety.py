@@ -145,6 +145,8 @@ class IdempotencyRepository:
         action_type: str,
         request_fingerprint: str,
     ) -> bool:
+        now = datetime.now(UTC)
+
         statement = (
             insert(IdempotencyRecord)
             .values(
@@ -154,9 +156,12 @@ class IdempotencyRepository:
                 request_fingerprint=request_fingerprint,
                 status="in_progress",
                 result=None,
-                created_at=datetime.now(UTC),
+                created_at=now,
+                claimed_at=now,
             )
-            .on_conflict_do_nothing(index_elements=[IdempotencyRecord.key])
+            .on_conflict_do_nothing(
+                index_elements=[IdempotencyRecord.key]
+            )
         )
 
         result = await self._session.execute(statement)
