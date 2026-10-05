@@ -37,7 +37,7 @@ _CONTACT_DELETE_PATTERN = re.compile(
 )
 
 _CONFIRM_ACTION_PATTERN = re.compile(
-    r"^\s*confirm\s+([a-f0-9]{32})\s*$",
+    r"^\s*(?:<@[^>]+>\s*)?confirm\s+`?([a-f0-9]{32})`?\s*$",
     re.IGNORECASE,
 )
 

@@ -479,6 +479,21 @@ def test_agent_extracts_confirmation_action_id():
 
     assert action_id == "0123456789abcdef0123456789abcdef"
 
+def test_agent_extracts_confirmation_action_id_from_slack_mention():
+    action_id = AccountIntelligenceAgent._confirmation_action_id(
+        "<@U0C2FKCSX4P> confirm "
+        "0123456789abcdef0123456789abcdef"
+    )
+
+    assert action_id == "0123456789abcdef0123456789abcdef"
+
+def test_agent_extracts_confirmation_action_id_from_slack_code_format():
+    action_id = AccountIntelligenceAgent._confirmation_action_id(
+        "<@U0C2FKCSX4P> confirm "
+        "`0123456789abcdef0123456789abcdef`"
+    )
+
+    assert action_id == "0123456789abcdef0123456789abcdef"
 
 def test_agent_rejects_invalid_confirmation_action_id():
     assert AccountIntelligenceAgent._confirmation_action_id("confirm not-a-valid-action-id") is None
