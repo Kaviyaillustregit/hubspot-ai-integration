@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 class SlackClient(ABC):
@@ -6,3 +7,6 @@ class SlackClient(ABC):
 
     @abstractmethod
     async def post_message(self, channel: str, text: str) -> None: ...
+
+    @abstractmethod
+    async def publish_home_view(self, user_id: str, view: dict[str, Any]) -> None: ...

@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
@@ -25,8 +27,26 @@ def test_default_oauth_scopes_match_app_and_omit_implicit_oauth_scope():
         "crm.objects.contacts.read",
         "crm.objects.contacts.write",
         "crm.objects.companies.read",
+        "crm.objects.companies.write",
+        "crm.objects.deals.read",
+        "crm.objects.deals.write",
     ]
     assert "oauth" not in settings.hubspot_oauth_scopes.split()
+
+
+def test_default_oauth_scopes_match_the_hubspot_app_manifest():
+    manifest_path = (
+        Path(__file__).resolve().parents[2]
+        / "hubspot-ai-integration"
+        / "src"
+        / "app"
+        / "app-hsmeta.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["config"]["auth"]["requiredScopes"] == (
+        Settings(_env_file=None).hubspot_oauth_scopes.split()
+    )
 
 
 class FakeRouteOAuthService:

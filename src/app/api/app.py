@@ -3,8 +3,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.assistant import STATIC_DIR as ASSISTANT_STATIC_DIR
+from app.api.assistant import api_router as assistant_api_router
+from app.api.assistant import page_router as assistant_page_router
 from app.api.errors import (
     AppError,
     app_error_handler,
@@ -47,4 +51,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(hubspot_contacts_router, prefix="/api/v1")
     application.include_router(hubspot_companies_router, prefix="/api/v1")
     application.include_router(slack_router, prefix="/api/v1")
+    application.include_router(assistant_api_router, prefix="/api/v1")
+    application.include_router(assistant_page_router)
+    application.mount(
+        "/assistant/static",
+        StaticFiles(directory=ASSISTANT_STATIC_DIR),
+        name="assistant-static",
+    )
     return application

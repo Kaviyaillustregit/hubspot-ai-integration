@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -123,3 +125,37 @@ async def test_companies_service_uses_tenant_token_and_account_context():
     result = await HubSpotCompaniesService(Client(), TokenProvider()).list_companies(context())
 
     assert result.results == []
+
+
+@pytest.mark.asyncio
+async def test_companies_client_searches_by_query_with_post():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers["Authorization"]
+        captured["body"] = json.loads(request.read())
+        return httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [{"id": "company-1", "properties": {"name": "ABC Company"}}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        page = await HubSpotCompaniesClient(Settings(), client).search_companies(
+            context(),
+            "access-token",
+            query="ABC",
+            limit=100,
+            properties=("name", "domain"),
+        )
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://api.hubapi.com/crm/v3/objects/companies/search"
+    assert captured["authorization"] == "Bearer access-token"
+    assert captured["body"] == {"query": "ABC", "limit": 100, "properties": ["name", "domain"]}
+    assert page.results[0].id == "company-1"
+    assert page.next_after is None

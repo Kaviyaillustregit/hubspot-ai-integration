@@ -28,8 +28,11 @@ class Settings(BaseSettings):
     hubspot_redirect_uri: str | None = None
     hubspot_oauth_authorize_url: str = "https://app.hubspot.com/oauth/authorize"
     hubspot_oauth_token_url: str = "https://api.hubapi.com/oauth/v3/token"
+    # Must match requiredScopes in hubspot-ai-integration/src/app/app-hsmeta.json.
     hubspot_oauth_scopes: str = (
-        "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read"
+        "crm.objects.contacts.read crm.objects.contacts.write "
+        "crm.objects.companies.read crm.objects.companies.write "
+        "crm.objects.deals.read crm.objects.deals.write"
     )
     hubspot_token_encryption_key: str | None = None
     hubspot_webhook_secret: str | None = None
@@ -40,6 +43,9 @@ class Settings(BaseSettings):
     # JSON object of Slack workspace IDs to application tenant IDs, e.g.
     # {"T0123": "tenant-a"}. This is server-owned authorization data.
     slack_team_tenant_map: str | None = None
+    # Public https base URL of this service (e.g. the ngrok URL). Enables the Slack App Home
+    # "Open HubSpot AI" button that signs users into the web assistant.
+    web_app_base_url: str | None = None
 
     @model_validator(mode="after")
     def validate_deployment_settings(self) -> "Settings":

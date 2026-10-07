@@ -304,3 +304,59 @@ async def test_pending_action_set_status_allows_reconciliation_required():
 
     assert updated is True
     session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pending_action_list_recent_is_scoped_to_tenant_and_actor():
+    session = MagicMock()
+    records = [MagicMock(spec=PendingActionRecord)]
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = records
+    session.execute = AsyncMock(return_value=result)
+
+    listed = await PendingActionRepository(session).list_recent(
+        tenant_id="tenant-a", actor_id="U1", limit=5
+    )
+
+    assert listed == records
+    statement = str(session.execute.await_args.args[0])
+    assert "pending_actions.tenant_id" in statement
+    assert "pending_actions.actor_id" in statement
+    assert "ORDER BY pending_actions.created_at DESC" in statement
+
+
+@pytest.mark.asyncio
+async def test_pending_action_create_can_record_policy_confirmed_action():
+    session = MagicMock()
+    repository = PendingActionRepository(session)
+
+    record = await repository.create(
+        action_id="direct-1",
+        tenant_id="tenant-a",
+        actor_id="user-1",
+        action_type="create_contact",
+        resource_type="contact",
+        payload={"firstname": "Victor"},
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        status="confirmed",
+    )
+
+    assert record.status == "confirmed"
+    assert record.confirmed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_pending_action_create_rejects_terminal_initial_status():
+    repository = PendingActionRepository(MagicMock())
+
+    with pytest.raises(ValueError):
+        await repository.create(
+            action_id="direct-1",
+            tenant_id="tenant-a",
+            actor_id="user-1",
+            action_type="create_contact",
+            resource_type="contact",
+            payload={},
+            expires_at=datetime.now(UTC),
+            status="completed",
+        )

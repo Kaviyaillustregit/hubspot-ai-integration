@@ -28,7 +28,13 @@ class PendingActionRepository:
         resource_type: str,
         payload: dict[str, Any],
         expires_at: datetime,
+        status: str = "pending",
     ) -> PendingActionRecord:
+        # "confirmed" is used for actions that policy allows to run without a human confirmation.
+        if status not in {"pending", "confirmed"}:
+            raise ValueError(f"Unsupported initial action status: {status}")
+
+        now = datetime.now(UTC)
         record = PendingActionRecord(
             id=action_id,
             tenant_id=tenant_id,
@@ -36,12 +42,31 @@ class PendingActionRepository:
             action_type=action_type,
             resource_type=resource_type,
             payload=payload,
-            status="pending",
+            status=status,
             expires_at=expires_at,
-            created_at=datetime.now(UTC),
+            created_at=now,
+            confirmed_at=now if status == "confirmed" else None,
         )
         self._session.add(record)
         return record
+
+    async def list_recent(
+        self,
+        *,
+        tenant_id: str,
+        actor_id: str,
+        limit: int,
+    ) -> list[PendingActionRecord]:
+        result = await self._session.execute(
+            select(PendingActionRecord)
+            .where(
+                PendingActionRecord.tenant_id == tenant_id,
+                PendingActionRecord.actor_id == actor_id,
+            )
+            .order_by(PendingActionRecord.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
 
     async def confirm(
         self,

@@ -5,16 +5,18 @@ import time
 
 from fastapi.testclient import TestClient
 
-from app.agent.schemas import AgentResponse
+from app.agent.schemas import AgentResponse, CRMIntentExtraction
 from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
 from app.ai.service import AIService
 from app.api.app import create_app
 from app.api.slack import get_agent, get_slack_client
 from app.core.config import Settings
+from app.integrations.hubspot.models import HubSpotContact
 from app.integrations.slack.events import (
     SlackRequestVerifier,
     SlackSignatureError,
+    parse_message,
 )
 
 
@@ -159,9 +161,10 @@ def test_verifier_rejects_old_replay_requests():
     else:
         raise AssertionError("old Slack request should be rejected")
 
-def test_slack_contact_create_request_creates_pending_action_and_confirmation():
+def test_slack_contact_create_request_creates_contact_directly():
     received: dict[str, str] = {}
-    created_action: dict[str, object] = {}
+    started: dict[str, object] = {}
+    created: dict[str, object] = {}
 
     class Provider:
         async def generate_structured(
@@ -171,36 +174,34 @@ def test_slack_contact_create_request_creates_pending_action_and_confirmation():
             variables,
             output_schema,
         ):
-            raise AssertionError(
-                "AI provider should not be called for contact creation"
+            assert prompt_name == "crm-intent/v2"
+            return CRMIntentExtraction(
+                intent="create_contact",
+                first_name="Arun",
+                last_name="Kumar",
+                email="arun@test.com",
+                confidence=0.95,
             )
 
     class ActionSafety:
-        async def create_pending_action(
-            self,
-            *,
-            tenant_id: str,
-            actor_id: str,
-            action_type: str,
-            resource_type: str,
-            payload: dict[str, object],
-        ) -> str:
-            created_action.update(
-                {
-                    "tenant_id": tenant_id,
-                    "actor_id": actor_id,
-                    "action_type": action_type,
-                    "resource_type": resource_type,
-                    "payload": payload,
-                }
-            )
-            return "0123456789abcdef0123456789abcdef"
+        async def start_direct_action(self, **kwargs):
+            started.update(kwargs)
+            return type("Claim", (), {"action_id": "direct-1", "claimed": True})()
+
+        async def complete_action(self, **kwargs) -> None:
+            created["completed_action_id"] = kwargs["action_id"]
+
+        async def create_pending_action(self, **kwargs) -> str:
+            raise AssertionError("contact creation must not require confirmation")
 
     class Companies:
         pass
 
     class Contacts:
-        pass
+        async def create_contact(self, context, *, properties):
+            assert context.tenant_id == "tenant-a"
+            created["properties"] = properties
+            return HubSpotContact(id="contact-2", properties=properties)
 
     class Client:
         async def post_message(
@@ -230,10 +231,8 @@ def test_slack_contact_create_request_creates_pending_action_and_confirmation():
     app.dependency_overrides[get_slack_client] = lambda: Client()
 
     payload = event_payload()
-    payload["event"]["text"] = (
-        "Create a contact firstname Arun "
-        "lastname Kumar email arun@test.com"
-    )
+    payload["event"]["text"] = "Please add Arun Kumar, email arun@test.com, as a contact"
+    payload["event"]["ts"] = "1712345678.000100"
 
     body = json.dumps(payload).encode()
 
@@ -246,23 +245,57 @@ def test_slack_contact_create_request_creates_pending_action_and_confirmation():
 
     assert response.status_code == 200
 
-    assert created_action == {
-        "tenant_id": "tenant-a",
-        "actor_id": "U1",
-        "action_type": "create_contact",
-        "resource_type": "contact",
-        "payload": {
-            "email": "arun@test.com",
+    assert started["tenant_id"] == "tenant-a"
+    assert started["actor_id"] == "U1"
+    assert started["action_type"] == "create_contact"
+    assert started["idempotency_key"] == "slack-message:C1:1712345678.000100"
+    assert created == {
+        "properties": {
             "firstname": "Arun",
             "lastname": "Kumar",
+            "email": "arun@test.com",
         },
+        "completed_action_id": "direct-1",
     }
 
     assert received["channel"] == "C1"
-    assert "pending_confirmation" not in received["text"]
-    assert "arun@test.com" in received["text"]
-    assert "0123456789abcdef0123456789abcdef" in received["text"]
-    assert "confirm" in received["text"].lower()
+    assert "Contact Arun Kumar was created successfully in HubSpot." in received["text"]
+    assert "confirm" not in received["text"].lower()
+
+
+def test_duplicate_slack_delivery_is_not_replied_to_twice():
+    posted: list[str] = []
+
+    class Agent:
+        async def respond(self, request):
+            assert request.channel_id == "C1"
+            assert request.message_ts == "1712345678.000100"
+            assert request.event_id == "Ev1"
+            return AgentResponse(
+                status="duplicate_request",
+                text="This message was already processed.",
+                request_id=request.request_id,
+            )
+
+    class Client:
+        async def post_message(self, channel: str, text: str) -> None:
+            posted.append(text)
+
+    app = create_app(
+        Settings(slack_signing_secret="signing", slack_team_tenant_map='{"T1":"tenant-a"}')
+    )
+    app.dependency_overrides[get_agent] = lambda: Agent()
+    app.dependency_overrides[get_slack_client] = lambda: Client()
+    payload = event_payload()
+    payload["event"]["ts"] = "1712345678.000100"
+    body = json.dumps(payload).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/slack/events", content=body, headers=signed_headers(body, "signing")
+        )
+
+    assert response.status_code == 200
+    assert posted == []
 
 def test_slack_confirmation_creates_hubspot_contact_and_completes_action():
     received: dict[str, str] = {}
@@ -428,3 +461,14 @@ def test_slack_confirmation_creates_hubspot_contact_and_completes_action():
             "contact_id": "contact-2",
         },
     }
+
+
+def test_parse_message_keeps_slack_message_timestamp():
+    payload = event_payload()
+    payload["event"]["ts"] = "1712345678.000100"
+
+    parsed = parse_message(payload)
+
+    assert parsed is not None
+    assert parsed.ts == "1712345678.000100"
+    assert parse_message(event_payload()).ts is None  # type: ignore[union-attr]

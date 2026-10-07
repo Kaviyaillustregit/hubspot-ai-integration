@@ -361,3 +361,113 @@ async def test_confirm_and_claim_action_rejects_duplicate_confirmation(
     assert idempotency.claim.await_count == 2
     assert unit_of_works[0].committed is True
     assert unit_of_works[1].rolled_back is True
+
+
+@pytest.mark.asyncio
+async def test_start_direct_action_claims_key_and_records_confirmed_action(safety_mocks):
+    pending, _, idempotency, unit_of_works = safety_mocks
+    idempotency.claim.return_value = True
+
+    service = ActionSafetyService(lambda: MagicMock())
+
+    claim = await service.start_direct_action(
+        idempotency_key="slack-message:C1:1712345678.000100",
+        tenant_id="tenant-a",
+        actor_id="U1",
+        action_type="create_contact",
+        resource_type="contact",
+        payload={"firstname": "Victor"},
+        request_fingerprint="fingerprint",
+    )
+
+    expected_id = ActionSafetyService.direct_action_id(
+        tenant_id="tenant-a",
+        action_type="create_contact",
+        idempotency_key="slack-message:C1:1712345678.000100",
+    )
+    assert claim.claimed is True
+    assert claim.action_id == expected_id
+    assert len(claim.action_id) <= 128
+    idempotency.claim.assert_awaited_once_with(
+        key=expected_id,
+        tenant_id="tenant-a",
+        action_type="create_contact",
+        request_fingerprint="fingerprint",
+    )
+    assert pending.create.await_args.kwargs["action_id"] == expected_id
+    assert pending.create.await_args.kwargs["status"] == "confirmed"
+    assert unit_of_works[0].committed is True
+
+
+@pytest.mark.asyncio
+async def test_start_direct_action_rejects_redelivery_without_recording_new_action(
+    safety_mocks,
+):
+    pending, _, idempotency, unit_of_works = safety_mocks
+    idempotency.claim.return_value = False
+
+    class ExpiringRecord:
+        """Mimics an ORM instance: attribute reads after rollback would lazy-load (sync IO)."""
+
+        def __getattr__(self, name):
+            if unit_of_works and unit_of_works[0].rolled_back:
+                raise AssertionError(f"read {name} after rollback expired the instance")
+            return {"tenant_id": "tenant-a", "status": "succeeded"}[name]
+
+    idempotency.get.return_value = ExpiringRecord()
+
+    service = ActionSafetyService(lambda: MagicMock())
+
+    claim = await service.start_direct_action(
+        idempotency_key="slack-message:C1:1712345678.000100",
+        tenant_id="tenant-a",
+        actor_id="U1",
+        action_type="create_contact",
+        resource_type="contact",
+        payload={},
+        request_fingerprint="fingerprint",
+    )
+
+    assert claim.claimed is False
+    assert claim.previous_status == "succeeded"
+    pending.create.assert_not_awaited()
+    assert unit_of_works[0].rolled_back is True
+    assert unit_of_works[0].committed is False
+
+
+@pytest.mark.asyncio
+async def test_recent_actions_are_read_for_the_actor_within_the_tenant(safety_mocks):
+    pending, _, _, unit_of_works = safety_mocks
+    created_at = datetime.now(UTC)
+    pending.list_recent = AsyncMock(
+        return_value=[
+            MagicMock(
+                action_type="create_contact",
+                status="completed",
+                payload={"firstname": "Angel"},
+                created_at=created_at,
+                expires_at=created_at,
+            )
+        ]
+    )
+
+    service = ActionSafetyService(lambda: MagicMock())
+
+    recent = await service.recent_actions(tenant_id="tenant-a", actor_id="U1", limit=3)
+
+    pending.list_recent.assert_awaited_once_with(tenant_id="tenant-a", actor_id="U1", limit=3)
+    assert [(item.action_type, item.status, item.payload) for item in recent] == [
+        ("create_contact", "completed", {"firstname": "Angel"})
+    ]
+    assert unit_of_works[0].committed is False
+
+
+def test_direct_action_ids_are_tenant_and_message_scoped():
+    def action_id(tenant: str, key: str) -> str:
+        return ActionSafetyService.direct_action_id(
+            tenant_id=tenant, action_type="create_contact", idempotency_key=key
+        )
+
+    assert action_id("tenant-a", "k1") == action_id("tenant-a", "k1")
+    assert action_id("tenant-a", "k1") != action_id("tenant-b", "k1")
+    assert action_id("tenant-a", "k1") != action_id("tenant-a", "k2")

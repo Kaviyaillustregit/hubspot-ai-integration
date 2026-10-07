@@ -11,12 +11,16 @@ from app.integrations.errors import (
     IntegrationTimeoutError,
 )
 from app.integrations.hubspot.context import TenantContext
+from app.integrations.hubspot.http import HubSpotApiClient
 from app.integrations.hubspot.models import (
     HubSpotContact,
     HubSpotContactCreate,
     HubSpotContactsPage,
     HubSpotContactUpdate,
 )
+
+# HubSpot-defined "contact to company" association type.
+CONTACT_TO_COMPANY_ASSOCIATION_TYPE_ID = 279
 
 
 class HubSpotContactsResponse(BaseModel):
@@ -26,7 +30,7 @@ class HubSpotContactsResponse(BaseModel):
     paging: dict[str, dict[str, str]] | None = None
 
 
-class HubSpotContactsClient:
+class HubSpotContactsClient(HubSpotApiClient):
     """HubSpot Contacts API adapter."""
 
     def __init__(
@@ -36,6 +40,31 @@ class HubSpotContactsClient:
     ) -> None:
         self._settings = settings
         self._client = client
+
+    async def search_contacts(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        query: str,
+        limit: int = 100,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContactsPage:
+        body: dict[str, object] = {"query": query, "limit": limit}
+        if properties:
+            body["properties"] = list(properties)
+        payload = await self._call(
+            "POST",
+            "/crm/v3/objects/contacts/search",
+            access_token,
+            label="HubSpot contact search",
+            json_body=body,
+        )
+        try:
+            response = HubSpotContactsResponse.model_validate(payload)
+        except (ValueError, TypeError) as exc:
+            raise IntegrationError("HubSpot contact search response was invalid") from exc
+        return HubSpotContactsPage(results=response.results)
 
     async def list_contacts(
         self,
@@ -206,6 +235,7 @@ class HubSpotContactsClient:
         access_token: str,
         *,
         properties: dict[str, str | None],
+        company_id: str | None = None,
     ) -> HubSpotContact:
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -214,9 +244,23 @@ class HubSpotContactsClient:
 
         url = "https://api.hubapi.com/crm/v3/objects/contacts"
 
-        payload = HubSpotContactCreate(
+        payload: dict[str, object] = HubSpotContactCreate(
             properties=properties
         ).model_dump()
+
+        if company_id is not None:
+            # Create and associate in one request so a contact is never left half-linked.
+            payload["associations"] = [
+                {
+                    "to": {"id": company_id},
+                    "types": [
+                        {
+                            "associationCategory": "HUBSPOT_DEFINED",
+                            "associationTypeId": CONTACT_TO_COMPANY_ASSOCIATION_TYPE_ID,
+                        }
+                    ],
+                }
+            ]
 
         try:
             if self._client is not None:

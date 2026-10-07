@@ -57,6 +57,9 @@ class SlackMessage:
     channel_id: str
     text: str
     event_id: str
+    # Slack's message timestamp; with channel_id it identifies the message across
+    # retries and across message/app_mention deliveries of the same post.
+    ts: str | None = None
 
 
 def parse_message(payload: object) -> SlackMessage | None:
@@ -78,10 +81,34 @@ def parse_message(payload: object) -> SlackMessage | None:
     if not all(isinstance(value, str) and value for value in values):
         return None
     team_id, user_id, channel_id, text, event_id = values
+    ts = event.get("ts")
     return SlackMessage(
         team_id=str(team_id),
         user_id=str(user_id),
         channel_id=str(channel_id),
         text=str(text),
         event_id=str(event_id),
+        ts=ts if isinstance(ts, str) and ts else None,
     )
+
+
+@dataclass(frozen=True)
+class SlackHomeOpened:
+    team_id: str
+    user_id: str
+
+
+def parse_app_home_opened(payload: object) -> SlackHomeOpened | None:
+    """Parse a verified app_home_opened event for the Home tab (not the Messages tab)."""
+    if not isinstance(payload, dict) or payload.get("type") != "event_callback":
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict) or event.get("type") != "app_home_opened":
+        return None
+    if event.get("tab") != "home":
+        return None
+    team_id = payload.get("team_id")
+    user_id = event.get("user")
+    if not isinstance(team_id, str) or not team_id or not isinstance(user_id, str) or not user_id:
+        return None
+    return SlackHomeOpened(team_id=team_id, user_id=user_id)

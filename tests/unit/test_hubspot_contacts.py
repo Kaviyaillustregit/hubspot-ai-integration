@@ -20,6 +20,7 @@ from app.integrations.hubspot.oauth import HubSpotTokenResponse, StoredOAuthToke
 from app.services.hubspot_contacts import (
     HubSpotAccessTokenProvider,
     HubSpotContactsService,
+    HubSpotDuplicateContactError,
 )
 
 
@@ -977,3 +978,108 @@ async def test_contacts_service_deletes_contact():
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_contacts_client_creates_contact_associated_with_company():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.read())
+        return httpx.Response(201, json={"id": "123", "properties": {"firstname": "Victor"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await HubSpotContactsClient(Settings(), client).create_contact(
+            TenantContext("tenant-a", "42", "hubspot-oauth-token"),
+            "access-token",
+            properties={"firstname": "Victor"},
+            company_id="company-abc",
+        )
+
+    assert captured["json"] == {
+        "properties": {"firstname": "Victor"},
+        "associations": [
+            {
+                "to": {"id": "company-abc"},
+                "types": [
+                    {"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 279}
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_contacts_service_duplicate_error_identifies_existing_contact():
+    class FakeTokenProvider:
+        async def get_access_token(self, tenant_id: str):
+            return "access-token", StoredOAuthToken(
+                tenant_id=tenant_id,
+                hubspot_account_id="42",
+                encrypted_access_token="encrypted-access",
+                encrypted_refresh_token="encrypted-refresh",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scopes=[],
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+    class FakeContactsClient:
+        async def find_contact_by_email(self, context, access_token, *, email):
+            return HubSpotContact(id="contact-9", properties={"email": email})
+
+    service = HubSpotContactsService(
+        FakeContactsClient(),  # type: ignore[arg-type]
+        FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(HubSpotDuplicateContactError) as raised:
+        await service.create_contact(
+            TenantContext("tenant-a", "", "hubspot-oauth-token"),
+            properties={"email": "victor@abc.com"},
+            company_id="company-abc",
+        )
+
+    assert raised.value.contact_id == "contact-9"
+    assert raised.value.email == "victor@abc.com"
+    assert isinstance(raised.value, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_contacts_service_passes_company_to_client_on_create():
+    received: dict[str, object] = {}
+
+    class FakeTokenProvider:
+        async def get_access_token(self, tenant_id: str):
+            return "access-token", StoredOAuthToken(
+                tenant_id=tenant_id,
+                hubspot_account_id="42",
+                encrypted_access_token="encrypted-access",
+                encrypted_refresh_token="encrypted-refresh",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scopes=[],
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+    class FakeContactsClient:
+        async def find_contact_by_email(self, context, access_token, *, email):
+            return None
+
+        async def create_contact(self, context, access_token, *, properties, company_id=None):
+            received["company_id"] = company_id
+            received["account"] = context.hubspot_account_id
+            return HubSpotContact(id="contact-1", properties=properties)
+
+    service = HubSpotContactsService(
+        FakeContactsClient(),  # type: ignore[arg-type]
+        FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+
+    await service.create_contact(
+        TenantContext("tenant-a", "", "hubspot-oauth-token"),
+        properties={"firstname": "Victor", "email": "victor@abc.com"},
+        company_id="company-abc",
+    )
+
+    assert received == {"company_id": "company-abc", "account": "42"}

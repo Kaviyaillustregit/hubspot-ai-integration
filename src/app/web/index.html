@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>HubSpot AI · Revenue Intelligence Assistant</title>
+    <link rel="stylesheet" href="/assistant/static/app.css" />
+    <script type="module" src="/assistant/static/app.js"></script>
+  </head>
+  <body data-app="assistant">
+    <div class="shell">
+      <aside class="sidebar" id="sidebar" aria-label="HubSpot AI navigation">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 2.5l1.9 6.2 6.1 2-6.1 2-1.9 6.3-1.9-6.3-6.1-2 6.1-2z" /></svg>
+          </span>
+          <div class="brand-text">
+            <span class="brand-name">HubSpot AI</span>
+            <span class="brand-sub">Revenue Intelligence</span>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="Quick actions">
+          <button type="button" class="nav-item nav-item--primary" data-prompt="Create a contact named ">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            New Contact
+          </button>
+          <button type="button" class="nav-item" data-prompt="Tell me about the company ">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6l8-3 8 3v14M9 20v-4h6v4M8 9h.01M12 9h.01M16 9h.01M8 13h.01M12 13h.01M16 13h.01" /></svg>
+            Company Info
+          </button>
+          <button type="button" class="nav-item" data-prompt="Show the contacts at ">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 19v-1a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v1M9.5 10a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7M21 19v-1a4 4 0 0 0-3-3.87M16 3.13a3.5 3.5 0 0 1 0 6.75" /></svg>
+            Find Contacts
+          </button>
+          <button type="button" class="nav-item" data-prompt="Show me the deals for ">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l6-6 4 4 8-8M15 7h6v6" /></svg>
+            Deals
+          </button>
+          <button type="button" class="nav-item" data-prompt="Search the CRM for ">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14M20 20l-4-4" /></svg>
+            Search CRM
+          </button>
+        </nav>
+
+        <section class="activity" aria-labelledby="activity-title">
+          <h2 class="eyebrow" id="activity-title">Recent activity</h2>
+          <ul class="activity-list" id="activity-list">
+            <li class="activity-empty">Your CRM changes will appear here.</li>
+          </ul>
+        </section>
+
+        <p class="sidebar-foot">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.8-7 9-4-1.2-7-4.5-7-9V6z" /></svg>
+          Updates and deletions always ask for your confirmation.
+        </p>
+      </aside>
+      <div class="scrim" id="scrim" hidden></div>
+
+      <main class="main">
+        <header class="topbar">
+          <button type="button" class="icon-button menu-button" id="menu-button" aria-label="Open navigation">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+          </button>
+          <div class="topbar-title">
+            <span class="ai-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 2.5l1.9 6.2 6.1 2-6.1 2-1.9 6.3-1.9-6.3-6.1-2 6.1-2z" /></svg>
+            </span>
+            <div>
+              <h1>HubSpot AI</h1>
+              <p>Revenue Intelligence Assistant</p>
+            </div>
+          </div>
+          <div class="connection" id="connection" data-state="checking" role="status">
+            <span class="connection-dot" aria-hidden="true"></span>
+            <span id="connection-text">Connecting…</span>
+          </div>
+        </header>
+
+        <section class="conversation" id="conversation">
+          <div class="empty-state" id="empty-state">
+            <div class="orb" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 2.5l1.9 6.2 6.1 2-6.1 2-1.9 6.3-1.9-6.3-6.1-2 6.1-2z" /></svg>
+            </div>
+            <h2>How can I help?</h2>
+            <p>Manage your HubSpot CRM using natural language.</p>
+            <div class="suggestions" role="list">
+              <button type="button" class="chip" role="listitem" data-prompt="Create a company called ">Create a company</button>
+              <button type="button" class="chip" role="listitem" data-prompt="Create a contact named ">Add a contact</button>
+              <button type="button" class="chip" role="listitem" data-prompt="Tell me about the company ">Find a company</button>
+              <button type="button" class="chip" role="listitem" data-prompt="Create a deal called ">Create a deal</button>
+              <button type="button" class="chip" role="listitem" data-prompt="Search the CRM for ">Search CRM</button>
+            </div>
+          </div>
+          <div class="thread" id="thread" aria-live="polite" aria-relevant="additions"></div>
+        </section>
+
+        <div class="composer-dock">
+          <form class="composer" id="composer" autocomplete="off">
+            <label class="visually-hidden" for="composer-input">Message HubSpot AI</label>
+            <textarea id="composer-input" rows="1" maxlength="3000" placeholder="Ask HubSpot AI anything..."></textarea>
+            <button type="submit" class="send-button" id="send-button" aria-label="Send message" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6" /></svg>
+            </button>
+          </form>
+          <p class="composer-hint">Enter to send · Shift + Enter for a new line</p>
+        </div>
+      </main>
+    </div>
+
+    <div class="gate" id="gate" hidden>
+      <div class="gate-card">
+        <div class="orb orb--small" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2.5l1.9 6.2 6.1 2-6.1 2-1.9 6.3-1.9-6.3-6.1-2 6.1-2z" /></svg>
+        </div>
+        <h2 id="gate-title">Open HubSpot AI from Slack</h2>
+        <p id="gate-text">
+          For your security, HubSpot AI signs you in through Slack. Open the HubSpot AI Agent
+          app in Slack and choose <strong>Open HubSpot AI</strong>.
+        </p>
+      </div>
+    </div>
+  </body>
+</html>

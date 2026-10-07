@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -8,6 +10,71 @@ class AgentRequest(BaseModel):
     actor_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=3000)
     request_id: str = Field(min_length=1, max_length=128)
+    # Source-message identity, used as the idempotency basis for direct CRM writes.
+    channel_id: str | None = Field(default=None, max_length=128)
+    message_ts: str | None = Field(default=None, max_length=64)
+    event_id: str | None = Field(default=None, max_length=128)
+
+
+CRMIntentName = Literal[
+    "create_contact",
+    "update_contact",
+    "delete_contact",
+    "crm_question",
+    "unsupported",
+    "create_company",
+    "update_company",
+    "create_deal",
+    "update_deal",
+    "associate_records",
+    "multi_step",
+]
+
+# What the user wants done with each entity mentioned in the message.
+EntityAction = Literal["create", "update", "reference"]
+AssociationName = Literal["contact_company", "deal_company", "deal_contact"]
+CRMQueryName = Literal[
+    "company_details",
+    "company_contacts",
+    "company_deals",
+    "contact_details",
+    "contact_company",
+    "deal_details",
+]
+
+
+class CRMIntentExtraction(BaseModel):
+    """LLM interpretation of one message. Untrusted until validated by the agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: CRMIntentName
+    # Contact fields.
+    first_name: str | None = Field(default=None, max_length=100)
+    last_name: str | None = Field(default=None, max_length=100)
+    email: str | None = Field(default=None, max_length=320)
+    phone: str | None = Field(default=None, max_length=50)
+    job_title: str | None = Field(default=None, max_length=200)
+    contact_id: str | None = Field(default=None, max_length=128)
+    # Company fields.
+    company_name: str | None = Field(default=None, max_length=200)
+    company_domain: str | None = Field(default=None, max_length=253)
+    company_website: str | None = Field(default=None, max_length=500)
+    company_phone: str | None = Field(default=None, max_length=50)
+    company_city: str | None = Field(default=None, max_length=100)
+    # Deal fields. Amount, stage and pipeline are kept exactly as written.
+    deal_name: str | None = Field(default=None, max_length=200)
+    deal_amount: str | None = Field(default=None, max_length=50)
+    deal_stage: str | None = Field(default=None, max_length=100)
+    deal_pipeline: str | None = Field(default=None, max_length=100)
+    # Structure of the request.
+    contact_action: EntityAction | None = None
+    company_action: EntityAction | None = None
+    deal_action: EntityAction | None = None
+    associations: list[AssociationName] = Field(default_factory=list, max_length=6)
+    query: CRMQueryName | None = None
+    question: str | None = Field(default=None, max_length=3000)
+    confidence: float = Field(ge=0, le=1)
 
 class ContactCreateIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -41,3 +108,7 @@ class AgentResponse(BaseModel):
     text: str
     request_id: str
     tools_used: list[str] = Field(default_factory=list)
+    # Optional structured outcome for rich UIs (e.g. Slack App Home); `text` stays canonical.
+    result: dict[str, str] | None = None
+    # Per-record summaries of CRM writes for the web assistant's result cards.
+    cards: list[dict[str, str]] = Field(default_factory=list)

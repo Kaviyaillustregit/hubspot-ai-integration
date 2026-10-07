@@ -1,9 +1,9 @@
-import json
 from typing import Any, TypeVar
 
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
+from app.ai.prompts import build_prompt, strip_json_fences
 from app.ai.provider import AIProvider
 from app.core.config import Settings
 from app.integrations.errors import IntegrationError, IntegrationTimeoutError
@@ -32,13 +32,7 @@ class OpenRouterProvider(AIProvider):
         if not self._settings.openrouter_api_key:
             raise IntegrationError("LLM provider is not configured")
 
-        prompt = (
-            f"Prompt: {prompt_name}\n"
-            "Return JSON only, matching this schema exactly.\n"
-            f"{json.dumps(output_schema.model_json_schema())}\n"
-            "Use only these CRM facts; do not infer missing facts:\n"
-            f"{json.dumps(variables, default=str)}"
-        )
+        prompt = build_prompt(prompt_name, variables, output_schema)
 
         client = self._client or AsyncOpenAI(
             api_key=self._settings.openrouter_api_key,
@@ -59,7 +53,7 @@ class OpenRouterProvider(AIProvider):
             if not text:
                 raise IntegrationError("LLM returned an empty response")
 
-            return output_schema.model_validate_json(text)
+            return output_schema.model_validate_json(strip_json_fences(text))
 
         except APITimeoutError as exc:
             raise IntegrationTimeoutError("LLM request timed out") from exc

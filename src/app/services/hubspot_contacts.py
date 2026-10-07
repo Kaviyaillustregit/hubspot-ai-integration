@@ -9,6 +9,16 @@ from app.db.session import UnitOfWork
 from app.integrations.hubspot.context import TenantContext
 from app.integrations.hubspot.models import HubSpotContact, HubSpotContactsPage
 from app.integrations.hubspot.oauth import OAuthTokenClient, StoredOAuthToken
+from app.services.hubspot_scopes import require_scope
+
+
+class HubSpotDuplicateContactError(ValueError):
+    """A contact with the requested email already exists in the tenant's HubSpot account."""
+
+    def __init__(self, email: str, contact_id: str) -> None:
+        super().__init__(f"HubSpot contact with email '{email}' already exists")
+        self.email = email
+        self.contact_id = contact_id
 
 
 class OAuthTokenRepository(Protocol):
@@ -47,12 +57,23 @@ class ContactsClient(Protocol):
         email: str,
     ) -> HubSpotContact | None: ...
 
+    async def search_contacts(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        query: str,
+        limit: int = 100,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContactsPage: ...
+
     async def create_contact(
         self,
         context: TenantContext,
         access_token: str,
         *,
         properties: dict[str, str | None],
+        company_id: str | None = None,
     ) -> HubSpotContact: ...
 
     async def update_contact(
@@ -203,11 +224,35 @@ class HubSpotContactsService:
             email=email,
         )
 
+    async def search_contacts(
+        self,
+        context: TenantContext,
+        *,
+        query: str,
+        limit: int = 100,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContactsPage:
+        access_token, token = await self._token_provider.get_access_token(context.tenant_id)
+        require_scope(token, "crm.objects.contacts.read")
+
+        return await self._client.search_contacts(
+            TenantContext(
+                tenant_id=context.tenant_id,
+                hubspot_account_id=token.hubspot_account_id,
+                credential_reference="hubspot-oauth-token",
+            ),
+            access_token,
+            query=query,
+            limit=limit,
+            properties=properties,
+        )
+
     async def create_contact(
         self,
         context: TenantContext,
         *,
         properties: dict[str, str | None],
+        company_id: str | None = None,
     ) -> HubSpotContact:
         access_token, token = await self._token_provider.get_access_token(
             context.tenant_id
@@ -229,14 +274,20 @@ class HubSpotContactsService:
             )
 
             if existing_contact is not None:
-                raise ValueError(
-                    f"HubSpot contact with email '{email}' already exists"
-                )
+                raise HubSpotDuplicateContactError(email, existing_contact.id)
+
+        if company_id is None:
+            return await self._client.create_contact(
+                context,
+                access_token,
+                properties=properties,
+            )
 
         return await self._client.create_contact(
             context,
             access_token,
             properties=properties,
+            company_id=company_id,
         )
 
     async def update_contact(

@@ -329,28 +329,36 @@ def test_agent_returns_no_contact_create_intent_without_email():
 
 
 @pytest.mark.asyncio
-async def test_agent_creates_pending_action_for_contact_creation():
-    created: dict[str, object] = {}
+async def test_rule_fallback_creates_contact_directly_without_confirmation():
+    started: dict[str, object] = {}
+    completed: dict[str, object] = {}
 
     class FakeActionSafety:
-        async def create_pending_action(
-            self,
-            *,
-            tenant_id: str,
-            actor_id: str,
-            action_type: str,
-            resource_type: str,
-            payload: dict[str, object],
-        ) -> str:
-            created["tenant_id"] = tenant_id
-            created["actor_id"] = actor_id
-            created["action_type"] = action_type
-            created["resource_type"] = resource_type
-            created["payload"] = payload
-            return "action-123"
+        async def start_direct_action(self, **kwargs):
+            started.update(kwargs)
+            return type("Claim", (), {"action_id": "direct-1", "claimed": True})()
+
+        async def complete_action(self, **kwargs) -> None:
+            completed.update(kwargs)
+
+        async def fail_action(self, **kwargs) -> None:
+            raise AssertionError("fail_action should not be called")
+
+        async def create_pending_action(self, **kwargs) -> str:
+            raise AssertionError("contact creation must not require confirmation")
+
+    class CreateContacts(Contacts):
+        async def create_contact(self, context, *, properties):
+            assert properties == {
+                "email": "arun@test.com",
+                "firstname": "Arun",
+                "lastname": "Kumar",
+            }
+            return HubSpotContact(id="contact-2", properties=properties)
 
     agent = AccountIntelligenceAgent(
-        HubSpotToolRegistry(Companies(), Contacts()),
+        HubSpotToolRegistry(Companies(), CreateContacts()),
+        # This provider rejects the intent prompt, which exercises the rule-based fallback.
         AIService(Provider()),
         FakeActionSafety(),  # type: ignore[arg-type]
     )
@@ -359,22 +367,14 @@ async def test_agent_creates_pending_action_for_contact_creation():
         request("Create a contact firstname Arun lastname Kumar email arun@test.com")
     )
 
-    assert result.status == "pending_confirmation"
+    assert result.status == "ok"
     assert result.request_id == "req-1"
-    assert "action-123" in result.text
-    assert "arun@test.com" in result.text
-
-    assert created == {
-        "tenant_id": "tenant-a",
-        "actor_id": "user-a",
-        "action_type": "create_contact",
-        "resource_type": "contact",
-        "payload": {
-            "email": "arun@test.com",
-            "firstname": "Arun",
-            "lastname": "Kumar",
-        },
-    }
+    assert "Contact Arun Kumar was created successfully" in result.text
+    assert "contact-2" in result.text
+    assert started["action_type"] == "create_contact"
+    assert started["idempotency_key"] == "request:req-1"
+    assert completed["action_id"] == "direct-1"
+    assert completed["resource_id"] == "contact-2"
 
 
 @pytest.mark.asyncio

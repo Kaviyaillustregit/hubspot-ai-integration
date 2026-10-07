@@ -69,3 +69,29 @@ class HubSpotContactCompanyAssociation(BaseModel):
 
 class HubSpotContactCompanyAssociations(BaseModel):
     results: list[HubSpotContactCompanyAssociation]
+
+class HubSpotDeal(BaseModel):
+    id: str
+    properties: dict[str, str | None]
+
+
+class HubSpotDealsPage(BaseModel):
+    results: list[HubSpotDeal]
+    next_after: str | None = None
+
+
+class HubSpotPipelineStage(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str
+    label: str
+    display_order: int = Field(default=0, validation_alias="displayOrder")
+
+
+class HubSpotPipeline(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str
+    label: str
+    display_order: int = Field(default=0, validation_alias="displayOrder")
+    stages: list[HubSpotPipelineStage] = Field(default_factory=list)
