@@ -9,6 +9,7 @@ import {
   parseRichText,
   shouldSend,
   statusOf,
+  tableOf,
 } from "./render.js";
 
 const API = "/api/v1/assistant";
@@ -104,13 +105,69 @@ function renderRecord(card) {
   const company = card.company
     ? el("div", { className: "record-detail", text: `Company · ${card.company}` })
     : null;
+  const hubspotLink = safeHubSpotLink(card.hubspotUrl);
   return el("div", { className: "record" }, [
     el("div", { className: "record-kind", text: card.label }),
     el("div", { className: "record-name", text: card.name }),
     card.detail ? el("div", { className: "record-detail", text: card.detail }) : null,
     company,
     meta,
+    hubspotLink,
   ]);
+}
+
+function safeHubSpotLink(url) {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || parsed.hostname !== "app.hubspot.com") return null;
+    return el("a", {
+      className: "hubspot-record-link",
+      text: "View in HubSpot",
+      attrs: { href: parsed.href, target: "_blank", rel: "noopener noreferrer" },
+    });
+  } catch {
+    return null;
+  }
+}
+
+function renderTable(tableModel) {
+  const isCompanyTable = tableModel.columns.some((column) => column.key === "employees");
+  const table = el("table", {
+    className: `crm-table${isCompanyTable ? " crm-table--company" : ""}`,
+  });
+  const head = el("thead");
+  const header = el("tr");
+  for (const column of tableModel.columns) {
+    header.append(el("th", {
+      className: column.key === "employees" ? "crm-table__employees" : "",
+      text: column.label,
+      attrs: { scope: "col" },
+    }));
+  }
+  head.append(header);
+  table.append(head);
+
+  const body = el("tbody");
+  for (const row of tableModel.rows) {
+    const tr = el("tr");
+    for (const column of tableModel.columns) {
+      const cell = el("td", {
+        className: column.key === "employees" ? "crm-table__employees" : "",
+      });
+      if (column.key === "view_url") {
+        const link = safeHubSpotLink(row[column.key]);
+        if (link) cell.append(link);
+        else cell.textContent = "—";
+      } else {
+        cell.textContent = row[column.key] == null ? "" : String(row[column.key]);
+      }
+      tr.append(cell);
+    }
+    body.append(tr);
+  }
+  table.append(body);
+  return el("div", { className: "table-wrap", attrs: { role: "region", "aria-label": "CRM deal results", tabindex: "0" } }, [table]);
 }
 
 export function renderReply(reply, { onConfirm } = {}) {
@@ -130,6 +187,13 @@ export function renderReply(reply, { onConfirm } = {}) {
 
   const records = cardsOf(reply);
   if (records.length) card.append(el("div", { className: "records" }, records.map(renderRecord)));
+
+  const table = tableOf(reply);
+  if (table) card.append(renderTable(table));
+  else if (!records.length) {
+    const resultLink = safeHubSpotLink((reply.result || {}).hubspot_url);
+    if (resultLink) card.append(resultLink);
+  }
 
   const confirmation = confirmationOf(reply);
   if (confirmation && onConfirm) {

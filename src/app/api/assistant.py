@@ -60,7 +60,7 @@ class AssistantReply(BaseModel):
     status: str
     text: str
     request_id: str
-    result: dict[str, str] | None = None
+    result: dict[str, object] | None = None
     cards: list[dict[str, str]] = Field(default_factory=list)
 
 

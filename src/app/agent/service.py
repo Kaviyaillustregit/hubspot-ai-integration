@@ -87,8 +87,10 @@ _JOBTITLE_PATTERN = re.compile(
     r"\bjobtitle\s*[:=]?\s*(.+?)(?=\s+(?:email|firstname|lastname|jobtitle)\b|$)",
     re.IGNORECASE,
 )
-
-
+_ALL_CONTACTS_LIST_PATTERN = re.compile(
+    r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+contacts\b",
+    re.IGNORECASE,
+)
 class AccountIntelligenceAgent:
     def __init__(
         self,
@@ -157,6 +159,15 @@ class AccountIntelligenceAgent:
                         ),
                         request_id=request.request_id,
                         tools_used=["update_contact"],
+                        result={
+                            "kind": "crm_records",
+                            "title": "Contact Updated",
+                            "hubspot_url": (
+                                await self._tools.hubspot_record_urls(
+                                    request.tenant_id, [("contacts", contact.id)]
+                                )
+                            )[0],
+                        },
                     )
 
                 except IntegrationError:
@@ -211,6 +222,15 @@ class AccountIntelligenceAgent:
                         ),
                         request_id=request.request_id,
                         tools_used=["delete_contact"],
+                        result={
+                            "kind": "crm_records",
+                            "title": "Contact Archived",
+                            "hubspot_url": (
+                                await self._tools.hubspot_record_urls(
+                                    request.tenant_id, [("contacts", contact_id)]
+                                )
+                            )[0],
+                        },
                     )
 
                 except IntegrationError:
@@ -352,6 +372,13 @@ class AccountIntelligenceAgent:
             return self._safe("unsupported", _CAPABILITIES_TEXT, request)
 
         if (
+            extraction.intent == "crm_question"
+            and extraction.query is None
+            and _ALL_CONTACTS_LIST_PATTERN.search(request.message)
+        ):
+            extraction = extraction.model_copy(update={"query": "contact_list"})
+
+        if (
             extraction.intent in _WRITE_INTENTS
             and extraction.confidence < _MIN_WRITE_CONFIDENCE
         ):
@@ -420,8 +447,7 @@ class AccountIntelligenceAgent:
                     request,
                 )
             return await self._propose_contact_delete(
-                request,
-                ContactDeleteIntent(contact_id=validated.contact_id),
+                request, ContactDeleteIntent(contact_id=validated.contact_id)
             )
 
         return await self._answer_crm_question(
@@ -734,7 +760,16 @@ class AccountIntelligenceAgent:
             or contact.id
         )
 
-        result = {"kind": "contact_created", "contact_id": contact.id, "name": display_name}
+        result: dict[str, object] = {
+            "kind": "contact_created",
+            "contact_id": contact.id,
+            "name": display_name,
+        }
+        result["hubspot_url"] = (
+            await self._tools.hubspot_record_urls(
+                request.tenant_id, [("contacts", contact.id)]
+            )
+        )[0]
         if draft.properties.get("email"):
             result["email"] = draft.properties["email"]
 

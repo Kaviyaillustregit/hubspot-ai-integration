@@ -66,18 +66,32 @@ class HubSpotAssociationsClient(HubSpotApiClient):
         to_type: CRMObjectType,
         limit: int = 100,
     ) -> list[str]:
-        payload = await self._call(
-            "GET",
-            f"/crm/v4/objects/{from_type}/{from_id}/associations/{to_type}",
-            access_token,
-            label="HubSpot associations",
-            params={"limit": limit},
-        )
-        try:
-            page = _AssociationsPage.model_validate(payload or {})
-        except (ValueError, TypeError) as exc:
-            raise IntegrationError("HubSpot associations response was invalid") from exc
-        return list(dict.fromkeys(item.to_object_id for item in page.results))
+        record_ids: list[str] = []
+        after: str | None = None
+        seen: set[str] = set()
+        while True:
+            params: dict[str, str | int] = {"limit": limit}
+            if after:
+                params["after"] = after
+            payload = await self._call(
+                "GET",
+                f"/crm/v4/objects/{from_type}/{from_id}/associations/{to_type}",
+                access_token,
+                label="HubSpot associations",
+                params=params,
+            )
+            try:
+                page = _AssociationsPage.model_validate(payload or {})
+            except (ValueError, TypeError) as exc:
+                raise IntegrationError("HubSpot associations response was invalid") from exc
+            record_ids.extend(item.to_object_id for item in page.results)
+            next_after = page.paging.get("next", {}).get("after") if page.paging else None
+            if next_after is None:
+                return list(dict.fromkeys(record_ids))
+            if next_after in seen:
+                raise IntegrationError("HubSpot associations repeated a pagination cursor")
+            seen.add(next_after)
+            after = next_after
 
     async def read_records(
         self,

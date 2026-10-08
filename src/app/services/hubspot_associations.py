@@ -95,13 +95,18 @@ class HubSpotAssociationsService:
             to_type=to_type,
             limit=limit,
         )
-        return await self._client.read_records(
-            resolved,
-            access_token,
-            object_type=to_type,
-            record_ids=record_ids,
-            properties=properties,
-        )
+        records: list[HubSpotRecord] = []
+        for offset in range(0, len(record_ids), 100):
+            records.extend(
+                await self._client.read_records(
+                    resolved,
+                    access_token,
+                    object_type=to_type,
+                    record_ids=record_ids[offset : offset + 100],
+                    properties=properties,
+                )
+            )
+        return records
 
     async def _authorized(
         self, context: TenantContext, scopes: Sequence[str]

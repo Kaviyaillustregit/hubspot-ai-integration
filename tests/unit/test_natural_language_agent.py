@@ -83,6 +83,9 @@ class FakeContacts:
         self.created: list[dict[str, object]] = []
         self.existing: list[HubSpotContact] = []
 
+    async def get_hubspot_account_id(self, context):
+        return "42"
+
     async def create_contact(self, context, *, properties, company_id=None):
         assert context.tenant_id == "tenant-a"
         if self.duplicate_of is not None:
@@ -92,6 +95,22 @@ class FakeContacts:
 
     async def list_contacts(self, context, **kwargs):
         return HubSpotContactsPage(results=self.existing)
+
+    async def search_contacts(self, context, *, query, **kwargs):
+        matches = [
+            contact
+            for contact in self.existing
+            if query.casefold() in " ".join(
+                value or "" for value in contact.properties.values()
+            ).casefold()
+        ]
+        return HubSpotContactsPage(results=matches)
+
+    async def find_contact_by_email(self, tenant_id, email):
+        return next(
+            (contact for contact in self.existing if contact.properties.get("email") == email),
+            None,
+        )
 
     async def update_contact(self, context, **kwargs):
         raise AssertionError("update must wait for confirmation")
@@ -269,6 +288,7 @@ async def test_full_example_creates_and_associates_contact():
         "kind": "contact_created",
         "contact_id": "contact-1",
         "name": "Victor Hall",
+        "hubspot_url": "https://app.hubspot.com/contacts/42/record/0-1/contact-1",
         "email": "victor@abc.com",
         "company_name": "ABC Company",
     }

@@ -10,7 +10,8 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from app.agent.extraction import ValidatedExtraction
@@ -224,7 +225,7 @@ class CRMOperations:
                     "Existing-record outcome was not recorded",
                     extra={"tenant_id": request.tenant_id},
                 )
-            return _existing_records_response(request, plan.reused)
+            return await _existing_records_response(request, plan.reused, self._tools)
 
         try:
             await self._safety.complete_action(
@@ -260,7 +261,6 @@ class CRMOperations:
     ) -> None:
         """Resolve every record and check every value before anything is written."""
         tenant_id = request.tenant_id
-
         if actions["company"] is not None and validated.company_name:
             name = validated.company_name
             resolution = await self._tools.resolve_company(tenant_id, name)
@@ -348,12 +348,15 @@ class CRMOperations:
         plan: _Plan,
     ) -> None:
         tenant_id = request.tenant_id
-
         if plan.company_to_create is not None:
             plan.step = f"Creating company {plan.company_to_create['name']}"
             plan.company = await self._tools.create_company(tenant_id, plan.company_to_create)
             plan.written["company_id"] = plan.company.id
-            plan.cards.append(_company_card_summary(plan.company))
+            company_card = _company_card_summary(plan.company)
+            company_card["hubspot_url"] = (
+                await self._tools.hubspot_record_urls(tenant_id, [("companies", plan.company.id)])
+            )[0]
+            plan.cards.append(company_card)
             plan.lines.append(f"✅ Company created: {_company_label(plan.company, '')}")
 
         if plan.contact_to_create is not None:
@@ -362,15 +365,17 @@ class CRMOperations:
             contact_properties: dict[str, str | None] = dict(plan.contact_to_create)
             plan.contact = await self._tools.create_contact(tenant_id, contact_properties)
             plan.written["contact_id"] = plan.contact.id
-            plan.cards.append(
-                _card(
-                    "contact",
-                    "Contact created",
-                    label,
-                    plan.contact_to_create.get("email"),
-                    plan.contact.id,
-                )
+            contact_card = _card(
+                "contact",
+                "Contact created",
+                label,
+                plan.contact_to_create.get("email"),
+                plan.contact.id,
             )
+            contact_card["hubspot_url"] = (
+                await self._tools.hubspot_record_urls(tenant_id, [("contacts", plan.contact.id)])
+            )[0]
+            plan.cards.append(contact_card)
             plan.lines.append(f"✅ Contact created: {label}")
 
         if plan.deal_to_create is not None:
@@ -396,7 +401,13 @@ class CRMOperations:
                 )
                 if part
             )
-            plan.cards.append(_card("deal", "Deal created", name, deal_detail, plan.deal.id))
+            deal_card = _card("deal", "Deal created", name, deal_detail, plan.deal.id)
+            deal_card["hubspot_url"] = (
+                await self._tools.hubspot_record_urls(
+                    tenant_id, [("deals", plan.deal.id)]
+                )
+            )[0]
+            plan.cards.append(deal_card)
 
         records: dict[Entity, HubSpotCompany | HubSpotContact | HubSpotDeal | None] = {
             "company": plan.company,
@@ -446,8 +457,7 @@ class CRMOperations:
         if updates[0] == "deal":
             return await self._propose_deal_update(request, validated)
         raise OperationError(
-            "needs_clarification",
-            "To update a contact, include the contact's HubSpot ID and the new values.",
+            "needs_clarification", "Contact update is handled by the contact agent."
         )
 
     async def _propose_company_update(
@@ -466,7 +476,7 @@ class CRMOperations:
             company = await self._resolve_company(request, validated.company_name)
         except (IntegrationError, ValueError) as exc:
             raise OperationError(*_hubspot_failure(exc)) from exc
-        label = _company_label(company, validated.company_name)
+        label = _company_label(company, validated.company_name or company.id)
         summary = ", ".join(f"{key} → {value}" for key, value in changes.items())
         action_id = await self._safety.create_pending_action(
             tenant_id=request.tenant_id,
@@ -534,7 +544,7 @@ class CRMOperations:
         except (IntegrationError, ValueError) as exc:
             raise OperationError(*_hubspot_failure(exc)) from exc
 
-        label = deal.properties.get("dealname") or validated.deal_name
+        label = deal.properties.get("dealname") or validated.deal_name or deal.id
         summary = ", ".join(described)
         action_id = await self._safety.create_pending_action(
             tenant_id=request.tenant_id,
@@ -570,7 +580,10 @@ class CRMOperations:
         kind = "company" if is_company else "deal"
         record_id = str(payload[f"{kind}_id"])
         label = str(payload.get(f"{kind}_name") or record_id)
-        properties = {str(key): str(value) for key, value in dict(payload["properties"]).items()}
+        properties = {
+            str(key): str(value)
+            for key, value in dict(payload.get("properties", {})).items()
+        }
         try:
             if is_company:
                 await self._tools.update_company(request.tenant_id, record_id, properties)
@@ -605,7 +618,16 @@ class CRMOperations:
             ),
             request_id=request.request_id,
             tools_used=[f"update_{kind}"],
-            result={"kind": "crm_records", "title": f"{kind.capitalize()} Updated"},
+            result={
+                "kind": "crm_records",
+                "title": f"{kind.capitalize()} Updated",
+                "hubspot_url": (
+                    await self._tools.hubspot_record_urls(
+                        request.tenant_id,
+                        [("companies" if is_company else "deals", record_id)],
+                    )
+                )[0],
+            },
         )
 
     # ------------------------------------------------------------------ read queries
@@ -615,64 +637,554 @@ class CRMOperations:
     ) -> AgentResponse:
         tenant_id = request.tenant_id
         try:
-            if query in ("company_details", "company_contacts", "company_deals"):
+            if query == "company_list":
+                companies = await self._tools.list_all_companies(tenant_id)
+                deal_names = {
+                    company.id: ", ".join(
+                        str(deal.properties.get("dealname") or deal.id)
+                        for deal in await self._tools.associated_records(
+                            tenant_id,
+                            from_type="companies",
+                            from_id=company.id,
+                            to_type="deals",
+                        )
+                    )
+                    for company in companies
+                }
+                rows = [
+                    {
+                        "name": item.properties.get("name") or item.id,
+                        "owner": item.properties.get("hubspot_owner_id") or "",
+                        "phone": item.properties.get("phone") or "",
+                        "city": item.properties.get("city") or "",
+                        "industry": item.properties.get("industry") or "",
+                        "employees": item.properties.get("numberofemployees") or "",
+                        "lifecycle": item.properties.get("lifecyclestage") or "",
+                        "lead_status": item.properties.get("hs_lead_status") or "",
+                        "last_contacted": _date_value(
+                            item.properties.get("notes_last_contacted")
+                        ),
+                        "associated_deals": deal_names[item.id],
+                    }
+                    for item in companies
+                ]
+                await _add_hubspot_urls(
+                    self._tools, tenant_id, rows, [("companies", item.id) for item in companies]
+                )
+                return _table_response(
+                    request,
+                    "Companies",
+                    f"Found {len(companies)} companies.",
+                    [
+                        ("name", "Name"),
+                        ("owner", "Owner"),
+                        ("phone", "Phone"),
+                        ("city", "City"),
+                        ("industry", "Industry"),
+                        ("employees", "Number of Employees"),
+                        ("lifecycle", "Lifecycle Stage"),
+                        ("lead_status", "Lead Status"),
+                        ("last_contacted", "Last Contacted"),
+                        ("associated_deals", "Associated Deals"),
+                    ],
+                    rows,
+                    tools=["list_all_companies", "associated_records"],
+                    requested_fields=validated.requested_fields,
+                )
+
+            if query in ("company_search", "company_details"):
+                if not validated.company_name:
+                    raise OperationError(
+                        "missing_fields", "Which company? Please include the company's name."
+                    )
+                if query == "company_search":
+                    companies = await self._tools.search_companies(
+                        tenant_id, validated.company_name or ""
+                    )
+                    company_search_rows: list[dict[str, str]] = []
+                    for item in companies:
+                        row = _company_row(item)
+                        deals = await self._tools.associated_records(
+                            tenant_id,
+                            from_type="companies",
+                            from_id=item.id,
+                            to_type="deals",
+                        )
+                        row["associated_deals"] = ", ".join(
+                            str(deal.properties.get("dealname") or deal.id) for deal in deals
+                        )
+                        company_search_rows.append(row)
+                    await _add_hubspot_urls(
+                        self._tools,
+                        tenant_id,
+                        company_search_rows,
+                        [("companies", item.id) for item in companies],
+                    )
+                    return _table_response(
+                        request,
+                        "Company Search",
+                        f"Found {len(companies)} matching companies.",
+                        [
+                            ("name", "Name"),
+                            ("owner", "Owner"),
+                            ("phone", "Phone"),
+                            ("city", "City"),
+                            ("industry", "Industry"),
+                            ("employees", "Number of Employees"),
+                            ("lifecycle", "Lifecycle Stage"),
+                            ("lead_status", "Lead Status"),
+                            ("last_contacted", "Last Contacted"),
+                            ("associated_deals", "Associated Deals"),
+                        ],
+                        company_search_rows,
+                        tools=["search_companies", "associated_records"],
+                        requested_fields=validated.requested_fields,
+                    )
+
+                company = await self._resolve_company(request, validated.company_name)
+                record = company
+                associated = await self._tools.associated_records(
+                    tenant_id, from_type="companies", from_id=company.id, to_type="deals"
+                )
+                row = _company_row(record)
+                row["associated_deals"] = ", ".join(
+                    str(deal.properties.get("dealname") or deal.id) for deal in associated
+                )
+                await _add_hubspot_urls(
+                    self._tools, tenant_id, [row], [("companies", company.id)]
+                )
+                return _table_response(
+                    request,
+                    "Company Details",
+                    "Company details from HubSpot.",
+                    [
+                        ("name", "Name"),
+                        ("owner", "Owner"),
+                        ("phone", "Phone"),
+                        ("city", "City"),
+                        ("industry", "Industry"),
+                        ("employees", "Number of Employees"),
+                        ("lifecycle", "Lifecycle Stage"),
+                        ("lead_status", "Lead Status"),
+                        ("last_contacted", "Last Contacted"),
+                        ("associated_deals", "Associated Deals"),
+                    ],
+                    [row],
+                    tools=["resolve_company", "get_company", "associated_records"],
+                    requested_fields=validated.requested_fields,
+                )
+
+            if query in ("contact_list", "contact_search"):
+                search_text = _contact_search_text(validated)
+                if query == "contact_search" and not search_text:
+                    raise OperationError(
+                        "missing_fields", "Which contact? Please include a name or email."
+                    )
+                contacts = (
+                    await self._tools.list_all_contacts(tenant_id)
+                    if query == "contact_list"
+                    else await self._tools.search_contacts(tenant_id, search_text)
+                )
+                companies_by_contact: dict[str, HubSpotRecord] = {}
+                for contact in contacts:
+                    associated_companies = await self._tools.associated_records(
+                        tenant_id,
+                        from_type="contacts",
+                        from_id=contact.id,
+                        to_type="companies",
+                    )
+                    if associated_companies:
+                        companies_by_contact[contact.id] = associated_companies[0]
+                    else:
+                        company_id = contact.properties.get("associatedcompanyid")
+                        if not company_id:
+                            continue
+                        company = await self._tools.get_company(tenant_id, company_id)
+                        companies_by_contact[contact.id] = HubSpotRecord(
+                            id=company.id, properties=company.properties
+                        )
+                deals_by_contact: dict[str, str] = {}
+                for contact in contacts:
+                    deals = await self._tools.associated_records(
+                        tenant_id,
+                        from_type="contacts",
+                        from_id=contact.id,
+                        to_type="deals",
+                    )
+                    deals_by_contact[contact.id] = ", ".join(
+                        str(deal.properties.get("dealname") or deal.id) for deal in deals
+                    )
+                summary = (
+                    f"Found {len(contacts)} contacts."
+                    if query == "contact_list"
+                    else f"Found {len(contacts)} matching contacts."
+                )
+                rows = [
+                    _contact_row(
+                        item,
+                        companies_by_contact.get(item.id),
+                        deals_by_contact[item.id],
+                    )
+                    for item in contacts
+                ]
+                await _add_hubspot_urls(
+                    self._tools, tenant_id, rows, [("contacts", item.id) for item in contacts]
+                )
+                return _table_response(
+                    request,
+                    "Contacts" if query == "contact_list" else "Contact Search",
+                    summary,
+                    _contact_columns(),
+                    rows,
+                    tools=[
+                        "list_all_contacts" if query == "contact_list" else "search_contacts",
+                        "associated_records",
+                    ],
+                    requested_fields=validated.requested_fields,
+                )
+
+            if query in {
+                "open_deals",
+                "closed_deals",
+                "closed_won_deals",
+                "closed_lost_deals",
+                "best_chance_deals",
+                "all_deals",
+            }:
+                return await self._answer_deal_list(
+                    request, query, validated.requested_fields
+                )
+
+            if query in ("company_contacts", "company_deals"):
                 if not validated.company_name:
                     raise OperationError(
                         "missing_fields", "Which company? Please include the company's name."
                     )
                 company = await self._resolve_company(request, validated.company_name)
                 label = _company_label(company, validated.company_name)
-                if query == "company_details":
-                    record = await self._tools.get_company(tenant_id, company.id)
-                    return _records_response(
-                        request, "Company Details", _company_card(record)
-                    )
                 to_type: CRMObjectType = "contacts" if query == "company_contacts" else "deals"
-                linked = await self._tools.associated_records(
+                company_records = await self._tools.associated_records(
                     tenant_id, from_type="companies", from_id=company.id, to_type=to_type
                 )
                 if to_type == "contacts":
-                    lines = [_contact_line(record) for record in linked]
-                    return _records_response(
+                    rows = [
+                        {**_contact_row(record, None), "company": label}
+                        for record in company_records
+                    ]
+                    await _add_hubspot_urls(
+                        self._tools,
+                        tenant_id,
+                        rows,
+                        [("contacts", record.id) for record in company_records],
+                    )
+                    return _table_response(
                         request,
                         f"Contacts at {label}",
-                        _list_text(lines, f"No contacts are associated with {label}."),
+                        f"Found {len(company_records)} associated contacts.",
+                        _contact_columns(),
+                        rows,
+                        tools=["resolve_company", "associated_records"],
+                        requested_fields=validated.requested_fields,
                     )
-                stage_labels = await self._stage_labels(tenant_id) if linked else {}
-                lines = [_deal_line(record, stage_labels) for record in linked]
-                return _records_response(
+                stage_labels = (
+                    await self._stage_labels(tenant_id) if company_records else {}
+                )
+                deal_rows = [
+                    {**_deal_row(record, stage_labels), "company": label}
+                    for record in company_records
+                ]
+                await _add_hubspot_urls(
+                    self._tools,
+                    tenant_id,
+                    deal_rows,
+                    [("deals", record.id) for record in company_records],
+                )
+                return _table_response(
                     request,
                     f"Deals for {label}",
-                    _list_text(lines, f"No deals are associated with {label}."),
+                    f"Found {len(company_records)} associated deals.",
+                    _deal_columns(),
+                    deal_rows,
+                    tools=["resolve_company", "associated_records"],
+                    requested_fields=validated.requested_fields,
                 )
 
-            if query in ("contact_details", "contact_company"):
+            if query in ("contact_details", "contact_company", "contact_deals"):
                 contact = await self._resolve_contact(request, validated)
                 if query == "contact_details":
-                    return _records_response(request, "Contact Details", _contact_card(contact))
-                linked = await self._tools.associated_records(
-                    tenant_id, from_type="contacts", from_id=contact.id, to_type="companies"
+                    contact = await self._tools.get_contact(tenant_id, contact.id)
+                    associated_companies = await self._tools.associated_records(
+                        tenant_id, from_type="contacts", from_id=contact.id, to_type="companies"
+                    )
+                    associated_company = associated_companies[0] if associated_companies else None
+                    deals = await self._tools.associated_records(
+                        tenant_id, from_type="contacts", from_id=contact.id, to_type="deals"
+                    )
+                    row = _contact_row(contact, None)
+                    row["company"] = (
+                        str(associated_company.properties.get("name") or "")
+                        if associated_company
+                        else ""
+                    )
+                    row["associated_deals"] = ", ".join(
+                        str(deal.properties.get("dealname") or deal.id) for deal in deals
+                    )
+                    await _add_hubspot_urls(
+                        self._tools, tenant_id, [row], [("contacts", contact.id)]
+                    )
+                    return _table_response(
+                        request,
+                        "Contact Details",
+                        "Contact details from HubSpot.",
+                        _contact_columns(),
+                        [row],
+                        tools=["resolve_contact", "get_contact", "associated_records"],
+                        requested_fields=validated.requested_fields,
+                    )
+                contact_records = await self._tools.associated_records(
+                    tenant_id,
+                    from_type="contacts",
+                    from_id=contact.id,
+                    to_type="deals" if query == "contact_deals" else "companies",
                 )
                 label = _contact_label(contact, validated.properties)
-                lines = [f"• {record.properties.get('name') or record.id}" for record in linked]
-                return _records_response(
+                if query == "contact_deals":
+                    stage_labels = (
+                        await self._stage_labels(tenant_id) if contact_records else {}
+                    )
+                    contact_deal_rows: list[dict[str, str]] = []
+                    for associated_deal in contact_records:
+                        associated_deal_companies = await self._tools.associated_records(
+                            tenant_id,
+                            from_type="deals",
+                            from_id=associated_deal.id,
+                            to_type="companies",
+                        )
+                        contact_deal_rows.append(
+                            {
+                                **_deal_row(associated_deal, stage_labels),
+                                "company": (
+                                    str(
+                                        associated_deal_companies[0].properties.get("name")
+                                        or associated_deal_companies[0].id
+                                    )
+                                    if associated_deal_companies
+                                    else ""
+                                ),
+                            }
+                        )
+                    await _add_hubspot_urls(
+                        self._tools,
+                        tenant_id,
+                        contact_deal_rows,
+                        [("deals", record.id) for record in contact_records],
+                    )
+                    return _table_response(
+                        request,
+                        f"Deals for {label}",
+                        f"Found {len(contact_records)} associated deals.",
+                        _deal_columns(),
+                        contact_deal_rows,
+                        tools=["resolve_contact", "associated_records", "deal_pipelines"],
+                        requested_fields=validated.requested_fields,
+                    )
+                rows = [
+                    {"name": record.properties.get("name") or record.id}
+                    for record in contact_records
+                ]
+                await _add_hubspot_urls(
+                    self._tools,
+                    tenant_id,
+                    rows,
+                    [("companies", record.id) for record in contact_records],
+                )
+                return _table_response(
                     request,
                     f"Companies for {label}",
-                    _list_text(lines, f"{label} isn't associated with any company."),
+                    f"Found {len(contact_records)} associated companies.",
+                    [("name", "Name")],
+                    rows,
+                    tools=["resolve_contact", "associated_records"],
+                    requested_fields=validated.requested_fields,
                 )
 
             if not validated.deal_name:
                 raise OperationError(
-                    "missing_fields", "Which deal? Please include the deal's name."
+                    "missing_fields", "Which deal? Please include its name."
                 )
             deal = await self._resolve_deal(request, validated.deal_name)
-            return _records_response(
+            associated_companies = await self._tools.associated_records(
+                tenant_id, from_type="deals", from_id=deal.id, to_type="companies"
+            )
+            row = _deal_row(deal, await self._stage_labels(tenant_id))
+            if associated_companies:
+                row["company"] = str(
+                    associated_companies[0].properties.get("name")
+                    or associated_companies[0].id
+                )
+            await _add_hubspot_urls(self._tools, tenant_id, [row], [("deals", deal.id)])
+            return _table_response(
                 request,
                 "Deal Details",
-                _deal_card(deal, await self._stage_labels(tenant_id)),
+                "Deal details from HubSpot.",
+                _deal_columns(),
+                [row],
+                tools=["resolve_deal", "get_deal", "associated_records"],
+                requested_fields=validated.requested_fields,
             )
         except (IntegrationError, ValueError) as exc:
             return _response(request, *_hubspot_failure(exc))
+
+    async def _answer_deal_list(
+        self,
+        request: AgentRequest,
+        query: CRMQueryName,
+        requested_fields: list[str] | None = None,
+    ) -> AgentResponse:
+        pipelines = await self._tools.deal_pipelines(request.tenant_id)
+        stages = {
+            stage.id: stage
+            for pipeline in pipelines
+            for stage in pipeline.stages
+        }
+        all_deals = await self._tools.list_all_deals(request.tenant_id)
+
+        def is_closed(deal: HubSpotDeal) -> bool | None:
+            stage = stages.get(deal.properties.get("dealstage") or "")
+            if stage is None:
+                return None
+            configured = stage.metadata.get("isClosed", "").casefold()
+            return configured == "true" if configured in {"true", "false"} else None
+
+        def is_won(deal: HubSpotDeal) -> bool:
+            stage = stages.get(deal.properties.get("dealstage") or "")
+            if stage is None:
+                return False
+            configured = stage.metadata.get("isClosedWon")
+            if configured is not None:
+                return configured.casefold() == "true"
+            try:
+                return Decimal(stage.metadata["probability"]) == 1
+            except (KeyError, InvalidOperation):
+                return False
+
+        def is_lost(deal: HubSpotDeal) -> bool:
+            stage = stages.get(deal.properties.get("dealstage") or "")
+            if stage is None:
+                return False
+            configured = stage.metadata.get("isClosedWon")
+            if configured is not None:
+                return configured.casefold() == "false"
+            try:
+                return Decimal(stage.metadata["probability"]) == 0
+            except (KeyError, InvalidOperation):
+                return False
+
+        open_deals = [deal for deal in all_deals if is_closed(deal) is False]
+        if query == "all_deals":
+            deals = all_deals
+        elif query in ("open_deals", "best_chance_deals"):
+            deals = open_deals
+        elif query == "closed_deals":
+            deals = [deal for deal in all_deals if is_closed(deal) is True]
+        elif query == "closed_won_deals":
+            deals = [deal for deal in all_deals if is_closed(deal) is True and is_won(deal)]
+        else:
+            deals = [deal for deal in all_deals if is_closed(deal) is True and is_lost(deal)]
+
+        probabilities = {deal.id: _deal_probability(deal) for deal in deals}
+        if query == "best_chance_deals":
+            deals.sort(
+                key=lambda deal: (
+                    probabilities[deal.id] is not None,
+                    probabilities[deal.id] if probabilities[deal.id] is not None else Decimal(-1),
+                ),
+                reverse=True,
+            )
+
+        rows: list[dict[str, str]] = []
+        for deal in deals:
+            properties = deal.properties
+            amount = properties.get("amount")
+            associated = await self._tools.associated_records(
+                request.tenant_id,
+                from_type="deals",
+                from_id=deal.id,
+                to_type="companies",
+            )
+            rows.append(
+                {
+                    "name": properties.get("dealname") or deal.id,
+                    "company": (
+                        str(associated[0].properties.get("name") or "") if associated else ""
+                    ),
+                    "owner": properties.get("hubspot_owner_id") or "",
+                    "stage": _stage_label(properties.get("dealstage"), stages),
+                    "amount": format_amount(amount) if amount else "",
+                    "probability": _format_probability(probabilities[deal.id]),
+                    "close_date": (properties.get("closedate") or "")[:10],
+                }
+            )
+
+        await _add_hubspot_urls(
+            self._tools, request.tenant_id, rows, [("deals", deal.id) for deal in deals]
+        )
+        if query == "best_chance_deals":
+            ranked = [
+                (
+                    f"{deal.properties.get('dealname') or deal.id} "
+                    f"({_format_probability(probabilities[deal.id])})"
+                )
+                for deal in deals
+                if probabilities[deal.id] is not None
+            ]
+            summary = (
+                "Highest-probability open deals based on HubSpot's recorded probability: "
+                + ", ".join(ranked[:3])
+                + "."
+                if ranked
+                else "No open deals have a recorded HubSpot probability to rank."
+            )
+            title = "Open Deals by Probability"
+        else:
+            status_label = {
+                "open_deals": "open",
+                "closed_deals": "closed",
+                "closed_won_deals": "closed-won",
+                "closed_lost_deals": "closed-lost",
+                "all_deals": "total",
+            }[query]
+            summary = f"Found {len(deals)} {status_label} deal{'s' if len(deals) != 1 else ''}."
+            title = f"{status_label.capitalize()} Deals"
+            if not deals:
+                summary = f"No {status_label} deals were found."
+
+        deal_columns = _columns_for_request(_deal_columns(), requested_fields or [])
+        if requested_fields:
+            for row in rows:
+                for key, _ in deal_columns:
+                    if key in requested_fields and not row.get(key):
+                        row[key] = "—"
+
+        return AgentResponse(
+            status="ok",
+            text=summary,
+            request_id=request.request_id,
+            tools_used=["deal_pipelines", "list_all_deals", "associated_records"],
+            result={
+                "kind": "crm_records",
+                "title": title,
+                "message": summary,
+                "table": {
+                    "columns": [
+                        {"key": key, "label": label}
+                        for key, label in deal_columns
+                    ]
+                    + [{"key": "view_url", "label": "View in HubSpot"}],
+                    "rows": rows,
+                },
+            },
+        )
 
     # ------------------------------------------------------------------- resolution
 
@@ -1008,6 +1520,126 @@ def _deal_card(deal: HubSpotDeal, stage_labels: dict[str, str]) -> str:
     )
 
 
+def _date_value(value: str | None) -> str:
+    if not value:
+        return ""
+    if value.isdigit() and len(value) == 13:
+        return datetime.fromtimestamp(int(value) / 1000, tz=UTC).date().isoformat()
+    return value[:10]
+
+
+def _company_row(company: HubSpotCompany) -> dict[str, str]:
+    properties = company.properties
+    return {
+        "name": properties.get("name") or company.id,
+        "owner": properties.get("hubspot_owner_id") or "",
+        "phone": properties.get("phone") or "",
+        "city": properties.get("city") or "",
+        "industry": properties.get("industry") or "",
+        "employees": properties.get("numberofemployees") or "",
+        "lifecycle": properties.get("lifecyclestage") or "",
+        "lead_status": properties.get("hs_lead_status") or "",
+        "last_contacted": _date_value(properties.get("notes_last_contacted")),
+    }
+
+
+def _contact_columns() -> list[tuple[str, str]]:
+    return [
+        ("name", "Name"),
+        ("owner", "Owner"),
+        ("email", "Email"),
+        ("phone", "Phone"),
+        ("company", "Associated Company"),
+        ("city", "City"),
+        ("state", "State/Region"),
+        ("industry", "Industry"),
+        ("lifecycle", "Lifecycle Stage"),
+        ("lead_status", "Lead Status"),
+        ("last_contacted", "Last Contacted"),
+        ("job_title", "Employment Role"),
+        ("job_sub_role", "Job Sub Role"),
+        ("seniority", "Job Seniority"),
+        ("linkedin", "LinkedIn"),
+        ("associated_deals", "Associated Deals"),
+    ]
+
+
+def _contact_row(
+    contact: HubSpotContact | HubSpotRecord,
+    company: HubSpotCompany | HubSpotRecord | None,
+    associated_deals: str = "",
+) -> dict[str, str]:
+    properties = contact.properties
+    return {
+        "name": " ".join(
+            part for part in (properties.get("firstname"), properties.get("lastname")) if part
+        )
+        or contact.id,
+        "owner": properties.get("hubspot_owner_id") or "",
+        "email": properties.get("email") or "",
+        "phone": properties.get("phone") or "",
+        "company": (
+            company.properties.get("name") or company.id
+            if company
+            else properties.get("associatedcompanyid") or ""
+        ),
+        "city": properties.get("city") or "",
+        "state": properties.get("state") or properties.get("country") or "",
+        "industry": properties.get("industry") or "",
+        "lifecycle": properties.get("lifecyclestage") or "",
+        "lead_status": properties.get("hs_lead_status") or "",
+        "last_contacted": _date_value(properties.get("notes_last_contacted")),
+        "job_title": properties.get("jobtitle") or properties.get("hs_role") or "",
+        "job_sub_role": properties.get("hs_sub_role") or "",
+        "seniority": properties.get("hs_seniority") or "",
+        "linkedin": properties.get("hs_linkedin_url") or "",
+        "associated_deals": associated_deals,
+    }
+
+
+def _deal_columns() -> list[tuple[str, str]]:
+    return [
+        ("name", "Name"),
+        ("company", "Account/Company"),
+        ("owner", "Owner"),
+        ("stage", "Stage Name"),
+        ("amount", "Amount"),
+        ("probability", "Probability"),
+        ("close_date", "Close Date"),
+    ]
+
+
+def _deal_row(
+    deal: HubSpotDeal | HubSpotRecord, stage_labels: dict[str, str]
+) -> dict[str, str]:
+    properties = deal.properties
+    amount = properties.get("amount")
+    stage = properties.get("dealstage")
+    return {
+        "name": properties.get("dealname") or deal.id,
+        "company": properties.get("associatedcompanyid") or "",
+        "owner": properties.get("hubspot_owner_id") or "",
+        "stage": stage_labels.get(stage, stage) if stage else "",
+        "amount": format_amount(amount) if amount else "",
+        "probability": _format_probability(
+            _deal_probability(HubSpotDeal(id=deal.id, properties=properties))
+        ),
+        "close_date": _date_value(properties.get("closedate")),
+    }
+
+
+def _contact_search_text(validated: ValidatedExtraction) -> str:
+    return " ".join(
+        value
+        for value in (
+            validated.properties.get("firstname"),
+            validated.properties.get("lastname"),
+            validated.properties.get("email"),
+        )
+        if value
+    )
+
+
 def _contact_line(record: HubSpotRecord) -> str:
     name = _contact_label(record, {}) or f"Contact {record.id}"
     email = record.properties.get("email")
@@ -1024,6 +1656,36 @@ def _deal_line(record: HubSpotRecord, stage_labels: dict[str, str]) -> str:
     ]
     details = " — ".join(part for part in parts if part)
     return f"• {properties.get('dealname') or record.id}" + (f" — {details}" if details else "")
+
+
+def _stage_label(
+    stage_id: str | None, stages: dict[str, HubSpotPipelineStage]
+) -> str:
+    if not stage_id:
+        return ""
+    return stages[stage_id].label if stage_id in stages else stage_id
+
+
+def _deal_probability(deal: HubSpotDeal) -> Decimal | None:
+    for property_name in ("hs_probability", "hs_deal_stage_probability"):
+        raw = deal.properties.get(property_name)
+        if raw is None:
+            continue
+        try:
+            probability = Decimal(raw)
+        except (InvalidOperation, ValueError):
+            continue
+        if probability.is_finite() and 0 <= probability <= 100:
+            return probability * 100 if probability <= 1 else probability
+    return None
+
+
+def _format_probability(probability: Decimal | None) -> str:
+    if probability is None:
+        return ""
+    displayed = probability.quantize(Decimal("0.1"))
+    value = str(int(displayed)) if displayed == displayed.to_integral_value() else str(displayed)
+    return f"{value}%"
 
 
 def _list_text(lines: list[str], empty: str) -> str:
@@ -1045,20 +1707,87 @@ def _records_response(request: AgentRequest, title: str, text: str) -> AgentResp
     )
 
 
-def _pending_response(
-    request: AgentRequest, action_id: str, *, action_type: str, record: str, text: str
+def _table_response(
+    request: AgentRequest,
+    title: str,
+    summary: str,
+    columns: list[tuple[str, str]],
+    rows: list[dict[str, str]],
+    *,
+    tools: list[str],
+    requested_fields: list[str] | None = None,
 ) -> AgentResponse:
+    requested_fields = requested_fields or []
+    columns = _columns_for_request(columns, requested_fields)
+    if requested_fields:
+        for row in rows:
+            for key in requested_fields:
+                if any(column_key == key for column_key, _ in columns) and not row.get(key):
+                    row[key] = "—"
+    if not rows or all("view_url" in row for row in rows):
+        columns = [*columns, ("view_url", "View in HubSpot")]
+    return AgentResponse(
+        status="ok",
+        text=summary,
+        request_id=request.request_id,
+        tools_used=tools,
+        result={
+            "kind": "crm_records",
+            "title": title,
+            "message": summary,
+            "table": {
+                "columns": [{"key": key, "label": label} for key, label in columns],
+                "rows": rows,
+            },
+        },
+    )
+
+
+def _columns_for_request(
+    default_columns: list[tuple[str, str]], requested_fields: list[str]
+) -> list[tuple[str, str]]:
+    if not requested_fields:
+        return default_columns
+    labels = dict(default_columns)
+    selected = [
+        (key, labels[key])
+        for key in dict.fromkeys(requested_fields)
+        if key in labels
+    ]
+    return selected or default_columns
+
+
+async def _add_hubspot_urls(
+    tools: HubSpotToolRegistry,
+    tenant_id: str,
+    rows: list[dict[str, str]],
+    records: list[tuple[CRMObjectType, str]],
+) -> None:
+    urls = await tools.hubspot_record_urls(tenant_id, records)
+    for row, url in zip(rows, urls, strict=True):
+        row["view_url"] = url
+
+
+def _pending_response(
+    request: AgentRequest,
+    action_id: str,
+    *,
+    action_type: str,
+    record: str,
+    text: str,
+) -> AgentResponse:
+    result: dict[str, object] = {
+        "kind": "pending_confirmation",
+        "action_id": action_id,
+        "action_type": action_type,
+        "record_label": record,
+    }
     return AgentResponse(
         status="pending_confirmation",
         text=text,
         request_id=request.request_id,
         tools_used=[],
-        result={
-            "kind": "pending_confirmation",
-            "action_id": action_id,
-            "action_type": action_type,
-            "record_label": record,
-        },
+        result=result,
     )
 
 
@@ -1095,8 +1824,10 @@ def _single_create_summary(plan: _Plan) -> dict[str, str]:
     return {"title": f"{entity} created", "message": f"{label} was successfully added to HubSpot."}
 
 
-def _existing_records_response(
-    request: AgentRequest, reused: list[tuple[str, str, str]]
+async def _existing_records_response(
+    request: AgentRequest,
+    reused: list[tuple[str, str, str]],
+    tools: HubSpotToolRegistry,
 ) -> AgentResponse:
     sentences = [
         f"{label} already exists in HubSpot, so I used the existing {entity} record."
@@ -1109,12 +1840,32 @@ def _existing_records_response(
         title = "Records already exist"
         bullets = [f"• {sentence}" for sentence in sentences]
         text = "\n".join([*bullets, "No duplicates were created."])
+    object_types: dict[str, CRMObjectType] = {
+        "company": "companies",
+        "contact": "contacts",
+        "deal": "deals",
+    }
+    urls = await tools.hubspot_record_urls(
+        request.tenant_id,
+        [(object_types[entity], record_id) for entity, _, record_id in reused],
+    )
+    cards = [
+        {
+            "kind": entity,
+            "title": f"{entity.capitalize()} already exists",
+            "name": label,
+            "hubspot_id": record_id,
+            "hubspot_url": url,
+        }
+        for (entity, label, record_id), url in zip(reused, urls, strict=True)
+    ]
     return AgentResponse(
         status="already_exists",
         text=text,
         request_id=request.request_id,
         tools_used=[],
         result={"kind": "existing_record", "title": title},
+        cards=cards,
     )
 
 

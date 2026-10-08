@@ -58,6 +58,7 @@ export function cardsOf(reply) {
       name: card.name || "",
       detail: card.detail || null,
       hubspotId: card.hubspot_id || null,
+      hubspotUrl: card.hubspot_url || null,
     }));
   }
   const result = reply.result || {};
@@ -71,10 +72,25 @@ export function cardsOf(reply) {
         detail: result.email || null,
         hubspotId: result.contact_id || null,
         company: result.company_name || null,
+        hubspotUrl: result.hubspot_url || null,
       },
     ];
   }
   return [];
+}
+
+/** Structured CRM tables are rendered with textContent by app.js, never as HTML. */
+export function tableOf(reply) {
+  const table = (reply.result || {}).table;
+  if (
+    !table ||
+    !Array.isArray(table.columns) ||
+    !Array.isArray(table.rows) ||
+    !table.columns.every((column) => column && typeof column.key === "string" && typeof column.label === "string")
+  ) {
+    return null;
+  }
+  return table;
 }
 
 const KIND_LABELS = {

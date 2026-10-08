@@ -51,12 +51,27 @@ Entity actions - for every entity the message mentions, say what to do with it:
 
 query (only for crm_question):
 - company_details: information about a company ("find/show ABC").
+- company_list: list companies; company_search: search for companies matching the supplied name.
 - company_contacts: the contacts associated with a company.
 - company_deals: the deals associated with a company.
 - contact_details: information about a contact.
+- contact_list: list contacts; contact_search: search for contacts matching the supplied name.
 - contact_company: which company a contact is associated with.
+- contact_deals: deals associated with a contact.
 - deal_details: information about a deal.
+- open_deals: list all deals whose configured pipeline stage is open.
+- closed_deals: list all deals whose configured pipeline stage is closed.
+- closed_won_deals / closed_lost_deals: list only the matching configured closed stage.
+- best_chance_deals: rank open deals by an actual HubSpot probability property if present;
+  never infer or invent a probability.
+- all_deals: list all deals regardless of stage.
 - null: a general overview or summary of an account.
+- requested_fields: when the user explicitly names fields to show, return their canonical
+ keys in the order requested. Company keys: name, owner, phone, city, industry, employees,
+ lifecycle, lead_status, last_contacted, associated_deals. Contact keys: name, owner,
+ email, phone, company, city, state, industry, lifecycle, lead_status, last_contacted,
+ job_title, job_sub_role, seniority, linkedin, associated_deals. Deal keys: name, company,
+ owner, stage, amount, probability, close_date. Use [] when no fields are specified.
 
 Extraction rules:
 - Copy every value exactly as written in the message. Never correct the spelling of
@@ -65,7 +80,8 @@ Extraction rules:
   Use null for anything not present. Do not derive a company or domain from an email.
 - first_name / last_name: split a person's full name into first and last name.
 - phone / job_title belong to the contact; company_phone, company_domain,
-  company_website and company_city belong to the company.
+  company_website, company_city and company_employees belong to the company.
+- Account means HubSpot company. Extract number of employees into company_employees.
 - company_name: the company's name without surrounding words such as "under", "at",
   "to", "with", "for". Words that refer to the CRM itself ("contacts", "CRM",
   "HubSpot", "our database") are not company names.

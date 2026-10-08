@@ -704,6 +704,78 @@ code {
   text-align: right;
 }
 
+.table-wrap {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin-top: 14px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.crm-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.crm-table th,
+.crm-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid rgba(148, 163, 184, 0.28);
+  text-align: left;
+}
+
+.crm-table th {
+  border-right: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.crm-table th:last-child,
+.crm-table td:last-child {
+  border-right: 0;
+}
+
+.crm-table th {
+  background: rgba(148, 163, 184, 0.06);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.crm-table td:first-child {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.crm-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.crm-table--company {
+  min-width: 100%;
+}
+
+.crm-table--company .crm-table__employees {
+  min-width: 12rem;
+}
+
+.hubspot-record-link {
+  display: inline-block;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.hubspot-record-link:hover {
+  color: var(--text);
+}
+
 .record-meta span {
   display: block;
   color: var(--faint);

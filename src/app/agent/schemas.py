@@ -40,6 +40,17 @@ CRMQueryName = Literal[
     "contact_details",
     "contact_company",
     "deal_details",
+    "open_deals",
+    "closed_deals",
+    "closed_won_deals",
+    "closed_lost_deals",
+    "best_chance_deals",
+    "all_deals",
+    "company_list",
+    "company_search",
+    "contact_list",
+    "contact_search",
+    "contact_deals",
 ]
 
 
@@ -62,6 +73,7 @@ class CRMIntentExtraction(BaseModel):
     company_website: str | None = Field(default=None, max_length=500)
     company_phone: str | None = Field(default=None, max_length=50)
     company_city: str | None = Field(default=None, max_length=100)
+    company_employees: str | None = Field(default=None, max_length=9)
     # Deal fields. Amount, stage and pipeline are kept exactly as written.
     deal_name: str | None = Field(default=None, max_length=200)
     deal_amount: str | None = Field(default=None, max_length=50)
@@ -73,6 +85,7 @@ class CRMIntentExtraction(BaseModel):
     deal_action: EntityAction | None = None
     associations: list[AssociationName] = Field(default_factory=list, max_length=6)
     query: CRMQueryName | None = None
+    requested_fields: list[str] = Field(default_factory=list, max_length=20)
     question: str | None = Field(default=None, max_length=3000)
     confidence: float = Field(ge=0, le=1)
 
@@ -109,6 +122,6 @@ class AgentResponse(BaseModel):
     request_id: str
     tools_used: list[str] = Field(default_factory=list)
     # Optional structured outcome for rich UIs (e.g. Slack App Home); `text` stays canonical.
-    result: dict[str, str] | None = None
+    result: dict[str, object] | None = None
     # Per-record summaries of CRM writes for the web assistant's result cards.
     cards: list[dict[str, str]] = Field(default_factory=list)

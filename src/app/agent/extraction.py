@@ -25,6 +25,7 @@ COMPANY_PROPERTY_FIELDS: dict[str, str] = {
     "company_website": "website",
     "company_phone": "phone",
     "company_city": "city",
+    "company_employees": "numberofemployees",
 }
 
 _FIELD_LABELS = {
@@ -39,6 +40,7 @@ _FIELD_LABELS = {
     "company_website": "company website",
     "company_phone": "company phone number",
     "company_city": "company city",
+    "company_employees": "number of employees",
     "deal_name": "deal name",
     "deal_amount": "deal amount",
     "deal_stage": "deal stage",
@@ -91,6 +93,7 @@ class ValidatedExtraction:
     deal_amount: str | None = None
     deal_stage: str | None = None
     deal_pipeline: str | None = None
+    requested_fields: list[str] = field(default_factory=list)
 
 
 def validate_extraction(message: str, extraction: CRMIntentExtraction) -> ValidatedExtraction:
@@ -114,7 +117,6 @@ def validate_extraction(message: str, extraction: CRMIntentExtraction) -> Valida
     contact_id = _grounded(without_emails, "contact_id", extraction.contact_id)
     if contact_id is not None and not _CONTACT_ID.fullmatch(contact_id):
         raise ExtractionValidationError("contact_id", contact_id, "invalid_format")
-
     company_properties: dict[str, str] = {}
     for name, property_name in COMPANY_PROPERTY_FIELDS.items():
         value = _grounded(without_emails, name, getattr(extraction, name))
@@ -124,10 +126,12 @@ def validate_extraction(message: str, extraction: CRMIntentExtraction) -> Valida
         value = company_properties.get(name)
         if value is not None and not _DOMAIN.fullmatch(value):
             raise ExtractionValidationError(f"company_{name}", value, "invalid_format")
-    _check_phone("company_phone", company_properties.get("phone"))
+    _check_phone("company_phone", company_properties.get("phone"), min_digits=4)
+    employees = company_properties.get("numberofemployees")
+    if employees is not None and (not employees.isdigit() or len(employees) > 9):
+        raise ExtractionValidationError("company_employees", employees, "invalid_format")
 
     amount_text = _grounded(without_emails, "deal_amount", extraction.deal_amount)
-
     return ValidatedExtraction(
         intent=extraction.intent,
         properties=properties,
@@ -138,7 +142,50 @@ def validate_extraction(message: str, extraction: CRMIntentExtraction) -> Valida
         deal_amount=normalize_amount(amount_text) if amount_text is not None else None,
         deal_stage=_grounded(without_emails, "deal_stage", extraction.deal_stage),
         deal_pipeline=_grounded(without_emails, "deal_pipeline", extraction.deal_pipeline),
+        requested_fields=_grounded_requested_fields(visible, extraction.requested_fields),
     )
+
+
+_REQUESTED_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "name": ("name", "company name", "contact name", "deal name"),
+    "owner": ("owner",),
+    "phone": ("phone", "phone number"),
+    "email": ("email", "email address"),
+    "city": ("city",),
+    "state": ("state", "region"),
+    "industry": ("industry",),
+    "employees": ("employees", "employee count", "number of employees"),
+    "lifecycle": ("lifecycle stage", "lifecycle"),
+    "lead_status": ("lead status",),
+    "last_contacted": ("last contacted", "last contact"),
+    "job_title": ("employment role", "job title", "role"),
+    "job_sub_role": ("job sub role", "sub role"),
+    "seniority": ("job seniority", "seniority"),
+    "linkedin": ("linkedin", "linkedin url"),
+    "company": ("associated company", "company"),
+    "associated_deals": ("associated deals", "deals"),
+    "stage": ("stage name", "deal stage", "stage"),
+    "amount": ("amount", "deal amount"),
+    "probability": ("probability",),
+    "close_date": ("close date", "closing date"),
+}
+
+
+def _grounded_requested_fields(message: str, requested_fields: list[str]) -> list[str]:
+    normalized = message.casefold()
+    mentions: list[tuple[int, str]] = []
+    for field_name in dict.fromkeys(requested_fields):
+        aliases = _REQUESTED_FIELD_ALIASES.get(field_name)
+        if aliases is None:
+            continue
+        positions = [
+            match.start()
+            for alias in aliases
+            if (match := re.search(rf"\b{re.escape(alias)}\b", normalized)) is not None
+        ]
+        if positions:
+            mentions.append((min(positions), field_name))
+    return [field_name for _, field_name in sorted(mentions)]
 
 
 def visible_text(message: str) -> str:
@@ -173,9 +220,9 @@ def normalize_amount(text: str) -> str:
     return f"{amount.quantize(Decimal('0.01'))}"
 
 
-def _check_phone(name: str, phone: str | None) -> None:
+def _check_phone(name: str, phone: str | None, *, min_digits: int = 7) -> None:
     if phone is not None and (
-        not _PHONE.fullmatch(phone) or sum(char.isdigit() for char in phone) < 7
+        not _PHONE.fullmatch(phone) or sum(char.isdigit() for char in phone) < min_digits
     ):
         raise ExtractionValidationError(name, phone, "invalid_format")
 

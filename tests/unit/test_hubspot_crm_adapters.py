@@ -88,6 +88,42 @@ async def test_search_contacts_uses_full_text_query():
     assert page.results[0].id == "1"
 
 
+async def test_search_and_get_contact_support_cursor_and_property_selection():
+    search = Recorder(
+        200,
+        {
+            "results": [{"id": "1", "properties": {"email": "kaviya@example.com"}}],
+            "paging": {"next": {"after": "100"}},
+        },
+    )
+    page = await call(
+        HubSpotContactsClient,
+        search,
+        "search_contacts",
+        query="Kaviya",
+        after="50",
+        properties=("email", "city"),
+    )
+    assert search.calls[0][2] == {
+        "query": "Kaviya",
+        "limit": 100,
+        "after": "50",
+        "properties": ["email", "city"],
+    }
+    assert page.next_after == "100"
+
+    get = Recorder(200, {"id": "1", "properties": {"email": "kaviya@example.com"}})
+    contact = await call(
+        HubSpotContactsClient,
+        get,
+        "get_contact",
+        contact_id="1",
+        properties=("email", "city"),
+    )
+    assert contact.id == "1"
+    assert get.calls[0][1].endswith("/crm/v3/objects/contacts/1?properties=email%2Ccity")
+
+
 async def test_deal_create_search_update_and_pipelines():
     recorder = Recorder(200, {"id": "5", "properties": {"dealname": "Renewal"}})
     await call(HubSpotDealsClient, recorder, "create_deal", properties={"dealname": "Renewal"})
@@ -116,7 +152,14 @@ async def test_deal_create_search_update_and_pipelines():
                     "id": "default",
                     "label": "Sales Pipeline",
                     "displayOrder": 0,
-                    "stages": [{"id": "closedwon", "label": "Closed Won", "displayOrder": 5}],
+                    "stages": [
+                        {
+                            "id": "closedwon",
+                            "label": "Closed Won",
+                            "displayOrder": 5,
+                            "metadata": {"isClosed": "true", "probability": "1.0"},
+                        }
+                    ],
                 }
             ]
         },
@@ -124,6 +167,32 @@ async def test_deal_create_search_update_and_pipelines():
     result = await call(HubSpotDealsClient, pipelines, "list_pipelines")
     assert pipelines.calls[0][:2] == ("GET", "https://api.hubapi.com/crm/v3/pipelines/deals")
     assert result[0].stages[0].label == "Closed Won"
+    assert result[0].stages[0].metadata == {"isClosed": "true", "probability": "1.0"}
+
+
+async def test_deal_listing_preserves_pagination_cursor_and_pipeline_metadata():
+    recorder = Recorder(
+        200,
+        {
+            "results": [{"id": "5", "properties": {"dealname": "Renewal"}}],
+            "paging": {"next": {"after": "100"}},
+        },
+    )
+
+    page = await call(
+        HubSpotDealsClient,
+        recorder,
+        "list_deals",
+        limit=100,
+        after="50",
+        properties=("dealname", "hs_probability"),
+    )
+
+    assert recorder.calls[0][1].endswith(
+        "/crm/v3/objects/deals?limit=100&after=50&properties=dealname%2Chs_probability"
+    )
+    assert page.results[0].properties["dealname"] == "Renewal"
+    assert page.next_after == "100"
 
 
 async def test_associate_uses_v4_default_association():
@@ -143,6 +212,39 @@ async def test_associate_uses_v4_default_association():
         ("PUT", "https://api.hubapi.com/crm/v4/objects/deals/5/associations/default/companies/9",
          None)
     ]
+
+
+async def test_associated_record_ids_follow_hubspot_paging_cursor():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.params.get("after") == "100":
+            return httpx.Response(
+                200,
+                json={"results": [{"toObjectId": "company-101"}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"toObjectId": "company-1"}],
+                "paging": {"next": {"after": "100"}},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = HubSpotAssociationsClient(Settings(), http)
+        ids = await client.list_associated_ids(
+            CONTEXT,
+            "access-token",
+            from_type="contacts",
+            from_id="contact-1",
+            to_type="companies",
+        )
+
+    assert ids == ["company-1", "company-101"]
+    assert len(calls) == 2
+    assert "after=100" in calls[1]
 
 
 async def test_associated_ids_and_batch_read():

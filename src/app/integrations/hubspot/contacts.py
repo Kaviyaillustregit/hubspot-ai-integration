@@ -48,9 +48,12 @@ class HubSpotContactsClient(HubSpotApiClient):
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotContactsPage:
         body: dict[str, object] = {"query": query, "limit": limit}
+        if after:
+            body["after"] = after
         if properties:
             body["properties"] = list(properties)
         payload = await self._call(
@@ -64,7 +67,29 @@ class HubSpotContactsClient(HubSpotApiClient):
             response = HubSpotContactsResponse.model_validate(payload)
         except (ValueError, TypeError) as exc:
             raise IntegrationError("HubSpot contact search response was invalid") from exc
-        return HubSpotContactsPage(results=response.results)
+        next_after = response.paging.get("next", {}).get("after") if response.paging else None
+        return HubSpotContactsPage(results=response.results, next_after=next_after)
+
+    async def get_contact(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        contact_id: str,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContact:
+        params: dict[str, str | int] = {"properties": ",".join(properties)} if properties else {}
+        payload = await self._call(
+            "GET",
+            f"/crm/v3/objects/contacts/{contact_id}",
+            access_token,
+            label="HubSpot Contacts",
+            params=params,
+        )
+        try:
+            return HubSpotContact.model_validate(payload)
+        except (ValueError, TypeError) as exc:
+            raise IntegrationError("HubSpot Contacts response was invalid") from exc
 
     async def list_contacts(
         self,

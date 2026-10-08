@@ -11,6 +11,7 @@ import {
   parseRichText,
   shouldSend,
   statusOf,
+  tableOf,
 } from "../../src/app/web/static/render.js";
 
 const companyCreated = {
@@ -51,9 +52,42 @@ test("company creation renders a summary and a record card, not the raw step lin
       name: "Demo AI Company 001",
       detail: null,
       hubspotId: "123",
+      hubspotUrl: null,
     },
   ]);
   assert.equal(bodyTextOf(companyCreated), "");
+});
+
+test("deal result tables expose safe structured columns and rows", () => {
+  const reply = {
+    status: "ok",
+    result: {
+      table: {
+        columns: [{ key: "name", label: "Name" }, { key: "probability", label: "Probability" }],
+        rows: [{ name: "Renewal", probability: "80%" }],
+      },
+    },
+  };
+
+  assert.deepEqual(tableOf(reply), reply.result.table);
+  assert.equal(tableOf({ result: { table: { columns: "bad", rows: [] } } }), null);
+});
+
+test("HubSpot record URLs are retained for record cards and table rows", () => {
+  const url = "https://app.hubspot.com/contacts/42/record/0-2/company-1";
+  const reply = {
+    status: "ok",
+    cards: [{ kind: "company", name: "Testing Corp", hubspot_url: url }],
+    result: {
+      table: {
+        columns: [{ key: "view_url", label: "View in HubSpot" }],
+        rows: [{ view_url: url }],
+      },
+    },
+  };
+
+  assert.equal(cardsOf(reply)[0].hubspotUrl, url);
+  assert.equal(tableOf(reply).rows[0].view_url, url);
 });
 
 test("contact creation from the original contact flow becomes a contact card", () => {

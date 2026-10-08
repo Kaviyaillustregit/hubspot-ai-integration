@@ -8,6 +8,16 @@ from app.services.hubspot_scopes import require_scope
 
 
 class DealsClient(Protocol):
+    async def list_deals(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        properties: Sequence[str] = (),
+    ) -> HubSpotDealsPage: ...
+
     async def search_deals(
         self,
         context: TenantContext,
@@ -15,6 +25,7 @@ class DealsClient(Protocol):
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotDealsPage: ...
 
@@ -50,17 +61,35 @@ class HubSpotDealsService:
         self._client = client
         self._token_provider = token_provider
 
+    async def list_deals(
+        self,
+        context: TenantContext,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        properties: Sequence[str] = (),
+    ) -> HubSpotDealsPage:
+        access_token, resolved = await self._authorized(context, "crm.objects.deals.read")
+        return await self._client.list_deals(
+            resolved,
+            access_token,
+            limit=limit,
+            after=after,
+            properties=properties,
+        )
+
     async def search_deals(
         self,
         context: TenantContext,
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotDealsPage:
         access_token, resolved = await self._authorized(context, "crm.objects.deals.read")
         return await self._client.search_deals(
-            resolved, access_token, query=query, limit=limit, properties=properties
+            resolved, access_token, query=query, limit=limit, after=after, properties=properties
         )
 
     async def get_deal(

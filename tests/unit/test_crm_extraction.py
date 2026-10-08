@@ -53,6 +53,19 @@ def test_grounding_uses_the_users_casing_and_spacing():
     assert validated.company_name == "abc"
 
 
+def test_requested_crm_fields_are_grounded_and_follow_the_users_order():
+    validated = validate_extraction(
+        "Show companies with phone, city, and number of employees",
+        extraction(
+            intent="crm_question",
+            query="company_list",
+            requested_fields=["employees", "city", "phone"],
+        ),
+    )
+
+    assert validated.requested_fields == ["phone", "city", "employees"]
+
+
 @pytest.mark.parametrize(
     ("message", "fields", "field"),
     [
@@ -142,6 +155,18 @@ def test_intent_prompt_forbids_inventing_or_correcting_values():
     assert "never decide whether an action is allowed" in prompt
 
 
+def test_crm_prompt_maps_deal_query_synonyms_and_account_to_company():
+    prompt = build_prompt(
+        "crm-intent/v2", {"message": "Show open opportunities"}, CRMIntentExtraction
+    )
+
+    assert "open_deals" in prompt
+    assert "closed_won_deals" in prompt
+    assert "closed_lost_deals" in prompt
+    assert "best_chance_deals" in prompt
+    assert "Account means HubSpot company" in prompt
+
+
 def test_unknown_prompt_is_an_integration_error():
     with pytest.raises(IntegrationError):
         build_prompt("missing/v1", {}, GroundedSummary)
@@ -202,6 +227,20 @@ def test_company_fields_are_grounded_and_mapped_to_hubspot_properties():
         "phone": "+1 415 555 0100",
         "city": "Austin",
     }
+
+
+def test_account_phone_and_employee_count_validate_for_hubspot_company_mapping():
+    validated = validate_extraction(
+        "Create an account named Testing KAVIYA with phone number 2385 and employees 1000.",
+        extraction(
+            intent="create_company",
+            company_name="Testing KAVIYA",
+            company_phone="2385",
+            company_employees="1000",
+        ),
+    )
+
+    assert validated.company_properties == {"phone": "2385", "numberofemployees": "1000"}
 
 
 def test_company_domain_taken_from_an_email_is_rejected():

@@ -124,9 +124,12 @@ class HubSpotCompaniesClient(HubSpotApiClient):
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotCompaniesPage:
         body: dict[str, object] = {"query": query, "limit": limit}
+        if after:
+            body["after"] = after
         if properties:
             body["properties"] = list(properties)
         payload = await self._request(

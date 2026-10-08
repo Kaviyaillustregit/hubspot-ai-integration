@@ -12,6 +12,7 @@ class _DealsResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     results: list[HubSpotDeal] = Field(default_factory=list)
+    paging: dict[str, dict[str, str]] | None = None
 
 
 class _PipelinesResponse(BaseModel):
@@ -23,6 +24,34 @@ class _PipelinesResponse(BaseModel):
 class HubSpotDealsClient(HubSpotApiClient):
     """HubSpot Deals and deal Pipelines API adapter."""
 
+    async def list_deals(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        properties: Sequence[str] = (),
+    ) -> HubSpotDealsPage:
+        params: dict[str, str | int] = {"limit": limit}
+        if after:
+            params["after"] = after
+        if properties:
+            params["properties"] = ",".join(properties)
+        payload = await self._call(
+            "GET",
+            "/crm/v3/objects/deals",
+            access_token,
+            label="HubSpot deal listing",
+            params=params,
+        )
+        try:
+            response = _DealsResponse.model_validate(payload)
+            next_after = response.paging.get("next", {}).get("after") if response.paging else None
+            return HubSpotDealsPage(results=response.results, next_after=next_after)
+        except (ValueError, TypeError) as exc:
+            raise IntegrationError("HubSpot deal listing response was invalid") from exc
+
     async def search_deals(
         self,
         context: TenantContext,
@@ -30,9 +59,12 @@ class HubSpotDealsClient(HubSpotApiClient):
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotDealsPage:
         body: dict[str, object] = {"query": query, "limit": limit}
+        if after:
+            body["after"] = after
         if properties:
             body["properties"] = list(properties)
         payload = await self._call(
@@ -43,7 +75,9 @@ class HubSpotDealsClient(HubSpotApiClient):
             json_body=body,
         )
         try:
-            return HubSpotDealsPage(results=_DealsResponse.model_validate(payload).results)
+            response = _DealsResponse.model_validate(payload)
+            next_after = response.paging.get("next", {}).get("after") if response.paging else None
+            return HubSpotDealsPage(results=response.results, next_after=next_after)
         except (ValueError, TypeError) as exc:
             raise IntegrationError("HubSpot deal search response was invalid") from exc
 

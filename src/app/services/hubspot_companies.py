@@ -29,6 +29,7 @@ class CompaniesClient(Protocol):
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotCompaniesPage: ...
 
@@ -57,7 +58,6 @@ class CompaniesClient(Protocol):
         company_id: str,
         properties: dict[str, str],
     ) -> HubSpotCompany: ...
-
 
 class HubSpotCompaniesService:
     def __init__(self, client: CompaniesClient, token_provider: AccessTokenProvider) -> None:
@@ -92,6 +92,7 @@ class HubSpotCompaniesService:
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotCompaniesPage:
         access_token, token = await self._token_provider.get_access_token(context.tenant_id)
@@ -105,6 +106,7 @@ class HubSpotCompaniesService:
             access_token,
             query=query,
             limit=limit,
+            after=after,
             properties=properties,
         )
 

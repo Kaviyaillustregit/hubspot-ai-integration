@@ -86,6 +86,7 @@ class HubSpotPipelineStage(BaseModel):
     id: str
     label: str
     display_order: int = Field(default=0, validation_alias="displayOrder")
+    metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class HubSpotPipeline(BaseModel):

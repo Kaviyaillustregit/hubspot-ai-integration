@@ -106,6 +106,9 @@ class FakeContacts:
     def __init__(self, crm: FakeCRM) -> None:
         self.crm = crm
 
+    async def get_hubspot_account_id(self, context):
+        return "42"
+
     async def find_contact_by_email(self, tenant_id, email):
         assert tenant_id == "tenant-a"
         return next(
@@ -830,7 +833,6 @@ async def test_create_deal_for_company_and_associate_with_contact(h):
         ("deals", deal_id, "companies", company_id),
         ("deals", deal_id, "contacts", contact_id),
     ]
-
 
 async def test_create_company_contact_and_deal_in_one_message(h):
     result = await h.say(

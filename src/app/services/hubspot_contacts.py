@@ -64,8 +64,18 @@ class ContactsClient(Protocol):
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotContactsPage: ...
+
+    async def get_contact(
+        self,
+        context: TenantContext,
+        access_token: str,
+        *,
+        contact_id: str,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContact: ...
 
     async def create_contact(
         self,
@@ -177,6 +187,10 @@ class HubSpotContactsService:
         self._client = client
         self._token_provider = token_provider
 
+    async def get_hubspot_account_id(self, context: TenantContext) -> str:
+        _, token = await self._token_provider.get_access_token(context.tenant_id)
+        return token.hubspot_account_id
+
     async def list_contacts(
         self,
         context: TenantContext,
@@ -230,6 +244,7 @@ class HubSpotContactsService:
         *,
         query: str,
         limit: int = 100,
+        after: str | None = None,
         properties: Sequence[str] = (),
     ) -> HubSpotContactsPage:
         access_token, token = await self._token_provider.get_access_token(context.tenant_id)
@@ -244,6 +259,27 @@ class HubSpotContactsService:
             access_token,
             query=query,
             limit=limit,
+            after=after,
+            properties=properties,
+        )
+
+    async def get_contact(
+        self,
+        context: TenantContext,
+        *,
+        contact_id: str,
+        properties: Sequence[str] = (),
+    ) -> HubSpotContact:
+        access_token, token = await self._token_provider.get_access_token(context.tenant_id)
+        require_scope(token, "crm.objects.contacts.read")
+        return await self._client.get_contact(
+            TenantContext(
+                tenant_id=context.tenant_id,
+                hubspot_account_id=token.hubspot_account_id,
+                credential_reference="hubspot-oauth-token",
+            ),
+            access_token,
+            contact_id=contact_id,
             properties=properties,
         )
 
