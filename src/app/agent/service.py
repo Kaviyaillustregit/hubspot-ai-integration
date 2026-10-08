@@ -3,7 +3,11 @@ import logging
 import re
 from dataclasses import dataclass
 
-from app.agent.extraction import ExtractionValidationError, validate_extraction
+from app.agent.extraction import (
+    ExtractionValidationError,
+    ValidatedExtraction,
+    validate_extraction,
+)
 from app.agent.operations import CONFIRMED_UPDATE_ACTIONS, OPERATION_INTENTS, CRMOperations
 from app.agent.schemas import (
     AgentRequest,
@@ -91,6 +95,14 @@ _ALL_CONTACTS_LIST_PATTERN = re.compile(
     r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+contacts\b",
     re.IGNORECASE,
 )
+_REVENUE_QUESTION_PATTERN = re.compile(
+    r"\brevenue\b"
+    r"|\bhow much\b.{0,100}\b(?:won|closed)\b"
+    r"|\b(?:what|which)\b.{0,100}\b(?:value|amount)\b.{0,100}\b(?:won|closed)\b",
+    re.IGNORECASE,
+)
+
+
 class AccountIntelligenceAgent:
     def __init__(
         self,
@@ -368,6 +380,14 @@ class AccountIntelligenceAgent:
     ) -> AgentResponse:
         # The LLM only interprets the message. Which writes run directly and which need
         # confirmation is decided here: create runs directly; update/delete stay pending.
+        if (
+            extraction.intent == "crm_question"
+            and _REVENUE_QUESTION_PATTERN.search(request.message)
+        ):
+            extraction = extraction.model_copy(
+                update={"query": "closed_won_revenue"}
+            )
+
         if extraction.intent == "unsupported":
             return self._safe("unsupported", _CAPABILITIES_TEXT, request)
 
@@ -413,19 +433,23 @@ class AccountIntelligenceAgent:
             )
 
         if validated.intent == "update_contact":
-            if validated.contact_id is None:
-                return self._safe(
-                    "missing_fields",
-                    "Please include the HubSpot contact ID of the contact to update.",
-                    request,
-                )
+            contact_id = await self._resolve_contact_id(request, validated)
+            if isinstance(contact_id, AgentResponse):
+                return contact_id
             if validated.company_name is not None:
                 return self._safe(
                     "unsupported",
                     "Changing a contact's company isn't supported yet.",
                     request,
                 )
-            if not validated.properties:
+            properties: dict[str, str | None] = dict(validated.properties)
+            if validated.contact_id is None:
+                has_name = bool(properties.get("firstname") or properties.get("lastname"))
+                properties.pop("firstname", None)
+                properties.pop("lastname", None)
+                if not has_name:
+                    properties.pop("email", None)
+            if not properties:
                 return self._safe(
                     "missing_fields",
                     "Tell me which contact fields to update and their new values.",
@@ -434,20 +458,17 @@ class AccountIntelligenceAgent:
             return await self._propose_contact_update(
                 request,
                 ContactUpdateIntent(
-                    contact_id=validated.contact_id,
-                    properties=dict(validated.properties),
+                    contact_id=contact_id,
+                    properties=properties,
                 ),
             )
 
         if validated.intent == "delete_contact":
-            if validated.contact_id is None:
-                return self._safe(
-                    "missing_fields",
-                    "Please include the HubSpot contact ID of the contact to delete.",
-                    request,
-                )
+            contact_id = await self._resolve_contact_id(request, validated)
+            if isinstance(contact_id, AgentResponse):
+                return contact_id
             return await self._propose_contact_delete(
-                request, ContactDeleteIntent(contact_id=validated.contact_id)
+                request, ContactDeleteIntent(contact_id=contact_id)
             )
 
         return await self._answer_crm_question(
@@ -455,6 +476,58 @@ class AccountIntelligenceAgent:
             validated.company_name or self._company_name(request.message),
             extraction.question,
         )
+
+    async def _resolve_contact_id(
+        self, request: AgentRequest, validated: ValidatedExtraction
+    ) -> str | AgentResponse:
+        if validated.contact_id:
+            return validated.contact_id
+
+        first_name = validated.properties.get("firstname")
+        last_name = validated.properties.get("lastname")
+        email = validated.properties.get("email")
+        if not first_name and not last_name and not email:
+            return self._safe(
+                "missing_fields",
+                "Which contact? Please include their name or email address.",
+                request,
+            )
+
+        try:
+            resolution = await self._tools.resolve_contact(
+                request.tenant_id,
+                first_name=first_name,
+                last_name=last_name,
+            )
+            if resolution.contact is None and email:
+                resolution = await self._tools.resolve_contact(request.tenant_id, email=email)
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+            )
+        except IntegrationError:
+            logger.exception("Contact lookup failed", extra={"tenant_id": request.tenant_id})
+            return self._safe(
+                "unavailable", "I couldn't look up the HubSpot contact right now.", request
+            )
+
+        if resolution.status == "ambiguous":
+            return self._safe(
+                "contact_ambiguous",
+                "I found multiple matching contacts. Please include the contact's email address.",
+                request,
+                ["resolve_contact"],
+            )
+        if resolution.contact is None:
+            return self._safe(
+                "contact_not_found",
+                "I couldn't find that contact in HubSpot.",
+                request,
+                ["resolve_contact"],
+            )
+        return resolution.contact.id
 
     async def _respond_with_rules(self, request: AgentRequest) -> AgentResponse:
         """Deterministic parser used when LLM intent extraction is unavailable."""

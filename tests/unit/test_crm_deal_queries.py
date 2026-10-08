@@ -3,7 +3,9 @@ import pytest
 from app.agent.extraction import validate_extraction
 from app.agent.operations import CRMOperations, _Plan
 from app.agent.schemas import AgentRequest, CRMIntentExtraction
+from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
+from app.ai.service import AIService
 from app.integrations.hubspot.models import (
     HubSpotCompany,
     HubSpotDeal,
@@ -69,11 +71,11 @@ def deal(deal_id: str, name: str, stage: str, **properties: str) -> HubSpotDeal:
     )
 
 
-def request() -> AgentRequest:
+def request(message: str = "Show me all open deals") -> AgentRequest:
     return AgentRequest(
         tenant_id="tenant-a",
         actor_id="user-1",
-        message="Show me all open deals",
+        message=message,
         request_id="request-1",
     )
 
@@ -193,6 +195,9 @@ class PagedDeals:
         next_after = str(next_offset) if next_offset < len(self.records) else None
         return HubSpotDealsPage(results=page_records, next_after=next_after)
 
+    async def list_pipelines(self, context):
+        return PIPELINES
+
 
 async def test_registry_follows_every_hubspot_deal_cursor():
     records = [deal(f"deal-{index}", f"Deal {index}", "open") for index in range(205)]
@@ -203,6 +208,114 @@ async def test_registry_follows_every_hubspot_deal_cursor():
 
     assert len(listed) == 205
     assert source.cursors == [None, "100", "200"]
+
+
+class MisclassifiedRevenueProvider:
+    async def generate_structured(self, **kwargs):
+        return CRMIntentExtraction(
+            intent="crm_question",
+            query="company_details",
+            confidence=0.95,
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "What is our revenue?",
+        "How much revenue have we generated?",
+        "How much have we won?",
+        "What is our closed-won revenue?",
+    ],
+)
+async def test_revenue_questions_route_to_closed_won_amount_total(message):
+    tools = QueryTools(
+        [
+            deal("deal-won-1", "Renewal", "won", amount="50000"),
+            deal("deal-won-2", "Expansion", "won", amount="25000"),
+            deal("deal-open", "Open Deal", "open", amount="900000"),
+            deal("deal-lost", "Lost Deal", "lost", amount="300000"),
+        ]
+    )
+    agent = AccountIntelligenceAgent(
+        tools,  # type: ignore[arg-type]
+        AIService(MisclassifiedRevenueProvider()),  # type: ignore[arg-type]
+        action_safety=None,  # type: ignore[arg-type]
+    )
+
+    response = await agent.respond(request(message))
+
+    assert response.status == "ok"
+    assert response.result is not None
+    assert response.result["total_amount"] == "75,000"
+    assert response.result["closed_won_deal_count"] == 2
+    assert response.result["deals_with_amount"] == 2
+    assert "Renewal: 50,000" in response.text
+    assert "Expansion: 25,000" in response.text
+    assert "company" not in response.text.lower()
+
+
+async def test_revenue_total_includes_closed_won_deals_from_every_page():
+    deals = [
+        deal(f"won-{index}", f"Won {index}", "won", amount="100")
+        for index in range(205)
+    ]
+    source = PagedDeals(deals)
+
+    class ContactPortal:
+        async def get_hubspot_account_id(self, context):
+            return "42"
+
+    tools = HubSpotToolRegistry(None, ContactPortal(), source)  # type: ignore[arg-type]
+    agent = AccountIntelligenceAgent(
+        tools,  # type: ignore[arg-type]
+        AIService(MisclassifiedRevenueProvider()),  # type: ignore[arg-type]
+        action_safety=None,  # type: ignore[arg-type]
+    )
+
+    response = await agent.respond(request("How much have we won?"))
+
+    assert response.status == "ok"
+    assert response.result is not None
+    assert response.result["total_amount"] == "20,500"
+    assert response.result["closed_won_deal_count"] == 205
+    assert source.cursors == [None, "100", "200"]
+
+
+async def test_closed_won_revenue_breakdown_links_each_deal_in_hubspot():
+    tools = QueryTools(
+        [
+            deal("deal-won-1", "Renewal", "won", amount="50000"),
+            deal("deal-open", "Open Deal", "open", amount="900000"),
+            deal("deal-won-2", "Expansion", "won"),
+        ]
+    )
+    agent = AccountIntelligenceAgent(
+        tools,  # type: ignore[arg-type]
+        AIService(MisclassifiedRevenueProvider()),  # type: ignore[arg-type]
+        action_safety=None,  # type: ignore[arg-type]
+    )
+
+    response = await agent.respond(request("What is our revenue?"))
+
+    assert response.result is not None
+    table = response.result["table"]
+    assert table["columns"][-1] == {
+        "key": "view_url",
+        "label": "View in HubSpot",
+    }
+    assert table["rows"] == [
+        {
+            "name": "Renewal",
+            "amount": "50,000",
+            "view_url": "https://app.hubspot.com/contacts/42/record/0-3/deal-won-1",
+        },
+        {
+            "name": "Expansion",
+            "amount": "—",
+            "view_url": "https://app.hubspot.com/contacts/42/record/0-3/deal-won-2",
+        },
+    ]
 
 
 class AccountCreationTools:

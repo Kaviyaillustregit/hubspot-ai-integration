@@ -30,6 +30,7 @@ Intents (wording, word order and obvious typos of intent words such as "creat",
 - delete_contact: remove an existing contact.
 - create_company: create/add a new company.
 - update_company: change fields (domain, website, phone, city) of an existing company.
+- delete_company: archive an existing company, identifying it by name when possible.
 - create_deal: create a new deal (optionally for a company and/or contact).
 - update_deal: change an existing deal's amount, stage or pipeline ("move X to ...").
 - associate_records: link records that already exist ("add Victor Hall to ABC",
@@ -62,6 +63,8 @@ query (only for crm_question):
 - open_deals: list all deals whose configured pipeline stage is open.
 - closed_deals: list all deals whose configured pipeline stage is closed.
 - closed_won_deals / closed_lost_deals: list only the matching configured closed stage.
+- closed_won_revenue: calculate revenue by summing the actual Amount property of all
+  Closed Won deals; include a count/breakdown and never invent missing amounts.
 - best_chance_deals: rank open deals by an actual HubSpot probability property if present;
   never infer or invent a probability.
 - all_deals: list all deals regardless of stage.

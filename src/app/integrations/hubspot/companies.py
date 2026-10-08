@@ -87,6 +87,16 @@ class HubSpotCompaniesClient(HubSpotApiClient):
         )
         return self._validate_company(payload)
 
+    async def delete_company(
+        self, context: TenantContext, access_token: str, *, company_id: str
+    ) -> None:
+        await self._call(
+            "DELETE",
+            f"/crm/v3/objects/companies/{company_id}",
+            access_token,
+            label="HubSpot Companies archive",
+        )
+
     @staticmethod
     def _validate_company(payload: object) -> HubSpotCompany:
         try:

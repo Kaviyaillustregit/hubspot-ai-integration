@@ -59,6 +59,10 @@ class CompaniesClient(Protocol):
         properties: dict[str, str],
     ) -> HubSpotCompany: ...
 
+    async def delete_company(
+        self, context: TenantContext, access_token: str, *, company_id: str
+    ) -> None: ...
+
 class HubSpotCompaniesService:
     def __init__(self, client: CompaniesClient, token_provider: AccessTokenProvider) -> None:
         self._client = client
@@ -162,6 +166,14 @@ class HubSpotCompaniesService:
         )
         return await self._client.update_company(
             resolved_context, access_token, company_id=company_id, properties=properties
+        )
+
+    async def delete_company(self, context: TenantContext, *, company_id: str) -> None:
+        access_token, resolved_context = await self._authorized(
+            context, "crm.objects.companies.write"
+        )
+        await self._client.delete_company(
+            resolved_context, access_token, company_id=company_id
         )
 
     async def _authorized(

@@ -43,13 +43,16 @@ OPERATION_INTENTS = frozenset(
     {
         "create_company",
         "update_company",
+        "delete_company",
         "create_deal",
         "update_deal",
         "associate_records",
         "multi_step",
     }
 )
-CONFIRMED_UPDATE_ACTIONS = frozenset({"update_company", "update_deal"})
+CONFIRMED_UPDATE_ACTIONS = frozenset(
+    {"update_company", "update_deal", "delete_company"}
+)
 
 _IMPLIED_ACTION: dict[str, tuple[Entity, str]] = {
     "create_contact": ("contact", "create"),
@@ -127,6 +130,8 @@ class CRMOperations:
         try:
             if extraction.intent == "crm_question" and extraction.query is not None:
                 return await self._answer_query(request, extraction.query, validated)
+            if extraction.intent == "delete_company":
+                return await self._propose_company_delete(request, validated)
             actions = _entity_actions(extraction, validated)
             if "update" in actions.values():
                 return await self._propose_update(request, extraction, validated, actions)
@@ -504,6 +509,39 @@ class CRMOperations:
             ),
         )
 
+    async def _propose_company_delete(
+        self, request: AgentRequest, validated: ValidatedExtraction
+    ) -> AgentResponse:
+        if not validated.company_name:
+            raise OperationError(
+                "missing_fields", "Which company should I archive? Please include its name."
+            )
+        try:
+            company = await self._resolve_company(request, validated.company_name)
+        except (IntegrationError, ValueError) as exc:
+            raise OperationError(*_hubspot_failure(exc)) from exc
+
+        label = _company_label(company, validated.company_name)
+        action_id = await self._safety.create_pending_action(
+            tenant_id=request.tenant_id,
+            actor_id=request.actor_id,
+            action_type="delete_company",
+            resource_type="company",
+            payload={"company_id": company.id, "company_name": label},
+        )
+        return _pending_response(
+            request,
+            action_id,
+            action_type="delete_company",
+            record=f"company {label}",
+            text=(
+                "I found a request to archive this HubSpot company:\n"
+                f"• Company: {label} (ID {company.id})\n\n"
+                f"Action ID: `{action_id}`\n"
+                f"Reply with `confirm {action_id}` to archive this company."
+            ),
+        )
+
     async def _propose_deal_update(
         self, request: AgentRequest, validated: ValidatedExtraction
     ) -> AgentResponse:
@@ -576,7 +614,8 @@ class CRMOperations:
         self, request: AgentRequest, confirmed: ConfirmedAction
     ) -> AgentResponse:
         payload = confirmed.payload
-        is_company = confirmed.action_type == "update_company"
+        is_company = confirmed.action_type in {"update_company", "delete_company"}
+        is_delete = confirmed.action_type == "delete_company"
         kind = "company" if is_company else "deal"
         record_id = str(payload[f"{kind}_id"])
         label = str(payload.get(f"{kind}_name") or record_id)
@@ -585,7 +624,9 @@ class CRMOperations:
             for key, value in dict(payload.get("properties", {})).items()
         }
         try:
-            if is_company:
+            if is_delete:
+                await self._tools.delete_company(request.tenant_id, record_id)
+            elif is_company:
                 await self._tools.update_company(request.tenant_id, record_id, properties)
             else:
                 await self._tools.update_deal(request.tenant_id, record_id, properties)
@@ -599,7 +640,10 @@ class CRMOperations:
                 resource_type=kind,
                 error_code=status,
             )
-            return _response(request, status, f"I couldn't update {kind} {label}. {message}")
+            action_verb = "archive" if is_delete else "update"
+            return _response(
+                request, status, f"I couldn't {action_verb} {kind} {label}. {message}"
+            )
 
         await self._safety.complete_action(
             action_id=confirmed.id,
@@ -613,14 +657,16 @@ class CRMOperations:
         return AgentResponse(
             status="ok",
             text=(
-                f"✅ {kind.capitalize()} {label} updated successfully in HubSpot.\n"
+                f"✅ {kind.capitalize()} {label} archived in HubSpot."
+                if is_delete
+                else f"✅ {kind.capitalize()} {label} updated successfully in HubSpot.\n"
                 f"• Changes: {payload.get('summary', ', '.join(properties))}"
             ),
             request_id=request.request_id,
-            tools_used=[f"update_{kind}"],
+            tools_used=[f"{'delete' if is_delete else 'update'}_{kind}"],
             result={
                 "kind": "crm_records",
-                "title": f"{kind.capitalize()} Updated",
+                "title": f"{kind.capitalize()} {'Archived' if is_delete else 'Updated'}",
                 "hubspot_url": (
                     await self._tools.hubspot_record_urls(
                         request.tenant_id,
@@ -637,6 +683,9 @@ class CRMOperations:
     ) -> AgentResponse:
         tenant_id = request.tenant_id
         try:
+            if query == "closed_won_revenue":
+                return await self._answer_closed_won_revenue(request)
+
             if query == "company_list":
                 companies = await self._tools.list_all_companies(tenant_id)
                 deal_names = {
@@ -1057,16 +1106,7 @@ class CRMOperations:
             return configured == "true" if configured in {"true", "false"} else None
 
         def is_won(deal: HubSpotDeal) -> bool:
-            stage = stages.get(deal.properties.get("dealstage") or "")
-            if stage is None:
-                return False
-            configured = stage.metadata.get("isClosedWon")
-            if configured is not None:
-                return configured.casefold() == "true"
-            try:
-                return Decimal(stage.metadata["probability"]) == 1
-            except (KeyError, InvalidOperation):
-                return False
+            return _is_closed_won(deal, stages)
 
         def is_lost(deal: HubSpotDeal) -> bool:
             stage = stages.get(deal.properties.get("dealstage") or "")
@@ -1181,6 +1221,96 @@ class CRMOperations:
                         for key, label in deal_columns
                     ]
                     + [{"key": "view_url", "label": "View in HubSpot"}],
+                    "rows": rows,
+                },
+            },
+        )
+
+    async def _answer_closed_won_revenue(self, request: AgentRequest) -> AgentResponse:
+        pipelines = await self._tools.deal_pipelines(request.tenant_id)
+        stages = {
+            stage.id: stage
+            for pipeline in pipelines
+            for stage in pipeline.stages
+        }
+        won_deals = [
+            deal
+            for deal in await self._tools.list_all_deals(request.tenant_id)
+            if _is_closed_won(deal, stages)
+        ]
+
+        total = Decimal(0)
+        deals_with_amount = 0
+        breakdown: list[str] = []
+        for deal in won_deals:
+            name = str(deal.properties.get("dealname") or deal.id)
+            amount = deal.properties.get("amount")
+            if amount is None or not amount.strip():
+                breakdown.append(f"{name}: Amount unavailable")
+                continue
+            try:
+                value = Decimal(amount)
+            except InvalidOperation as exc:
+                raise OperationError(
+                    "invalid_hubspot_data",
+                    f"I couldn't calculate revenue because Closed Won deal {name} has an "
+                    "invalid Amount in HubSpot.",
+                ) from exc
+            if not value.is_finite():
+                raise OperationError(
+                    "invalid_hubspot_data",
+                    f"I couldn't calculate revenue because Closed Won deal {name} has an "
+                    "invalid Amount in HubSpot.",
+                )
+            total += value
+            deals_with_amount += 1
+            breakdown.append(f"{name}: {format_amount(amount)}")
+
+        summary = (
+            f"Closed-Won revenue (sum of HubSpot Amount): {format_amount(str(total))}. "
+            f"Based on {len(won_deals)} Closed Won deals; {deals_with_amount} "
+            f"{'has' if deals_with_amount == 1 else 'have'} an Amount."
+        )
+        if breakdown:
+            shown = breakdown[:3]
+            if len(breakdown) > 3:
+                shown.append(f"and {len(breakdown) - 3} more")
+            summary += " Breakdown: " + "; ".join(shown) + "."
+
+        rows: list[dict[str, str]] = []
+        for deal in won_deals:
+            amount = deal.properties.get("amount")
+            rows.append(
+                {
+                    "name": str(deal.properties.get("dealname") or deal.id),
+                    "amount": format_amount(amount) if amount else "—",
+                }
+            )
+        await _add_hubspot_urls(
+            self._tools,
+            request.tenant_id,
+            rows,
+            [("deals", deal.id) for deal in won_deals],
+        )
+
+        return AgentResponse(
+            status="ok",
+            text=summary,
+            request_id=request.request_id,
+            tools_used=["deal_pipelines", "list_all_deals", "hubspot_record_urls"],
+            result={
+                "kind": "crm_records",
+                "title": "Closed-Won Revenue",
+                "message": summary,
+                "total_amount": format_amount(str(total)),
+                "closed_won_deal_count": len(won_deals),
+                "deals_with_amount": deals_with_amount,
+                "table": {
+                    "columns": [
+                        {"key": "name", "label": "Deal"},
+                        {"key": "amount", "label": "Amount"},
+                        {"key": "view_url", "label": "View in HubSpot"},
+                    ],
                     "rows": rows,
                 },
             },
@@ -1415,6 +1545,21 @@ def resolve_pipeline_stage(
 def format_amount(amount: str) -> str:
     value = Decimal(amount)
     return f"{value:,.2f}" if value != value.to_integral_value() else f"{int(value):,}"
+
+
+def _is_closed_won(
+    deal: HubSpotDeal, stages: dict[str, HubSpotPipelineStage]
+) -> bool:
+    stage = stages.get(deal.properties.get("dealstage") or "")
+    if stage is None:
+        return False
+    configured = stage.metadata.get("isClosedWon")
+    if configured is not None:
+        return configured.casefold() == "true"
+    try:
+        return Decimal(stage.metadata["probability"]) == 1
+    except (KeyError, InvalidOperation):
+        return False
 
 
 def _hubspot_failure(exc: Exception) -> tuple[str, str]:

@@ -13,6 +13,7 @@ from app.integrations.hubspot.models import (
     HubSpotPipelineStage,
     HubSpotRecord,
 )
+from app.services.action_safety import ConfirmedAction
 
 
 class PagedCompanies:
@@ -325,6 +326,73 @@ async def test_all_contacts_request_routes_to_existing_contact_list_query():
     assert response.result is not None
     assert response.result["title"] == "Contacts"
     assert response.result["table"]["rows"][0]["name"] == "Kaviya Smith"  # type: ignore[index]
+
+
+async def test_delete_company_by_name_resolves_and_requests_confirmation():
+    class CompanyDeleteIntentProvider:
+        async def generate_structured(self, **kwargs):
+            return CRMIntentExtraction(
+                intent="delete_company",
+                confidence=0.95,
+                company_name="Test Revenue Company",
+            )
+
+    class CompanyDeleteTools(ListingTools):
+        def __init__(self):
+            super().__init__()
+            self.company = HubSpotCompany(
+                id="company-revenue-1",
+                properties={"name": "Test Revenue Company"},
+            )
+            self.resolved_names = []
+            self.deleted_ids = []
+
+        async def resolve_company(self, tenant_id, name):
+            self.resolved_names.append(name)
+            from app.agent.tools import CompanyResolution
+
+            return CompanyResolution("found", self.company)
+
+        async def delete_company(self, tenant_id, company_id):
+            self.deleted_ids.append(company_id)
+
+    class PendingActionSafety:
+        async def create_pending_action(self, **kwargs):
+            self.pending_action = kwargs
+            return "action-company-delete"
+
+        async def complete_action(self, **kwargs):
+            self.completed_action = kwargs
+
+    tools = CompanyDeleteTools()
+    safety = PendingActionSafety()
+    agent = AccountIntelligenceAgent(
+        tools,  # type: ignore[arg-type]
+        AIService(CompanyDeleteIntentProvider()),  # type: ignore[arg-type]
+        action_safety=safety,  # type: ignore[arg-type]
+    )
+
+    response = await agent.respond(request("Delete the company named Test Revenue Company"))
+
+    assert response.status == "pending_confirmation"
+    assert tools.resolved_names == ["Test Revenue Company"]
+    assert safety.pending_action["action_type"] == "delete_company"
+    assert safety.pending_action["payload"]["company_id"] == "company-revenue-1"
+
+    confirmed = ConfirmedAction(
+        id="action-company-delete",
+        tenant_id="tenant-a",
+        actor_id="user-1",
+        action_type="delete_company",
+        resource_type="company",
+        payload=safety.pending_action["payload"],
+    )
+    archived = await agent._operations.execute_confirmed_update(  # noqa: SLF001
+        request("confirm action-company-delete"), confirmed
+    )
+
+    assert archived.status == "ok"
+    assert tools.deleted_ids == ["company-revenue-1"]
 
 
 async def test_contact_search_returns_matching_contact_table():

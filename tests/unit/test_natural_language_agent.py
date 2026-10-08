@@ -464,6 +464,36 @@ async def test_update_still_requires_confirmation():
     assert safety.claimed == {}
 
 
+async def test_contact_update_by_name_resolves_id_before_asking_for_confirmation():
+    contacts = FakeContacts()
+    contacts.existing = [
+        HubSpotContact(
+            id="contact-19",
+            properties={"firstname": "Test Revenue", "lastname": "Contact"},
+        )
+    ]
+    agent, _, _, _, safety = build(
+        extraction(
+            "update_contact",
+            first_name="Test Revenue",
+            last_name="Contact",
+            phone="5551234567",
+        ),
+        contacts=contacts,
+    )
+
+    result = await agent.respond(
+        request("Update Test Revenue Contact phone to 5551234567")
+    )
+
+    assert result.status == "pending_confirmation"
+    assert result.result["contact_id"] == "contact-19"
+    assert safety.pending[0]["payload"] == {
+        "contact_id": "contact-19",
+        "phone": "5551234567",
+    }
+
+
 async def test_delete_still_requires_confirmation():
     agent, _, _, _, safety = build(extraction("delete_contact", contact_id="123"))
 
@@ -481,15 +511,24 @@ async def test_delete_still_requires_confirmation():
     assert safety.claimed == {}
 
 
-async def test_delete_without_contact_id_asks_for_it():
+async def test_contact_delete_by_name_resolves_id_before_asking_for_confirmation():
+    contacts = FakeContacts()
+    contacts.existing = [
+        HubSpotContact(
+            id="contact-20",
+            properties={"firstname": "Test Revenue", "lastname": "Contact"},
+        )
+    ]
     agent, _, _, _, safety = build(
-        extraction("delete_contact", first_name="Victor", last_name="Hall")
+        extraction("delete_contact", first_name="Test Revenue", last_name="Contact"),
+        contacts=contacts,
     )
 
-    result = await agent.respond(request("delete Victor Hall"))
+    result = await agent.respond(request("Delete the contact named Test Revenue Contact"))
 
-    assert result.status == "missing_fields"
-    assert safety.pending == []
+    assert result.status == "pending_confirmation"
+    assert result.result["contact_id"] == "contact-20"
+    assert safety.pending[0]["payload"] == {"contact_id": "contact-20"}
 
 
 async def test_low_confidence_write_asks_for_clarification():

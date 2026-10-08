@@ -437,6 +437,9 @@ class HubSpotToolRegistry:
             self._context(tenant_id), company_id=company_id, properties=properties
         )
 
+    async def delete_company(self, tenant_id: str, company_id: str) -> None:
+        await self._companies.delete_company(self._context(tenant_id), company_id=company_id)
+
     async def resolve_contact(
         self,
         tenant_id: str,
