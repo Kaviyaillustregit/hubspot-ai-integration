@@ -21,3 +21,19 @@ async def test_ai_service_uses_provider_contract():
     )
 
     assert result.answer == "generated for deal"
+
+
+async def test_ai_service_logs_intent_extraction_timing(caplog):
+    caplog.set_level("INFO", logger="app.ai.service")
+    result = await AIService(FakeProvider()).generate(
+        prompt_name="crm-intent/v2",
+        variables={"name": "deal"},
+        output_schema=Result,
+    )
+
+    assert result.answer == "generated for deal"
+    assert [record.message for record in caplog.records] == [
+        "Intent extraction started",
+        "Intent extraction completed",
+    ]
+    assert isinstance(caplog.records[-1].elapsed_ms, float)

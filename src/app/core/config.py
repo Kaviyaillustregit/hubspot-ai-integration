@@ -43,9 +43,6 @@ class Settings(BaseSettings):
     # JSON object of Slack workspace IDs to application tenant IDs, e.g.
     # {"T0123": "tenant-a"}. This is server-owned authorization data.
     slack_team_tenant_map: str | None = None
-    # Public https base URL of this service (e.g. the ngrok URL). Enables the Slack App Home
-    # "Open HubSpot AI" button that signs users into the web assistant.
-    web_app_base_url: str | None = None
 
     @model_validator(mode="after")
     def validate_deployment_settings(self) -> "Settings":

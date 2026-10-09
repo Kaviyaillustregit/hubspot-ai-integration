@@ -6,13 +6,16 @@ extraction only says *what* was asked; the order of operations, record resolutio
 confirmation policy and safety bookkeeping are decided here, deterministically.
 """
 
+import asyncio
 import hashlib
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Literal
+from time import perf_counter
+from typing import Literal, TypeVar
 
 from app.agent.extraction import ValidatedExtraction
 from app.agent.schemas import AgentRequest, AgentResponse, CRMIntentExtraction, CRMQueryName
@@ -68,6 +71,22 @@ _LINKS: dict[str, tuple[CRMObjectType, Entity, CRMObjectType, Entity]] = {
     "deal_contact": ("deals", "deal", "contacts", "contact"),
 }
 _LIST_LIMIT = 20
+_ENRICHMENT_CONCURRENCY = 8
+_Item = TypeVar("_Item")
+_Result = TypeVar("_Result")
+
+
+async def _bounded_map(
+    items: list[_Item],
+    operation: Callable[[_Item], Awaitable[_Result]],
+) -> list[_Result]:
+    semaphore = asyncio.Semaphore(_ENRICHMENT_CONCURRENCY)
+
+    async def run(item: _Item) -> _Result:
+        async with semaphore:
+            return await operation(item)
+
+    return list(await asyncio.gather(*(run(item) for item in items)))
 
 
 class OperationError(Exception):
@@ -127,6 +146,8 @@ class CRMOperations:
         validated: ValidatedExtraction,
         idempotency_key: str,
     ) -> AgentResponse:
+        started = perf_counter()
+        operation = extraction.query or extraction.intent
         try:
             if extraction.intent == "crm_question" and extraction.query is not None:
                 return await self._answer_query(request, extraction.query, validated)
@@ -138,6 +159,14 @@ class CRMOperations:
             return await self._run_plan(request, extraction, validated, actions, idempotency_key)
         except OperationError as exc:
             return _response(request, exc.status, exc.message)
+        finally:
+            logger.info(
+                "CRM operation timing",
+                extra={
+                    "operation": operation,
+                    "elapsed_ms": round((perf_counter() - started) * 1000, 2),
+                },
+            )
 
     # ---------------------------------------------------------------- plans (direct)
 
@@ -688,18 +717,19 @@ class CRMOperations:
 
             if query == "company_list":
                 companies = await self._tools.list_all_companies(tenant_id)
-                deal_names = {
-                    company.id: ", ".join(
-                        str(deal.properties.get("dealname") or deal.id)
-                        for deal in await self._tools.associated_records(
-                            tenant_id,
-                            from_type="companies",
-                            from_id=company.id,
-                            to_type="deals",
-                        )
+
+                async def company_deals(company: HubSpotCompany) -> tuple[str, str]:
+                    deals = await self._tools.associated_records(
+                        tenant_id,
+                        from_type="companies",
+                        from_id=company.id,
+                        to_type="deals",
                     )
-                    for company in companies
-                }
+                    return company.id, ", ".join(
+                        str(deal.properties.get("dealname") or deal.id) for deal in deals
+                    )
+
+                deal_names = dict(await _bounded_map(companies, company_deals))
                 rows = [
                     {
                         "name": item.properties.get("name") or item.id,
@@ -750,8 +780,8 @@ class CRMOperations:
                     companies = await self._tools.search_companies(
                         tenant_id, validated.company_name or ""
                     )
-                    company_search_rows: list[dict[str, str]] = []
-                    for item in companies:
+
+                    async def company_search_row(item: HubSpotCompany) -> dict[str, str]:
                         row = _company_row(item)
                         deals = await self._tools.associated_records(
                             tenant_id,
@@ -762,7 +792,9 @@ class CRMOperations:
                         row["associated_deals"] = ", ".join(
                             str(deal.properties.get("dealname") or deal.id) for deal in deals
                         )
-                        company_search_rows.append(row)
+                        return row
+
+                    company_search_rows = await _bounded_map(companies, company_search_row)
                     await _add_hubspot_urls(
                         self._tools,
                         tenant_id,
@@ -834,35 +866,48 @@ class CRMOperations:
                     if query == "contact_list"
                     else await self._tools.search_contacts(tenant_id, search_text)
                 )
-                companies_by_contact: dict[str, HubSpotRecord] = {}
-                for contact in contacts:
-                    associated_companies = await self._tools.associated_records(
-                        tenant_id,
-                        from_type="contacts",
-                        from_id=contact.id,
-                        to_type="companies",
+                async def contact_enrichment(
+                    contact: HubSpotContact,
+                ) -> tuple[str, HubSpotRecord | None, str]:
+                    associated_companies, deals = await asyncio.gather(
+                        self._tools.associated_records(
+                            tenant_id,
+                            from_type="contacts",
+                            from_id=contact.id,
+                            to_type="companies",
+                        ),
+                        self._tools.associated_records(
+                            tenant_id,
+                            from_type="contacts",
+                            from_id=contact.id,
+                            to_type="deals",
+                        ),
                     )
-                    if associated_companies:
-                        companies_by_contact[contact.id] = associated_companies[0]
-                    else:
+                    associated_company = (
+                        associated_companies[0] if associated_companies else None
+                    )
+                    if associated_company is None:
                         company_id = contact.properties.get("associatedcompanyid")
-                        if not company_id:
-                            continue
-                        company = await self._tools.get_company(tenant_id, company_id)
-                        companies_by_contact[contact.id] = HubSpotRecord(
-                            id=company.id, properties=company.properties
-                        )
-                deals_by_contact: dict[str, str] = {}
-                for contact in contacts:
-                    deals = await self._tools.associated_records(
-                        tenant_id,
-                        from_type="contacts",
-                        from_id=contact.id,
-                        to_type="deals",
-                    )
-                    deals_by_contact[contact.id] = ", ".join(
+                        if company_id:
+                            company = await self._tools.get_company(tenant_id, company_id)
+                            associated_company = HubSpotRecord(
+                                id=company.id, properties=company.properties
+                            )
+                    deal_names = ", ".join(
                         str(deal.properties.get("dealname") or deal.id) for deal in deals
                     )
+                    return contact.id, associated_company, deal_names
+
+                enrichment = await _bounded_map(contacts, contact_enrichment)
+                companies_by_contact = {
+                    contact_id: company
+                    for contact_id, company, _ in enrichment
+                    if company is not None
+                }
+                deals_by_contact = {
+                    contact_id: deal_names
+                    for contact_id, _, deal_names in enrichment
+                }
                 summary = (
                     f"Found {len(contacts)} contacts."
                     if query == "contact_list"
@@ -1001,27 +1046,31 @@ class CRMOperations:
                     stage_labels = (
                         await self._stage_labels(tenant_id) if contact_records else {}
                     )
-                    contact_deal_rows: list[dict[str, str]] = []
-                    for associated_deal in contact_records:
+
+                    async def contact_deal_row(
+                        associated_deal: HubSpotRecord,
+                    ) -> dict[str, str]:
                         associated_deal_companies = await self._tools.associated_records(
                             tenant_id,
                             from_type="deals",
                             from_id=associated_deal.id,
                             to_type="companies",
                         )
-                        contact_deal_rows.append(
-                            {
-                                **_deal_row(associated_deal, stage_labels),
-                                "company": (
-                                    str(
-                                        associated_deal_companies[0].properties.get("name")
-                                        or associated_deal_companies[0].id
-                                    )
-                                    if associated_deal_companies
-                                    else ""
-                                ),
-                            }
-                        )
+                        return {
+                            **_deal_row(associated_deal, stage_labels),
+                            "company": (
+                                str(
+                                    associated_deal_companies[0].properties.get("name")
+                                    or associated_deal_companies[0].id
+                                )
+                                if associated_deal_companies
+                                else ""
+                            ),
+                        }
+
+                    contact_deal_rows = await _bounded_map(
+                        contact_records, contact_deal_row
+                    )
                     await _add_hubspot_urls(
                         self._tools,
                         tenant_id,
@@ -1090,13 +1139,15 @@ class CRMOperations:
         query: CRMQueryName,
         requested_fields: list[str] | None = None,
     ) -> AgentResponse:
-        pipelines = await self._tools.deal_pipelines(request.tenant_id)
+        pipelines, all_deals = await asyncio.gather(
+            self._tools.deal_pipelines(request.tenant_id),
+            self._tools.list_all_deals(request.tenant_id),
+        )
         stages = {
             stage.id: stage
             for pipeline in pipelines
             for stage in pipeline.stages
         }
-        all_deals = await self._tools.list_all_deals(request.tenant_id)
 
         def is_closed(deal: HubSpotDeal) -> bool | None:
             stage = stages.get(deal.properties.get("dealstage") or "")
@@ -1142,8 +1193,7 @@ class CRMOperations:
                 reverse=True,
             )
 
-        rows: list[dict[str, str]] = []
-        for deal in deals:
+        async def deal_row(deal: HubSpotDeal) -> dict[str, str]:
             properties = deal.properties
             amount = properties.get("amount")
             associated = await self._tools.associated_records(
@@ -1152,19 +1202,19 @@ class CRMOperations:
                 from_id=deal.id,
                 to_type="companies",
             )
-            rows.append(
-                {
-                    "name": properties.get("dealname") or deal.id,
-                    "company": (
-                        str(associated[0].properties.get("name") or "") if associated else ""
-                    ),
-                    "owner": properties.get("hubspot_owner_id") or "",
-                    "stage": _stage_label(properties.get("dealstage"), stages),
-                    "amount": format_amount(amount) if amount else "",
-                    "probability": _format_probability(probabilities[deal.id]),
-                    "close_date": (properties.get("closedate") or "")[:10],
-                }
-            )
+            return {
+                "name": properties.get("dealname") or deal.id,
+                "company": (
+                    str(associated[0].properties.get("name") or "") if associated else ""
+                ),
+                "owner": properties.get("hubspot_owner_id") or "",
+                "stage": _stage_label(properties.get("dealstage"), stages),
+                "amount": format_amount(amount) if amount else "",
+                "probability": _format_probability(probabilities[deal.id]),
+                "close_date": (properties.get("closedate") or "")[:10],
+            }
+
+        rows = await _bounded_map(deals, deal_row)
 
         await _add_hubspot_urls(
             self._tools, request.tenant_id, rows, [("deals", deal.id) for deal in deals]
@@ -1227,7 +1277,10 @@ class CRMOperations:
         )
 
     async def _answer_closed_won_revenue(self, request: AgentRequest) -> AgentResponse:
-        pipelines = await self._tools.deal_pipelines(request.tenant_id)
+        pipelines, all_deals = await asyncio.gather(
+            self._tools.deal_pipelines(request.tenant_id),
+            self._tools.list_all_deals(request.tenant_id),
+        )
         stages = {
             stage.id: stage
             for pipeline in pipelines
@@ -1235,7 +1288,7 @@ class CRMOperations:
         }
         won_deals = [
             deal
-            for deal in await self._tools.list_all_deals(request.tenant_id)
+            for deal in all_deals
             if _is_closed_won(deal, stages)
         ]
 

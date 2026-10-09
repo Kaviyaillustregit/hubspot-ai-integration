@@ -68,17 +68,10 @@ Start an HTTPS tunnel:
 
 cloudflared tunnel --url http://localhost:8000
 
-Set the generated URL in:
-
-WEB_APP_BASE_URL=https://<your-tunnel>.trycloudflare.com
-
-Restart the API:
-
-docker compose restart api
-
-Configure Slack Event Subscription:
+Configure Slack Event Subscription and Interactivity Request URL:
 
 https://<your-tunnel>.trycloudflare.com/api/v1/slack/events
+https://<your-tunnel>.trycloudflare.com/api/v1/slack/interactions
 
 Keep the Cloudflare tunnel running while testing.
 

@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -116,6 +117,7 @@ class HubSpotAccessTokenProvider:
         self._token_client = token_client
         self._cipher = cipher
         self._repository_factory = repository_factory
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
 
     async def get_access_token(
         self,
@@ -132,33 +134,45 @@ class HubSpotAccessTokenProvider:
                 existing,
             )
 
-        refreshed = await self._token_client.refresh_token(
-            self._cipher.decrypt(existing.encrypted_refresh_token)
-        )
+        lock = self._refresh_locks.setdefault(tenant_id, asyncio.Lock())
+        async with lock:
+            existing = await self._get_token(tenant_id)
+            if existing is None:
+                raise ValueError("HubSpot OAuth connection was not found")
 
-        now = datetime.now(UTC)
+            if existing.expires_at > datetime.now(UTC) + timedelta(minutes=1):
+                return (
+                    self._cipher.decrypt(existing.encrypted_access_token),
+                    existing,
+                )
 
-        updated = StoredOAuthToken(
-            tenant_id=tenant_id,
-            hubspot_account_id=str(refreshed.hub_id),
-            encrypted_access_token=self._cipher.encrypt(
-                refreshed.access_token
-            ),
-            encrypted_refresh_token=self._cipher.encrypt(
-                refreshed.refresh_token
-            ),
-            expires_at=now + timedelta(seconds=refreshed.expires_in),
-            scopes=refreshed.scopes,
-            created_at=existing.created_at,
-            updated_at=now,
-        )
+            refreshed = await self._token_client.refresh_token(
+                self._cipher.decrypt(existing.encrypted_refresh_token)
+            )
 
-        async with UnitOfWork(self._session_factory) as unit_of_work:
-            repository = self._repository(unit_of_work)
-            await repository.save_token(updated)
-            await unit_of_work.commit()
+            now = datetime.now(UTC)
 
-        return refreshed.access_token, updated
+            updated = StoredOAuthToken(
+                tenant_id=tenant_id,
+                hubspot_account_id=str(refreshed.hub_id),
+                encrypted_access_token=self._cipher.encrypt(
+                    refreshed.access_token
+                ),
+                encrypted_refresh_token=self._cipher.encrypt(
+                    refreshed.refresh_token
+                ),
+                expires_at=now + timedelta(seconds=refreshed.expires_in),
+                scopes=refreshed.scopes,
+                created_at=existing.created_at,
+                updated_at=now,
+            )
+
+            async with UnitOfWork(self._session_factory) as unit_of_work:
+                repository = self._repository(unit_of_work)
+                await repository.save_token(updated)
+                await unit_of_work.commit()
+
+            return refreshed.access_token, updated
 
     async def _get_token(
         self,

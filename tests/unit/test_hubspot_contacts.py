@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -135,6 +136,48 @@ async def test_expired_tenant_token_is_refreshed_before_contacts_read():
     assert page.results == []
     assert TokenRepository.token is not None
     assert TokenRepository.token.encrypted_access_token != "refreshed-access"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_expired_token_reads_refresh_once_per_tenant():
+    cipher = SecretCipher(Fernet.generate_key().decode())
+    expired_token = StoredOAuthToken(
+        tenant_id="tenant-a",
+        hubspot_account_id="42",
+        encrypted_access_token=cipher.encrypt("expired-access"),
+        encrypted_refresh_token=cipher.encrypt("refresh-token"),
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        scopes=["crm.objects.contacts.read"],
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    class SharedTokenRepository(TokenRepository):
+        token: StoredOAuthToken | None = expired_token
+
+        async def save_token(self, token: StoredOAuthToken) -> None:
+            type(self).token = token
+
+    class SlowRefreshClient(RefreshClient):
+        def __init__(self):
+            self.refresh_calls = 0
+
+        async def refresh_token(self, refresh_token: str) -> HubSpotTokenResponse:
+            self.refresh_calls += 1
+            await asyncio.sleep(0.01)
+            return await super().refresh_token(refresh_token)
+
+    refresh_client = SlowRefreshClient()
+    provider = HubSpotAccessTokenProvider(
+        lambda: Session(), refresh_client, cipher, SharedTokenRepository
+    )
+    tokens = await asyncio.gather(
+        *(provider.get_access_token("tenant-a") for _ in range(6))
+    )
+
+    assert refresh_client.refresh_calls == 1
+    assert {access_token for access_token, _ in tokens} == {"refreshed-access"}
+
 
 @pytest.mark.asyncio
 async def test_contacts_client_creates_contact_and_sends_bearer_token():

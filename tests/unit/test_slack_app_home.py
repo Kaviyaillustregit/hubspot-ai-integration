@@ -55,6 +55,11 @@ def test_home_view_has_branding_input_send_and_quick_actions():
     assert "I can create and update contacts, companies and deals" in text
 
     [request_input] = blocks_of_type(view, "input")
+    assert request_input["label"] == {
+        "type": "plain_text",
+        "text": "CRM request",
+        "emoji": True,
+    }
     assert request_input["dispatch_action"] is True
     assert request_input["element"]["action_id"] == REQUEST_INPUT_ACTION
     assert request_input["element"]["placeholder"]["text"] == "Ask your HubSpot AI Agent..."
@@ -115,6 +120,7 @@ def test_contact_created_renders_professional_fields():
                 "name": "Angel John",
                 "email": "angel@example.com",
                 "company_name": "ABC <!channel>",
+                "hubspot_url": "https://app.hubspot.com/contacts/42/record/0-1/565238436562",
             },
         )
     )
@@ -126,6 +132,59 @@ def test_contact_created_renders_professional_fields():
     assert blocks[2]["elements"][0]["text"] == (
         "angel@example.com  ·  HubSpot ID `565238436562`"
     )
+    assert blocks[3]["text"]["text"] == (
+        "<https://app.hubspot.com/contacts/42/record/0-1/565238436562|View in HubSpot>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "title", "record_url"),
+    [
+        (
+            "company",
+            "Company created",
+            "https://app.hubspot.com/contacts/42/record/0-2/company-1",
+        ),
+        (
+            "deal",
+            "Deal created",
+            "https://app.hubspot.com/contacts/42/record/0-3/deal-1",
+        ),
+    ],
+)
+def test_created_crm_record_cards_render_existing_hubspot_links(kind, title, record_url):
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text=f"{title}.",
+            request_id="r",
+            result={"kind": "crm_records", "title": "CRM Updated"},
+            cards=[
+                {
+                    "kind": kind,
+                    "title": title,
+                    "name": "New record",
+                    "hubspot_url": record_url,
+                }
+            ],
+        )
+    )
+
+    assert blocks[-1]["text"]["text"] == f"<{record_url}|View in HubSpot>"
+
+
+def test_single_record_result_renders_existing_hubspot_link():
+    record_url = "https://app.hubspot.com/contacts/42/record/0-2/company-1"
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Company updated.",
+            request_id="r",
+            result={"kind": "crm_records", "hubspot_url": record_url},
+        )
+    )
+
+    assert blocks[-1]["text"]["text"] == f"<{record_url}|View in HubSpot>"
 
 
 def test_pending_confirmation_renders_confirm_button_instead_of_typed_instructions():
@@ -185,6 +244,187 @@ def test_summary_text_is_split_into_section_sized_chunks():
     assert blocks[0]["text"]["text"] == "✓  *Here's what I found*"
     assert len(blocks) > 2
     assert all(len(block["text"]["text"]) <= 3000 for block in blocks)
+
+
+@pytest.mark.parametrize(
+    ("columns", "rows", "expected_values"),
+    [
+        (
+            [
+                {"key": "name", "label": "Company"},
+                {"key": "industry", "label": "Industry"},
+                {"key": "view_url", "label": "View in HubSpot"},
+            ],
+            [
+                {
+                    "name": "Northwind",
+                    "industry": "Software",
+                    "view_url": "https://app.hubspot.com/contacts/42/record/0-2/1",
+                },
+                {
+                    "name": "Contoso",
+                    "industry": "Manufacturing",
+                    "view_url": "https://app.hubspot.com/contacts/42/record/0-2/2",
+                },
+            ],
+            ("Company", "Industry", "Northwind", "Contoso"),
+        ),
+        (
+            [
+                {"key": "name", "label": "Contact"},
+                {"key": "email", "label": "Email"},
+                {"key": "view_url", "label": "View in HubSpot"},
+            ],
+            [
+                {
+                    "name": "Alex Smith",
+                    "email": "alex@example.com",
+                    "view_url": "https://app.hubspot.com/contacts/42/record/0-1/3",
+                },
+                {
+                    "name": "Sam Jones",
+                    "email": "sam@example.com",
+                    "view_url": "https://app.hubspot.com/contacts/42/record/0-1/4",
+                },
+            ],
+            ("Contact", "Email", "Alex Smith", "Sam Jones"),
+        ),
+        (
+            [
+                {"key": "name", "label": "Deal Name"},
+                {"key": "company", "label": "Associated Company"},
+                {"key": "owner", "label": "Deal Owner"},
+                {"key": "stage", "label": "Deal Stage"},
+                {"key": "amount", "label": "Amount"},
+                {"key": "probability", "label": "Probability"},
+                {"key": "close_date", "label": "Close Date"},
+                {"key": "view_url", "label": "View in HubSpot"},
+            ],
+            [
+                {
+                    "name": "Renewal",
+                    "company": "Northwind",
+                    "owner": "Owner 1",
+                    "stage": "Negotiation",
+                    "amount": "$500",
+                    "probability": "75%",
+                    "close_date": "2026-12-31",
+                    "view_url": "https://app.hubspot.com/contacts/42/record/0-3/5",
+                },
+                {
+                    "name": "Expansion",
+                    "company": "Contoso",
+                    "owner": "Owner 2",
+                    "stage": "Qualified",
+                    "amount": "$900",
+                    "probability": "50%",
+                    "close_date": "2027-01-31",
+                    "view_url": "https://app.hubspot.com/contacts/42/record/0-3/6",
+                },
+            ],
+            (
+                "Deal Name",
+                "Associated Company",
+                "Deal Owner",
+                "Deal Stage",
+                "Amount",
+                "Probability",
+                "Close Date",
+                "Renewal",
+                "Expansion",
+            ),
+        ),
+    ],
+)
+def test_structured_tables_render_dynamic_columns_rows_and_hubspot_links(
+    columns, rows, expected_values
+):
+    response = AgentResponse(
+        status="ok",
+        text=f"Found {len(rows)} records.",
+        request_id="r",
+        result={"kind": "crm_records", "table": {"columns": columns, "rows": rows}},
+    )
+
+    blocks = render_response_blocks(response)
+    text = all_text(blocks)
+
+    assert blocks[1]["text"]["text"] == f"Found {len(rows)} records."
+    assert all(value in text for value in expected_values)
+    assert text.count("|View in HubSpot>") == len(rows)
+    record_blocks = [
+        block
+        for block in blocks[2:]
+        if block["type"] == "section" and block.get("text", {}).get("text")
+    ]
+    assert all(
+        block["type"] == "section"
+        and "fields" not in block
+        and len(block["text"]["text"]) <= 3000
+        for block in blocks[2:]
+        if block["type"] == "section"
+    )
+    assert len(record_blocks) == len(rows)
+    assert sum(block["type"] == "divider" for block in blocks) == len(rows) - 1
+
+
+def test_structured_table_without_view_url_renders_rows_without_links():
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Found 1 company.",
+            request_id="r",
+            result={
+                "table": {
+                    "columns": [{"key": "name", "label": "Company"}],
+                    "rows": [{"name": "Northwind"}],
+                }
+            },
+        )
+    )
+
+    text = all_text(blocks)
+    assert "Found 1 company." in text
+    assert "Northwind" in text
+    assert "|View in HubSpot>" not in text
+
+
+def test_large_structured_table_stays_within_slack_home_block_limit():
+    response = AgentResponse(
+        status="ok",
+        text="Found 100 records.",
+        request_id="r",
+        result={
+            "table": {
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": f"Record {index}"} for index in range(100)],
+            }
+        },
+    )
+
+    blocks = build_home_view(response=response)["blocks"]
+
+    assert len(blocks) <= 100
+    assert any(
+        block.get("elements", [{}])[0].get("text", "").startswith("Showing ")
+        for block in blocks
+        if block["type"] == "context"
+    )
+    assert any(block["type"] == "input" for block in blocks)
+
+
+def test_non_table_response_keeps_existing_text_fallback():
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Closed-Won revenue: $12,000.",
+            request_id="r",
+            result={"kind": "revenue_summary", "total_amount": "$12,000"},
+        )
+    )
+
+    assert blocks[0]["text"]["text"] == "✓  *Here's what I found*"
+    assert blocks[1]["text"]["text"] == "Closed-Won revenue: $12,000."
 
 
 def test_recent_activity_lines_reflect_real_action_state():

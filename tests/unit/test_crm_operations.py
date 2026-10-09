@@ -185,6 +185,15 @@ class FakeDeals:
         self.crm.check(context, "read:deals")
         return [PIPELINE]
 
+    async def list_deals(self, context, **kwargs):
+        self.crm.check(context, "read:deals")
+        return HubSpotDealsPage(
+            results=[
+                HubSpotDeal(id=key, properties=value)
+                for key, value in self.crm.deals.items()
+            ]
+        )
+
 
 class FakeAssociations:
     def __init__(self, crm: FakeCRM) -> None:
@@ -360,6 +369,86 @@ async def test_create_company_from_natural_language(h, message):
     assert h.crm.writes == ["create company ABC Technologies"]
     assert len(h.safety.completed) == 1
     assert h.safety.completed[0]["result"] == {"company_id": "company-1"}
+
+
+@pytest.mark.parametrize("failed_extraction", [True, False])
+@pytest.mark.parametrize(
+    ("message", "misclassified_intent", "expected_write"),
+    [
+        ("create company named abcd", "crm_question", "create company abcd"),
+        ("create contact name ayal", "unsupported", "create contact"),
+    ],
+)
+async def test_explicit_create_recovers_failed_or_misclassified_intent(
+    h, failed_extraction, message, misclassified_intent, expected_write
+):
+    h.provider.intent = (
+        RuntimeError("intent extraction unavailable")
+        if failed_extraction
+        else CRMIntentExtraction(
+            intent=misclassified_intent,
+            confidence=0.95,
+            query="company_details" if misclassified_intent == "crm_question" else None,
+        )
+    )
+    result = await h.agent.respond(
+        AgentRequest(
+            tenant_id="tenant-a",
+            actor_id="U1",
+            message=message,
+            request_id="create-recovery",
+        )
+    )
+
+    assert result.status == "ok"
+    if expected_write == "create company abcd":
+        assert h.crm.writes == [expected_write]
+        assert "Company created: abcd" in result.text
+    else:
+        assert h.crm.writes == ["create contact {'firstname': 'ayal'}"]
+        assert "Contact ayal was created successfully" in result.text
+
+
+@pytest.mark.parametrize(
+    "name_phrase",
+    [
+        "named Daniel and last name Joseph",
+        "name Daniel and last name Joseph",
+        "first name Daniel and last name Joseph",
+        "Daniel and last name Joseph",
+    ],
+)
+async def test_create_contact_parses_last_name_phrase_and_preserves_other_fields(h, name_phrase):
+    h.provider.intent = CRMIntentExtraction(
+        intent="create_contact",
+        confidence=0.95,
+        first_name="Daniel",
+        last_name="and last name Joseph",
+        email="daniel.joseph@example.com",
+        phone="9876543211",
+    )
+
+    result = await h.agent.respond(
+        AgentRequest(
+            tenant_id="tenant-a",
+            actor_id="U1",
+            message=(
+                f"Create contact {name_phrase} with email daniel.joseph@example.com "
+                "and phone 9876543211"
+            ),
+            request_id="create-contact-name",
+        )
+    )
+
+    assert result.status == "ok"
+    assert h.crm.writes == [
+        "create contact {'firstname': 'Daniel', 'lastname': 'Joseph', "
+        "'email': 'daniel.joseph@example.com', 'phone': '9876543211'}"
+    ]
+    assert result.result is not None
+    assert result.result["hubspot_url"] == (
+        "https://app.hubspot.com/contacts/42/record/0-1/contact-1"
+    )
 
 
 async def test_create_company_with_grounded_details(h):
@@ -972,6 +1061,57 @@ async def test_llm_failure_falls_back_to_existing_rule_parser(h):
     assert result.status == "ok"
     assert result.tools_used == ["find_company"]
     assert h.crm.writes == []
+
+
+@pytest.mark.parametrize(
+    ("message", "title", "first_tool"),
+    [
+        ("Show all contacts.", "Contacts", "list_all_contacts"),
+        ("show all company", "Companies", "list_all_companies"),
+        ("show all companies", "Companies", "list_all_companies"),
+        ("show all deals", "Total Deals", "deal_pipelines"),
+        ("show all open deals", "Open Deals", "deal_pipelines"),
+    ],
+)
+async def test_llm_failure_routes_list_request_to_existing_list_flow(h, message, title, first_tool):
+    h.provider.intent = IntegrationError("LLM request failed")
+    h.contact("Ada", "Lovelace", "ada@example.com")
+
+    result = await h.agent.respond(
+        AgentRequest(
+            tenant_id="tenant-a",
+            actor_id="U1",
+            message=message,
+            request_id="req-contacts",
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.result is not None
+    assert result.result["title"] == title
+    assert result.tools_used[0] == first_tool
+    if message.casefold().endswith("contacts."):
+        assert result.text == "Found 1 contacts."
+        assert result.result["table"]["rows"][0]["name"] == "Ada Lovelace"  # type: ignore[index]
+    assert h.crm.writes == []
+
+
+async def test_llm_failure_routes_open_deals_to_open_deals_filter(h):
+    h.provider.intent = IntegrationError("LLM request failed")
+
+    result = await h.agent.respond(
+        AgentRequest(
+            tenant_id="tenant-a",
+            actor_id="U1",
+            message="show all open deals",
+            request_id="req-open-deals",
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.result is not None
+    assert result.result["title"] == "Open Deals"
+    assert result.text == "No open deals were found."
 
 
 async def test_confirmation_from_another_user_is_rejected(h):

@@ -1,3 +1,5 @@
+import asyncio
+
 from app.agent.extraction import validate_extraction
 from app.agent.operations import CRMOperations
 from app.agent.schemas import AgentRequest, CRMIntentExtraction
@@ -9,6 +11,7 @@ from app.integrations.hubspot.models import (
     HubSpotCompany,
     HubSpotContact,
     HubSpotContactsPage,
+    HubSpotDeal,
     HubSpotPipeline,
     HubSpotPipelineStage,
     HubSpotRecord,
@@ -248,6 +251,77 @@ async def test_company_search_and_contact_list_return_structured_tables():
     assert row["seniority"] == "Director"
     assert row["linkedin"] == "https://linkedin.example/kaviya"
     assert row["view_url"].endswith("/record/0-1/contact-1")
+
+
+async def test_contact_enrichment_is_bounded_concurrent_and_preserves_row_order():
+    class ConcurrentListingTools(ListingTools):
+        def __init__(self):
+            super().__init__()
+            self.contacts = [
+                HubSpotContact(
+                    id=f"contact-{index}",
+                    properties={"firstname": f"Contact {index}", "lastname": "Name"},
+                )
+                for index in range(12)
+            ]
+            self.active_associations = 0
+            self.max_active_associations = 0
+
+        async def list_all_contacts(self, tenant_id):
+            return self.contacts
+
+        async def associated_records(self, tenant_id, *, from_type, from_id, to_type):
+            self.active_associations += 1
+            self.max_active_associations = max(
+                self.max_active_associations, self.active_associations
+            )
+            try:
+                await asyncio.sleep(0.005)
+            finally:
+                self.active_associations -= 1
+            if to_type == "companies":
+                return [HubSpotRecord(id="company-1", properties={"name": "Testing Corp"})]
+            return []
+
+    tools = ConcurrentListingTools()
+    response = await query("contact_list", "List all contacts", tools=tools)
+
+    assert response.result is not None
+    rows = response.result["table"]["rows"]  # type: ignore[index]
+    assert [row["name"] for row in rows] == [
+        f"Contact {index} Name" for index in range(12)
+    ]
+    assert 1 < tools.max_active_associations <= 16
+
+
+async def test_deal_list_loads_pipeline_and_deals_concurrently():
+    class ParallelDealTools(ListingTools):
+        def __init__(self):
+            super().__init__()
+            self.active_loads = 0
+            self.max_active_loads = 0
+
+        async def _track_load(self):
+            self.active_loads += 1
+            self.max_active_loads = max(self.max_active_loads, self.active_loads)
+            try:
+                await asyncio.sleep(0.005)
+            finally:
+                self.active_loads -= 1
+
+        async def deal_pipelines(self, tenant_id):
+            await self._track_load()
+            return await super().deal_pipelines(tenant_id)
+
+        async def list_all_deals(self, tenant_id):
+            await self._track_load()
+            return [HubSpotDeal(id="deal-1", properties={"dealname": "Renewal"})]
+
+    tools = ParallelDealTools()
+    response = await query("all_deals", "Show all deals", tools=tools)
+
+    assert response.status == "ok"
+    assert tools.max_active_loads == 2
 
 
 async def test_company_list_returns_requested_columns_in_order_and_marks_empty_values():

@@ -1,12 +1,14 @@
 import json
 import logging
+from time import perf_counter
 from typing import Annotated
 from urllib.parse import parse_qs
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse, Response
 
-from app.agent.schemas import AgentRequest
+from app.agent.schemas import AgentRequest, AgentResponse
 from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
 from app.ai.factory import create_ai_provider
@@ -14,7 +16,6 @@ from app.ai.service import AIService
 from app.api.errors import AppError
 from app.api.hubspot_companies import get_companies_service
 from app.api.hubspot_contacts import get_contacts_service
-from app.core.config import Settings
 from app.core.secrets import SecretCipher
 from app.integrations.errors import IntegrationError
 from app.integrations.hubspot.associations import HubSpotAssociationsClient
@@ -29,6 +30,7 @@ from app.integrations.slack.events import (
     parse_message,
 )
 from app.integrations.slack.home import (
+    HomeInteraction,
     build_home_view,
     parse_home_interaction,
 )
@@ -38,10 +40,20 @@ from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_associations import HubSpotAssociationsService
 from app.services.hubspot_contacts import HubSpotAccessTokenProvider
 from app.services.hubspot_deals import HubSpotDealsService
-from app.web.session import LINK_TTL_SECONDS, WebIdentity, WebSessionSigner
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/slack", tags=["slack"])
+
+
+def _log_timing(operation: str, started: float, tenant_id: str) -> None:
+    logger.info(
+        "Slack Home timing",
+        extra={
+            "operation": operation,
+            "elapsed_ms": round((perf_counter() - started) * 1000, 2),
+            "tenant_id": tenant_id,
+        },
+    )
 
 
 def _token_provider(request: Request) -> HubSpotAccessTokenProvider:
@@ -83,18 +95,6 @@ def get_slack_client(request: Request) -> SlackClient:
 
 def get_action_safety(request: Request) -> ActionSafetyService:
     return ActionSafetyService(request.app.state.session_factory)
-
-
-def web_assistant_link(settings: Settings, tenant_id: str, user_id: str) -> str | None:
-    """A short-lived link that signs this Slack user into the web assistant."""
-    if not settings.web_app_base_url or not settings.slack_signing_secret:
-        return None
-    token = WebSessionSigner(settings.slack_signing_secret).issue(
-        WebIdentity(tenant_id=tenant_id, user_id=user_id),
-        purpose="link",
-        ttl_seconds=LINK_TTL_SECONDS,
-    )
-    return f"{settings.web_app_base_url.rstrip('/')}/assistant?token={token}"
 
 
 async def _respond(
@@ -142,18 +142,144 @@ async def _respond(
 
 async def _publish_home(
     client: SlackClient,
+    action_safety: ActionSafetyService,
     *,
     tenant_id: str,
     user_id: str,
-    web_url: str | None = None,
+    request_text: str | None = None,
+    response: AgentResponse | None = None,
+    working: bool = False,
+    draft: str | None = None,
+    timing_label: str | None = None,
 ) -> None:
+    started = perf_counter()
+    activity_started = perf_counter()
     try:
-        await client.publish_home_view(user_id, build_home_view(web_url=web_url))
+        recent = await action_safety.recent_actions(tenant_id=tenant_id, actor_id=user_id)
+        recent_unavailable = False
+    except Exception:
+        logger.exception("Slack App Home activity lookup failed", extra={"tenant_id": tenant_id})
+        recent = []
+        recent_unavailable = True
+    finally:
+        _log_timing("slack_home.recent_activity", activity_started, tenant_id)
+
+    build_started = perf_counter()
+    view = build_home_view(
+        recent=recent,
+        request_text=request_text,
+        response=response,
+        working=working,
+        draft=draft,
+        recent_unavailable=recent_unavailable,
+    )
+    _log_timing("slack_home.view_build", build_started, tenant_id)
+
+    publish_started = perf_counter()
+    try:
+        await client.publish_home_view(user_id, view)
     except IntegrationError as exc:
         logger.error(
             "Slack App Home publish failed",
             extra={"tenant_id": tenant_id, "error": str(exc)},
         )
+    finally:
+        _log_timing("slack_home.views_publish", publish_started, tenant_id)
+        if timing_label is not None:
+            _log_timing(f"slack_home.{timing_label}_publish_total", started, tenant_id)
+
+
+async def _handle_home_interaction(
+    agent: AccountIntelligenceAgent,
+    client: SlackClient,
+    action_safety: ActionSafetyService,
+    interaction: HomeInteraction,
+    tenant_id: str,
+    request_id: str,
+) -> None:
+    if interaction.kind == "quick_action":
+        await _publish_home(
+            client,
+            action_safety,
+            tenant_id=tenant_id,
+            user_id=interaction.user_id,
+            draft=interaction.template,
+        )
+        return
+
+    if interaction.kind == "input":
+        await _publish_home(
+            client,
+            action_safety,
+            tenant_id=tenant_id,
+            user_id=interaction.user_id,
+            draft=interaction.text,
+        )
+        return
+
+    message = (
+        f"confirm {interaction.action_id}"
+        if interaction.kind == "confirm"
+        else interaction.text
+    )
+    if not message.strip():
+        response = AgentResponse(
+            status="missing_fields",
+            text="Enter a request before sending it.",
+            request_id=request_id,
+        )
+        await _publish_home(
+            client,
+            action_safety,
+            tenant_id=tenant_id,
+            user_id=interaction.user_id,
+            response=response,
+        )
+        return
+
+    await _publish_home(
+        client,
+        action_safety,
+        tenant_id=tenant_id,
+        user_id=interaction.user_id,
+        request_text=message,
+        working=True,
+        timing_label="loading",
+    )
+    agent_started = perf_counter()
+    try:
+        response = await agent.respond(
+            AgentRequest(
+                tenant_id=tenant_id,
+                actor_id=interaction.user_id,
+                message=message,
+                request_id=request_id or uuid4().hex,
+                channel_id=f"apphome:{interaction.user_id}",
+                message_ts=interaction.action_ts or None,
+                event_id=interaction.action_ts or None,
+            )
+        )
+    except Exception:
+        logger.exception(
+            "Slack App Home agent request failed",
+            extra={"tenant_id": tenant_id},
+        )
+        response = AgentResponse(
+            status="unavailable",
+            text="Something went wrong while processing your request. Please try again.",
+            request_id=request_id,
+        )
+    finally:
+        _log_timing("agent.respond", agent_started, tenant_id)
+    await _publish_home(
+        client,
+        action_safety,
+        tenant_id=tenant_id,
+        user_id=interaction.user_id,
+        request_text=message,
+        response=response,
+        timing_label="final",
+    )
 
 
 @router.post("/interactions")
@@ -161,13 +287,10 @@ async def interactions(
     request: Request,
     background_tasks: BackgroundTasks,
     client: Annotated[SlackClient, Depends(get_slack_client)],
+    agent: Annotated[AccountIntelligenceAgent, Depends(get_agent)],
+    action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
 ) -> Response:
-    """Slack interactivity for the App Home tab.
-
-    The Home tab is only a launch screen for the web assistant. Interactions from an older
-    Home view (input, quick actions) simply redraw the launch screen; they never run CRM
-    requests whose results the Home tab would no longer show.
-    """
+    """Handle input and actions from the in-Slack App Home conversation."""
     settings = request.app.state.settings
 
     if not settings.slack_signing_secret:
@@ -205,11 +328,13 @@ async def interactions(
         return Response(status_code=200)
 
     background_tasks.add_task(
-        _publish_home,
+        _handle_home_interaction,
+        agent,
         client,
+        action_safety,
+        interaction,
         tenant_id=tenant_id,
-        user_id=interaction.user_id,
-        web_url=web_assistant_link(settings, tenant_id, interaction.user_id),
+        request_id=request.state.request_id,
     )
 
     return Response(status_code=200)
@@ -227,6 +352,7 @@ async def events(
         SlackClient,
         Depends(get_slack_client),
     ],
+    action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
 ) -> Response:
     settings = request.app.state.settings
 
@@ -283,9 +409,9 @@ async def events(
         background_tasks.add_task(
             _publish_home,
             client,
+            action_safety,
             tenant_id=home_tenant_id,
             user_id=home_opened.user_id,
-            web_url=web_assistant_link(settings, home_tenant_id, home_opened.user_id),
         )
         return Response(status_code=200)
 

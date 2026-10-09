@@ -13,7 +13,7 @@ from app.api.app import create_app
 from app.api.assistant import get_hubspot_connected, recent_item
 from app.api.slack import get_action_safety, get_agent, get_slack_client
 from app.core.config import Settings
-from app.integrations.slack.home import OPEN_WEB_ACTION, build_home_view
+from app.integrations.slack.home import build_home_view
 from app.services.action_safety import RecentAction
 from app.web.session import (
     LINK_TTL_SECONDS,
@@ -326,29 +326,25 @@ def test_agent_failure_returns_a_safe_error_reply():
 # ------------------------------------------------------------------- Slack entry point
 
 
-def test_slack_home_offers_the_web_assistant_when_configured():
-    view = build_home_view(recent=[], web_url="https://example.ngrok.app/assistant?token=abc")
-    button = next(
-        element
-        for block in view["blocks"]
-        if block["type"] == "actions"
-        for element in block["elements"]
-        if element["action_id"] == OPEN_WEB_ACTION
-    )
+def test_slack_home_is_an_in_slack_conversation_without_external_navigation():
+    view = build_home_view(recent=[])
+    text = json.dumps(view)
 
-    assert button["url"] == "https://example.ngrok.app/assistant?token=abc"
-    assert "Open HubSpot AI" in button["text"]["text"]
-    assert OPEN_WEB_ACTION not in json.dumps(build_home_view(recent=[]))
+    assert view["type"] == "home"
+    assert any(block["type"] == "input" for block in view["blocks"])
+    assert "Open HubSpot AI" not in text
+    assert "/assistant" not in text
+    assert '"url"' not in text
 
 
-def test_app_home_opened_publishes_a_signed_link_for_that_user():
+def test_app_home_opened_publishes_the_conversation_inside_slack():
     views = []
 
     class Client:
         async def publish_home_view(self, user_id, view):
             views.append((user_id, view))
 
-    app = app_with(web_app_base_url="https://demo.example.com/")
+    app = app_with()
     app.dependency_overrides[get_slack_client] = lambda: Client()
     body = json.dumps(
         {
@@ -373,16 +369,9 @@ def test_app_home_opened_publishes_a_signed_link_for_that_user():
             },
         )
 
-    url = next(
-        element["url"]
-        for block in views[0][1]["blocks"]
-        if block["type"] == "actions"
-        for element in block["elements"]
-        if element.get("action_id") == OPEN_WEB_ACTION
-    )
-    assert url.startswith("https://demo.example.com/assistant?token=")
-    token = url.split("token=", 1)[1]
-    assert signer().verify(token, purpose="link") == IDENTITY
+    assert views[0][0] == "U1"
+    assert any(block["type"] == "input" for block in views[0][1]["blocks"])
+    assert "/assistant" not in json.dumps(views[0][1])
 
 
 # --------------------------------------------------------------------- recent activity

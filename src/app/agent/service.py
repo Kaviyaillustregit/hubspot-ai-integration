@@ -52,6 +52,25 @@ _CONTACT_CREATE_PATTERN = re.compile(
     r"\b(?:create|add)\s+(?:a\s+)?contact\b",
     re.IGNORECASE,
 )
+_EXPLICIT_CREATE_PATTERN = re.compile(
+    r"^\s*(?:(?:please\s+)?(?:(?:can|could|would) you\s+(?:please\s+)?)"
+    r"|(?:i want to|i need to|i(?:'d| would) like to)\s+)?"
+    r"(?:create|add|make)\s+(?:(?:a|an)\s+)?(?:new\s+)?"
+    r"(?P<entity>company|contact)\b"
+    r"(?P<details>.*)",
+    re.IGNORECASE,
+)
+_CREATE_NAME_PATTERN = re.compile(
+    r"\b(?:named|called|name)\s*[:=]?\s*(?P<name>.+?)"
+    r"(?=\s*(?:[.,;!?]|$|\b(?:with|email|phone|website|domain|city|"
+    r"under|associated\s+with)\b))",
+    re.IGNORECASE,
+)
+_CONTACT_NAME_WITH_LAST_PATTERN = re.compile(
+    r"\b(?:(?:named|called|name|first\s+name)\s+)?(?P<first>[\w'-]+)\s+and\s+"
+    r"(?:the\s+)?last\s+name\s+(?P<last>[\w'-]+)\b",
+    re.IGNORECASE,
+)
 
 _CONTACT_UPDATE_PATTERN = re.compile(
     r"\bupdate\s+(?:a\s+)?contact\b",
@@ -93,6 +112,18 @@ _JOBTITLE_PATTERN = re.compile(
 )
 _ALL_CONTACTS_LIST_PATTERN = re.compile(
     r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+contacts\b",
+    re.IGNORECASE,
+)
+_ALL_COMPANIES_LIST_PATTERN = re.compile(
+    r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+compan(?:y|ies)\b",
+    re.IGNORECASE,
+)
+_ALL_OPEN_DEALS_LIST_PATTERN = re.compile(
+    r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+open\s+deals?\b",
+    re.IGNORECASE,
+)
+_ALL_DEALS_LIST_PATTERN = re.compile(
+    r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+deals?\b",
     re.IGNORECASE,
 )
 _REVENUE_QUESTION_PATTERN = re.compile(
@@ -353,7 +384,53 @@ class AccountIntelligenceAgent:
         extraction = await self._extract_intent(request)
 
         if extraction is None:
-            return await self._respond_with_rules(request)
+            explicit_create = self._explicit_create_extraction(request.message)
+            if explicit_create is not None:
+                return await self._respond_to_extraction(request, explicit_create)
+            if _ALL_CONTACTS_LIST_PATTERN.search(request.message):
+                query = "contact_list"
+            elif _ALL_COMPANIES_LIST_PATTERN.search(request.message):
+                query = "company_list"
+            elif _ALL_OPEN_DEALS_LIST_PATTERN.search(request.message):
+                query = "open_deals"
+            elif _ALL_DEALS_LIST_PATTERN.search(request.message):
+                query = "all_deals"
+            else:
+                return await self._respond_with_rules(request)
+            return await self._respond_to_extraction(
+                request,
+                CRMIntentExtraction(
+                    intent="crm_question",
+                    query=query,
+                    confidence=1.0,
+                ),
+            )
+
+        explicit_create = self._explicit_create_extraction(request.message)
+        if explicit_create is not None and extraction.intent in {
+            "crm_question",
+            "unsupported",
+            explicit_create.intent,
+        }:
+            reclassified = extraction.intent != explicit_create.intent
+            extraction = extraction.model_copy(
+                update={
+                    "intent": explicit_create.intent,
+                    "confidence": (
+                        explicit_create.confidence if reclassified else extraction.confidence
+                    ),
+                    "first_name": explicit_create.first_name or extraction.first_name,
+                    "last_name": explicit_create.last_name or extraction.last_name,
+                    "company_name": explicit_create.company_name or extraction.company_name,
+                    "email": explicit_create.email or extraction.email,
+                    "query": None,
+                    "question": None,
+                    "contact_action": explicit_create.contact_action,
+                    "company_action": explicit_create.company_action,
+                    "deal_action": None,
+                    "associations": [],
+                }
+            )
 
         return await self._respond_to_extraction(request, extraction)
 
@@ -980,6 +1057,44 @@ class AccountIntelligenceAgent:
             email=email_match.group(0),
             firstname=(firstname_match.group(1) if firstname_match else None),
             lastname=(lastname_match.group(1) if lastname_match else None),
+        )
+
+    @staticmethod
+    def _explicit_create_extraction(message: str) -> CRMIntentExtraction | None:
+        matched = _EXPLICIT_CREATE_PATTERN.search(message)
+        if matched is None:
+            return None
+
+        entity = matched.group("entity").casefold()
+        details = matched.group("details")
+        name_match = _CREATE_NAME_PATTERN.search(details)
+        name = name_match.group("name").strip(" \t'\"`.,;:!?") if name_match else None
+        email_match = _EMAIL_PATTERN.search(details)
+        firstname_match = _FIRSTNAME_PATTERN.search(details)
+        lastname_match = _LASTNAME_PATTERN.search(details)
+
+        first_name = firstname_match.group(1) if firstname_match else None
+        last_name = lastname_match.group(1) if lastname_match else None
+        contact_name_match = (
+            _CONTACT_NAME_WITH_LAST_PATTERN.search(details) if entity == "contact" else None
+        )
+        if contact_name_match is not None:
+            first_name = contact_name_match.group("first")
+            last_name = contact_name_match.group("last")
+        if entity == "contact" and name and not first_name and not last_name:
+            parts = name.split(maxsplit=1)
+            first_name = parts[0]
+            last_name = parts[1] if len(parts) > 1 else None
+
+        return CRMIntentExtraction(
+            intent="create_company" if entity == "company" else "create_contact",
+            confidence=0.95,
+            first_name=first_name,
+            last_name=last_name,
+            email=email_match.group(0) if email_match else None,
+            company_name=name if entity == "company" else None,
+            company_action="create" if entity == "company" else None,
+            contact_action="create" if entity == "contact" else None,
         )
 
     @staticmethod
