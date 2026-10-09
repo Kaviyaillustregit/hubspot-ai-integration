@@ -5,7 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.integrations.errors import IntegrationError
 from app.integrations.hubspot.context import TenantContext
 from app.integrations.hubspot.http import HubSpotApiClient
-from app.integrations.hubspot.models import HubSpotDeal, HubSpotDealsPage, HubSpotPipeline
+from app.integrations.hubspot.models import (
+    HubSpotDeal,
+    HubSpotDealsPage,
+    HubSpotPipeline,
+    HubSpotProperty,
+)
 
 
 class _DealsResponse(BaseModel):
@@ -147,6 +152,22 @@ class HubSpotDealsClient(HubSpotApiClient):
             return _PipelinesResponse.model_validate(payload).results
         except (ValueError, TypeError) as exc:
             raise IntegrationError("HubSpot deal pipelines response was invalid") from exc
+
+    async def get_deal_type_property(
+        self,
+        context: TenantContext,
+        access_token: str,
+    ) -> HubSpotProperty:
+        payload = await self._call(
+            "GET",
+            "/crm/v3/properties/deals/dealtype",
+            access_token,
+            label="HubSpot deal type property",
+        )
+        try:
+            return HubSpotProperty.model_validate(payload)
+        except (ValueError, TypeError) as exc:
+            raise IntegrationError("HubSpot deal type property response was invalid") from exc
 
     @staticmethod
     def _validate_deal(payload: object) -> HubSpotDeal:

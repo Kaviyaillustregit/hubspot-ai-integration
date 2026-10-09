@@ -22,6 +22,7 @@ from app.integrations.hubspot.models import (
     HubSpotDealsPage,
     HubSpotPipeline,
     HubSpotPipelineStage,
+    HubSpotPropertyOption,
     HubSpotRecord,
 )
 from app.integrations.slack.home import render_response_blocks
@@ -35,6 +36,7 @@ PIPELINE = HubSpotPipeline(
         HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled"),
         HubSpotPipelineStage(id="contractsent", label="Contract Sent", display_order=4),
         HubSpotPipelineStage(id="closedwon", label="Closed Won", display_order=5),
+        HubSpotPipelineStage(id="qualifiedtobuy", label="Qualified to Buy", display_order=6),
     ],
 )
 
@@ -50,6 +52,10 @@ class FakeCRM:
         self.writes: list[str] = []
         self.fail_on: str | None = None
         self.denied_scope: str | None = None
+        self.deal_type_options: list[HubSpotPropertyOption] | None = [
+            HubSpotPropertyOption(label="New Business", value="newbusiness"),
+            HubSpotPropertyOption(label="Existing Business", value="existingbusiness"),
+        ]
 
     def new_id(self, prefix: str) -> str:
         return f"{prefix}-{len(self.companies) + len(self.contacts) + len(self.deals) + 1}"
@@ -184,6 +190,12 @@ class FakeDeals:
     async def list_pipelines(self, context):
         self.crm.check(context, "read:deals")
         return [PIPELINE]
+
+    async def get_deal_type_options(self, context):
+        self.crm.check(context, "read:deal_type_options")
+        if self.crm.deal_type_options is None:
+            raise IntegrationError("Deal type options unavailable")
+        return self.crm.deal_type_options
 
     async def list_deals(self, context, **kwargs):
         self.crm.check(context, "read:deals")
@@ -676,7 +688,7 @@ async def test_which_company_is_contact_associated_with(h):
 
 
 async def test_create_deal_for_company_with_amount(h):
-    company_id = h.company("ABC Technologies")
+    h.company("ABC Technologies")
 
     result = await h.say(
         "Create a $50,000 deal for ABC Technologies.",
@@ -685,17 +697,283 @@ async def test_create_deal_for_company_with_amount(h):
         company_name="ABC Technologies",
     )
 
+    assert result.status == "missing_fields"
+    assert "What should the new deal be called?" in result.text
+    assert h.crm.writes == []
+    assert h.crm.deals == {}
+    assert h.crm.links == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Create a deal named Enterprise Upgrade with a close date of 2026-10-10.",
+        "Close date 2026-10-10. Create a deal named Enterprise Upgrade.",
+        "Creat a deal calld Enterprise Upgrade, close date 2026-10-10.",
+    ],
+)
+async def test_create_named_deal_with_close_date(h, message):
+    result = await h.say(
+        message,
+        "create_deal",
+        deal_name="Enterprise Upgrade",
+        deal_close_date="2026-10-10",
+    )
+
     assert result.status == "ok"
-    assert h.crm.deals["deal-2"] == {
-        "dealname": "ABC Technologies Deal",
+    assert h.crm.deals["deal-1"] == {
+        "dealname": "Enterprise Upgrade",
         "pipeline": "default",
         "dealstage": "appointmentscheduled",
-        "amount": "50000",
+        "closedate": "2026-10-10T00:00:00Z",
     }
-    assert h.crm.links == [("deals", "deal-2", "companies", company_id)]
-    assert "✅ Deal created: ABC Technologies Deal — 50,000 — Appointment Scheduled" in result.text
-    assert "named automatically" in result.text
-    assert "✅ Deal ABC Technologies Deal associated with ABC Technologies" in result.text
+    assert "✅ Deal created: Enterprise Upgrade" in result.text
+    assert "2026-10-10" in result.text
+
+
+async def test_deal_type_phrase_without_record_name_asks_for_clarification(h):
+    result = await h.say(
+        "Create a deal type with close date Oct 10.",
+        "create_deal",
+        deal_close_date="Oct 10",
+    )
+
+    assert result.status == "needs_clarification"
+    assert "Did you mean to create a deal record?" in result.text
+    assert h.crm.writes == []
+    assert h.safety.claimed == {}
+
+
+async def test_missing_extracted_close_date_does_not_create_incomplete_deal(h):
+    result = await h.say(
+        "Create a deal called Renewal closing October 10.",
+        "create_deal",
+        deal_name="Renewal",
+    )
+
+    assert result.status == "needs_clarification"
+    assert "couldn't identify the close date" in result.text
+    assert h.crm.writes == []
+    assert h.crm.deals == {}
+    assert h.safety.claimed == {}
+
+
+async def test_updating_deal_close_date_remains_confirmation_gated(h):
+    deal_id = h.deal("Renewal")
+    proposed = await h.say(
+        "Update the Renewal close date to 2026-10-10.",
+        "update_deal",
+        deal_name="Renewal",
+        deal_close_date="2026-10-10",
+    )
+
+    assert proposed.status == "pending_confirmation"
+    assert h.crm.deals[deal_id].get("closedate") is None
+
+    await h.confirm(str(proposed.result["action_id"]))  # type: ignore[index]
+
+    assert h.crm.deals[deal_id]["closedate"] == "2026-10-10T00:00:00Z"
+
+
+async def test_deal_type_and_owner_requests_do_not_guess_account_values(h):
+    typed = await h.say(
+        "Create a deal called Renewal with type new business.",
+        "create_deal",
+        deal_name="Renewal",
+        deal_type="New Business",
+    )
+    assert typed.status == "ok"
+    assert h.crm.deals["deal-1"]["dealtype"] == "newbusiness"
+
+    owned = await h.say(
+        "Create a deal called Renewal and assign it to me.",
+        "create_deal",
+        deal_name="Renewal",
+        deal_owner="me",
+    )
+    assert owned.status == "needs_clarification"
+    assert "resolve a HubSpot owner" in owned.text
+    assert len(h.crm.writes) == 1
+
+    currency = await h.say(
+        "Create a deal called Renewal for 10000 in currency USD.",
+        "create_deal",
+        deal_name="Renewal",
+        deal_amount="10000",
+        deal_currency="USD",
+    )
+    assert currency.status == "needs_clarification"
+    assert "supported deal currencies" in currency.text
+    assert len(h.crm.writes) == 1
+
+
+async def test_deal_type_label_maps_to_hubspot_account_value(h):
+    company_id = h.company("Test ABC")
+    contact_id = h.contact("John", "Cena")
+    result = await h.say(
+        "Create a deal called Renewal with type Existing Business for Test ABC and "
+        "associate it with John Cena, amount $1000, stage Qualified to Buy, "
+        "close date December 10,2026.",
+        "create_deal",
+        deal_name="Renewal",
+        company_name="Test ABC",
+        first_name="John",
+        last_name="Cena",
+        deal_amount="$1000",
+        deal_stage="Qualified to Buy",
+        deal_close_date="December 10,2026",
+        deal_type="Existing Business",
+        associations=["deal_contact", "deal_company"],
+    )
+
+    assert result.status == "ok"
+    deal_id = next(iter(h.crm.deals))
+    assert h.crm.deals[deal_id] == {
+        "dealname": "Renewal",
+        "pipeline": "default",
+        "dealstage": "qualifiedtobuy",
+        "amount": "1000",
+        "closedate": "2026-12-10T00:00:00Z",
+        "dealtype": "existingbusiness",
+    }
+    assert h.crm.links == [
+        ("deals", deal_id, "companies", company_id),
+        ("deals", deal_id, "contacts", contact_id),
+    ]
+
+
+async def test_invalid_deal_type_is_rejected_without_creation(h):
+    result = await h.say(
+        "Create a deal called Renewal with type Channel Partner.",
+        "create_deal",
+        deal_name="Renewal",
+        deal_type="Channel Partner",
+    )
+
+    assert result.status == "invalid_request"
+    assert "New Business" in result.text
+    assert "Existing Business" in result.text
+    assert h.crm.writes == []
+    assert h.crm.deals == {}
+
+
+async def test_unavailable_deal_type_options_prevent_creation(h):
+    h.crm.deal_type_options = None
+    result = await h.say(
+        "Create a deal called Renewal with type Existing Business.",
+        "create_deal",
+        deal_name="Renewal",
+        deal_type="Existing Business",
+    )
+
+    assert result.status == "unavailable"
+    assert h.crm.writes == []
+    assert h.crm.deals == {}
+
+
+async def test_unrecognized_deal_name_from_llm_is_rejected_without_creation(h):
+    result = await h.say(
+        "Create a deal called Renewal.",
+        "create_deal",
+        deal_name="Invented Renewal",
+    )
+
+    assert result.status == "invalid_request"
+    assert "deal name" in result.text
+    assert h.crm.writes == []
+    assert h.crm.deals == {}
+
+
+async def test_create_deal_with_close_date_and_associations(h):
+    company_id = h.company("TechNova")
+    contact_id = h.contact("John", "Smith")
+
+    result = await h.say(
+        "Create a deal named Product Renewal for TechNova and associate it with John Smith, "
+        "closing 2026-10-16.",
+        "create_deal",
+        deal_name="Product Renewal",
+        company_name="TechNova",
+        first_name="John",
+        last_name="Smith",
+        deal_close_date="2026-10-16",
+        associations=["deal_company", "deal_contact"],
+    )
+
+    assert result.status == "ok"
+    deal_id = next(iter(h.crm.deals))
+    assert h.crm.deals[deal_id]["closedate"] == "2026-10-16T00:00:00Z"
+    assert h.crm.links == [
+        ("deals", deal_id, "companies", company_id),
+        ("deals", deal_id, "contacts", contact_id),
+    ]
+
+
+async def test_create_deal_with_comma_adjacent_close_date_and_requested_fields(h):
+    company_id = h.company("Test ABC")
+    contact_id = h.contact("John", "Cena")
+
+    result = await h.say(
+        "Create a new deal named 'Deal From John Cena', associate it with contact "
+        "'John Cena' and company 'Test ABC', set amount to $1000, stage to "
+        "'Qualified to Buy', and close date to December 10,2026.",
+        "create_deal",
+        deal_name="Deal From John Cena",
+        company_name="Test ABC",
+        first_name="John",
+        last_name="Cena",
+        deal_amount="$1000",
+        deal_stage="Qualified to Buy",
+        deal_close_date="December 10,2026",
+        associations=["deal_contact", "deal_company"],
+    )
+
+    assert result.status == "ok"
+    deal_id = next(iter(h.crm.deals))
+    assert h.crm.deals[deal_id] == {
+        "dealname": "Deal From John Cena",
+        "pipeline": "default",
+        "dealstage": "qualifiedtobuy",
+        "amount": "1000",
+        "closedate": "2026-12-10T00:00:00Z",
+    }
+    assert h.crm.links == [
+        ("deals", deal_id, "companies", company_id),
+        ("deals", deal_id, "contacts", contact_id),
+    ]
+    assert len(h.crm.writes) == 3
+
+
+async def test_hubspot_deal_creation_failure_does_not_report_success(h):
+    h.crm.fail_on = "write:deals"
+    result = await h.say(
+        "Create a deal called Renewal with close date 2026-10-10.",
+        "create_deal",
+        deal_name="Renewal",
+        deal_close_date="2026-10-10",
+    )
+
+    assert result.status == "unavailable"
+    assert "✅ Deal created" not in result.text
+    assert h.crm.deals == {}
+    assert h.crm.writes == []
+
+
+async def test_provider_failure_does_not_create_a_deal(h):
+    h.provider.intent = RuntimeError("provider unavailable")
+
+    result = await h.agent.respond(
+        AgentRequest(
+            tenant_id="tenant-a",
+            actor_id="U1",
+            message="Create a deal called Renewal with close date 2026-10-10.",
+            request_id="provider-failure",
+        )
+    )
+
+    assert result.status == "unsupported"
+    assert h.crm.writes == []
+    assert h.crm.deals == {}
 
 
 async def test_create_named_deal_with_amount_and_stage(h):
@@ -907,8 +1185,10 @@ async def test_create_deal_for_company_and_associate_with_contact(h):
     contact_id = h.contact("John", "Smith")
 
     result = await h.say(
-        "Create a $50,000 deal for TechNova and associate it with John Smith.",
+        "Create a deal called Product Renewal worth $50,000 for TechNova and associate it "
+        "with John Smith.",
         "create_deal",
+        deal_name="Product Renewal",
         deal_amount="$50,000",
         company_name="TechNova",
         first_name="John",
@@ -926,11 +1206,12 @@ async def test_create_deal_for_company_and_associate_with_contact(h):
 async def test_create_company_contact_and_deal_in_one_message(h):
     result = await h.say(
         "Create ABC Technologies, add John Smith as a contact, and create a $50,000 deal "
-        "for them.",
+        "called Product Renewal for them.",
         "multi_step",
         company_name="ABC Technologies",
         first_name="John",
         last_name="Smith",
+        deal_name="Product Renewal",
         deal_amount="$50,000",
         company_action="create",
         contact_action="create",
@@ -944,8 +1225,8 @@ async def test_create_company_contact_and_deal_in_one_message(h):
         "✅ Contact created",
         "✅ Deal created",
         "✅ Contact John Smith associated with ABC Technologies",
-        "✅ Deal ABC Technologies Deal associated with ABC Technologies",
-        "✅ Deal ABC Technologies Deal associated with Contact John Smith",
+        "✅ Deal Product Renewal associated with ABC Technologies",
+        "✅ Deal Product Renewal associated with Contact John Smith",
     ]
     assert len(h.crm.links) == 3
 

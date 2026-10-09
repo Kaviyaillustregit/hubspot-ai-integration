@@ -52,6 +52,10 @@ _CONTACT_CREATE_PATTERN = re.compile(
     r"\b(?:create|add)\s+(?:a\s+)?contact\b",
     re.IGNORECASE,
 )
+_AMBIGUOUS_DEAL_TYPE_CREATE_PATTERN = re.compile(
+    r"\b(?:create|add|make)\s+(?:(?:a|an|new)\s+)*deal\s+type\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_CREATE_PATTERN = re.compile(
     r"^\s*(?:(?:please\s+)?(?:(?:can|could|would) you\s+(?:please\s+)?)"
     r"|(?:i want to|i need to|i(?:'d| would) like to)\s+)?"
@@ -380,6 +384,13 @@ class AccountIntelligenceAgent:
                     request,
                     ["create_contact"],
                 )
+
+        if _AMBIGUOUS_DEAL_TYPE_CREATE_PATTERN.search(request.message):
+            return self._safe(
+                "needs_clarification",
+                "Did you mean to create a deal record? If so, what should it be called?",
+                request,
+            )
 
         extraction = await self._extract_intent(request)
 

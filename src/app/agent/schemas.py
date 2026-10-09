@@ -81,6 +81,10 @@ class CRMIntentExtraction(BaseModel):
     deal_amount: str | None = Field(default=None, max_length=50)
     deal_stage: str | None = Field(default=None, max_length=100)
     deal_pipeline: str | None = Field(default=None, max_length=100)
+    deal_close_date: str | None = Field(default=None, max_length=100)
+    deal_type: str | None = Field(default=None, max_length=100)
+    deal_owner: str | None = Field(default=None, max_length=200)
+    deal_currency: str | None = Field(default=None, max_length=3)
     # Structure of the request.
     contact_action: EntityAction | None = None
     company_action: EntityAction | None = None

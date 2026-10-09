@@ -6,6 +6,7 @@ and the value actually used is the user's own text, never the model's rewrite.
 
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from app.agent.schemas import CRMIntentExtraction, CRMIntentName
@@ -45,6 +46,10 @@ _FIELD_LABELS = {
     "deal_amount": "deal amount",
     "deal_stage": "deal stage",
     "deal_pipeline": "deal pipeline",
+    "deal_close_date": "deal close date",
+    "deal_type": "deal type",
+    "deal_owner": "deal owner",
+    "deal_currency": "deal currency",
 }
 
 _EMAIL = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
@@ -61,6 +66,47 @@ _MAX_AMOUNT = Decimal(10) ** 12
 # Slack markup: <@U1> mentions, <#C1|name> channels, <!here>, <mailto:a@b.c|a@b.c>, <http://x|x>.
 _SLACK_TOKEN = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
 _EMAIL_SPAN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MONTH_DATE = re.compile(
+    r"^(?P<month>[A-Za-z]+)\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:(?:,\s*|\s+)(?P<year>\d{4}))?$",
+    re.IGNORECASE,
+)
+_DAY_MONTH_DATE = re.compile(
+    r"^(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+(?P<month>[A-Za-z]+)\.?"
+    r"(?:(?:,\s*|\s+)(?P<year>\d{4}))?$",
+    re.IGNORECASE,
+)
+_WEEKDAY_NAMES = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+_MONTH_NAMES = {
+    name.casefold(): month
+    for month, names in enumerate(
+        (
+            (),
+            ("january", "jan"),
+            ("february", "feb"),
+            ("march", "mar"),
+            ("april", "apr"),
+            ("may",),
+            ("june", "jun"),
+            ("july", "jul"),
+            ("august", "aug"),
+            ("september", "sep", "sept"),
+            ("october", "oct"),
+            ("november", "nov"),
+            ("december", "dec"),
+        )
+    )
+    for name in names
+}
 
 
 class ExtractionValidationError(ValueError):
@@ -73,6 +119,11 @@ class ExtractionValidationError(ValueError):
     @property
     def user_message(self) -> str:
         label = _FIELD_LABELS.get(self.field, self.field)
+        if self.reason == "ambiguous":
+            return (
+                f"I couldn't determine the {label} \"{self.value}\" unambiguously. "
+                "Please provide an exact date."
+            )
         if self.reason == "ungrounded":
             return (
                 f"I couldn't match the {label} \"{self.value}\" to your message exactly, "
@@ -93,10 +144,16 @@ class ValidatedExtraction:
     deal_amount: str | None = None
     deal_stage: str | None = None
     deal_pipeline: str | None = None
+    deal_close_date: str | None = None
+    deal_type: str | None = None
+    deal_owner: str | None = None
+    deal_currency: str | None = None
     requested_fields: list[str] = field(default_factory=list)
 
 
-def validate_extraction(message: str, extraction: CRMIntentExtraction) -> ValidatedExtraction:
+def validate_extraction(
+    message: str, extraction: CRMIntentExtraction, *, today: date | None = None
+) -> ValidatedExtraction:
     visible = visible_text(message)
     # Only the email field may be grounded inside an email address; otherwise "ABC"
     # would be "found" in "victor@abc.com".
@@ -132,6 +189,9 @@ def validate_extraction(message: str, extraction: CRMIntentExtraction) -> Valida
         raise ExtractionValidationError("company_employees", employees, "invalid_format")
 
     amount_text = _grounded(without_emails, "deal_amount", extraction.deal_amount)
+    close_date_text = _grounded(
+        without_emails, "deal_close_date", extraction.deal_close_date
+    )
     return ValidatedExtraction(
         intent=extraction.intent,
         properties=properties,
@@ -142,6 +202,14 @@ def validate_extraction(message: str, extraction: CRMIntentExtraction) -> Valida
         deal_amount=normalize_amount(amount_text) if amount_text is not None else None,
         deal_stage=_grounded(without_emails, "deal_stage", extraction.deal_stage),
         deal_pipeline=_grounded(without_emails, "deal_pipeline", extraction.deal_pipeline),
+        deal_close_date=(
+            normalize_deal_close_date(close_date_text, today=today)
+            if close_date_text is not None
+            else None
+        ),
+        deal_type=_grounded(without_emails, "deal_type", extraction.deal_type),
+        deal_owner=_grounded(without_emails, "deal_owner", extraction.deal_owner),
+        deal_currency=_grounded(without_emails, "deal_currency", extraction.deal_currency),
         requested_fields=_grounded_requested_fields(visible, extraction.requested_fields),
     )
 
@@ -218,6 +286,46 @@ def normalize_amount(text: str) -> str:
     if amount == amount.to_integral_value():
         return str(int(amount))
     return f"{amount.quantize(Decimal('0.01'))}"
+
+
+def normalize_deal_close_date(text: str, *, today: date | None = None) -> str:
+    """Resolve a grounded date phrase to a UTC date-time accepted by HubSpot."""
+    current_date = today or datetime.now(UTC).date()
+    value = text.strip().rstrip(".,!?").casefold()
+    try:
+        if _ISO_DATE.fullmatch(value):
+            return _hubspot_date(date.fromisoformat(value))
+        if value == "today":
+            return _hubspot_date(current_date)
+        if value == "tomorrow":
+            return _hubspot_date(current_date + timedelta(days=1))
+        weekday_match = re.fullmatch(r"next\s+([a-z]+)", value)
+        if weekday_match and weekday_match.group(1) in _WEEKDAY_NAMES:
+            target = _WEEKDAY_NAMES[weekday_match.group(1)]
+            days_ahead = (target - current_date.weekday()) % 7 or 7
+            return _hubspot_date(current_date + timedelta(days=days_ahead))
+
+        matched = _MONTH_DATE.fullmatch(value) or _DAY_MONTH_DATE.fullmatch(value)
+        if matched:
+            groups = matched.groupdict()
+            month = _MONTH_NAMES.get(groups["month"].rstrip(".").casefold())
+            if month is None:
+                raise ValueError
+            day = int(groups["day"])
+            year = int(groups["year"]) if groups["year"] else current_date.year
+            parsed = date(year, month, day)
+            if groups["year"] is None and parsed < current_date:
+                raise ExtractionValidationError("deal_close_date", text, "ambiguous")
+            return _hubspot_date(parsed)
+    except ExtractionValidationError:
+        raise
+    except ValueError as exc:
+        raise ExtractionValidationError("deal_close_date", text, "invalid_format") from exc
+    raise ExtractionValidationError("deal_close_date", text, "ambiguous")
+
+
+def _hubspot_date(value: date) -> str:
+    return f"{value.isoformat()}T00:00:00Z"
 
 
 def _check_phone(name: str, phone: str | None, *, min_digits: int = 7) -> None:

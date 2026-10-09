@@ -72,6 +72,21 @@ _LINKS: dict[str, tuple[CRMObjectType, Entity, CRMObjectType, Entity]] = {
 }
 _LIST_LIMIT = 20
 _ENRICHMENT_CONCURRENCY = 8
+_DEAL_OWNER_REQUEST_PATTERN = re.compile(
+    r"\b(?:assign(?:ed)?|(?:deal\s+)?owner\s+(?:is|to)|owned\s+by|as\s+owner)\b",
+    re.IGNORECASE,
+)
+_DEAL_TYPE_PHRASE_PATTERN = re.compile(r"\bdeal\s+type\b", re.IGNORECASE)
+_DEAL_TYPE_REQUEST_PATTERN = re.compile(
+    r"\bdeal\s+type\b|\bwith\s+type\b|\btype\s+(?:is|of)\b", re.IGNORECASE
+)
+_DEAL_CURRENCY_REQUEST_PATTERN = re.compile(r"\bcurrency\b", re.IGNORECASE)
+_DEAL_CLOSE_DATE_REQUEST_PATTERN = re.compile(
+    r"\b(?:close\s+date|close\s+on|closing(?:\s+on)?)\b", re.IGNORECASE
+)
+_DEAL_AMOUNT_REQUEST_PATTERN = re.compile(r"\b(?:amount|worth|budget)\b", re.IGNORECASE)
+_DEAL_PIPELINE_REQUEST_PATTERN = re.compile(r"\bpipeline\b", re.IGNORECASE)
+_DEAL_STAGE_REQUEST_PATTERN = re.compile(r"\bstage\b", re.IGNORECASE)
 _Item = TypeVar("_Item")
 _Result = TypeVar("_Result")
 
@@ -107,7 +122,6 @@ class _Plan:
     deal: HubSpotDeal | None = None
     deal_to_create: dict[str, str] | None = None
     deal_stage_label: str | None = None
-    deal_name_derived: bool = False
     lines: list[str] = field(default_factory=list)
     written: dict[str, str] = field(default_factory=dict)
     # (entity, label, record id) for requested creates that matched an existing record.
@@ -154,6 +168,91 @@ class CRMOperations:
             if extraction.intent == "delete_company":
                 return await self._propose_company_delete(request, validated)
             actions = _entity_actions(extraction, validated)
+            if actions["deal"] == "create":
+                if (
+                    validated.deal_name is None
+                    and _DEAL_TYPE_PHRASE_PATTERN.search(request.message)
+                ):
+                    raise OperationError(
+                        "missing_fields",
+                        "Did you mean to create a deal record? If so, what should it be called?",
+                    )
+                if (
+                    _DEAL_TYPE_REQUEST_PATTERN.search(request.message)
+                    and validated.deal_type is None
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I couldn't identify the deal type you requested. "
+                        "Please provide the exact type shown in HubSpot.",
+                    )
+                if validated.deal_currency is not None or _DEAL_CURRENCY_REQUEST_PATTERN.search(
+                    request.message
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I can't verify this HubSpot account's supported deal currencies. "
+                        "Please use the account's configured currency and resend the request.",
+                    )
+                if (
+                    validated.deal_owner is not None
+                    or _DEAL_OWNER_REQUEST_PATTERN.search(request.message)
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I can't safely resolve a HubSpot owner from this request. "
+                        "Please provide a supported HubSpot owner selection.",
+                    )
+                if (
+                    _DEAL_CLOSE_DATE_REQUEST_PATTERN.search(request.message)
+                    and validated.deal_close_date is None
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I couldn't identify the close date you requested. "
+                        "Please provide an exact date.",
+                    )
+                if (
+                    _DEAL_AMOUNT_REQUEST_PATTERN.search(request.message)
+                    and validated.deal_amount is None
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I couldn't identify the deal amount you requested. "
+                        "Please provide an amount.",
+                    )
+                if (
+                    _DEAL_PIPELINE_REQUEST_PATTERN.search(request.message)
+                    and validated.deal_pipeline is None
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I couldn't identify the deal pipeline you requested. "
+                        "Please provide its name.",
+                    )
+                if (
+                    _DEAL_STAGE_REQUEST_PATTERN.search(request.message)
+                    and validated.deal_stage is None
+                ):
+                    raise OperationError(
+                        "needs_clarification",
+                        "I couldn't identify the deal stage you requested. "
+                        "Please provide its name.",
+                    )
+            if actions["deal"] == "update" and (
+                validated.deal_type is not None
+                or _DEAL_TYPE_REQUEST_PATTERN.search(request.message)
+                or validated.deal_owner is not None
+                or validated.deal_currency is not None
+                or _DEAL_CURRENCY_REQUEST_PATTERN.search(request.message)
+                or _DEAL_OWNER_REQUEST_PATTERN.search(request.message)
+            ):
+                raise OperationError(
+                    "needs_clarification",
+                    "I can't safely resolve a HubSpot deal type, currency or owner "
+                    "from this request. "
+                    "Please provide a supported HubSpot value.",
+                )
             if "update" in actions.values():
                 return await self._propose_update(request, extraction, validated, actions)
             return await self._run_plan(request, extraction, validated, actions, idempotency_key)
@@ -341,9 +440,7 @@ class CRMOperations:
         if actions["deal"] == "create":
             deal_name = validated.deal_name
             if deal_name is None:
-                company_name = _company_label(plan.company, validated.company_name or "")
-                deal_name = f"{company_name} Deal"
-                plan.deal_name_derived = True
+                raise OperationError("missing_fields", "What should the new deal be called?")
             existing_deal = await self._tools.resolve_deal(tenant_id, deal_name)
             if existing_deal.status != "not_found":
                 deal_id = f" (ID `{existing_deal.deal.id}`)" if existing_deal.deal else ""
@@ -370,6 +467,36 @@ class CRMOperations:
             }
             if validated.deal_amount is not None:
                 plan.deal_to_create["amount"] = validated.deal_amount
+            if validated.deal_close_date is not None:
+                plan.deal_to_create["closedate"] = validated.deal_close_date
+            if validated.deal_type is not None:
+                options = await self._tools.deal_type_options(tenant_id)
+                normalized_type = _normal(validated.deal_type)
+                matching_options = [
+                    option
+                    for option in options
+                    if not option.hidden
+                    and (
+                        _normal(option.label) == normalized_type
+                        or option.value.casefold() == validated.deal_type.casefold()
+                    )
+                ]
+                if len(matching_options) != 1:
+                    available = ", ".join(
+                        option.label for option in options if not option.hidden
+                    )
+                    if not available:
+                        raise OperationError(
+                            "needs_clarification",
+                            "I couldn't retrieve this HubSpot account's available deal types, "
+                            "so I didn't create the deal.",
+                        )
+                    raise OperationError(
+                        "invalid_request",
+                        f"“{validated.deal_type}” isn't an available deal type. "
+                        f"Choose one of: {available}.",
+                    )
+                plan.deal_to_create["dealtype"] = matching_options[0].value
             plan.deal_stage_label = stage.label
         elif actions["deal"] == "reference":
             plan.deal = await self._resolve_deal(request, validated.deal_name or "")
@@ -420,18 +547,25 @@ class CRMOperations:
             amount = plan.deal_to_create.get("amount")
             details = " — ".join(
                 part
-                for part in (format_amount(amount) if amount else None, plan.deal_stage_label)
+                for part in (
+                    format_amount(amount) if amount else None,
+                    plan.deal_stage_label,
+                    plan.deal_to_create.get("closedate", "")[:10] or None,
+                )
                 if part
             )
             line = f"✅ Deal created: {name}" + (f" — {details}" if details else "")
-            if plan.deal_name_derived:
-                line += " (named automatically; no deal name was given)"
             plan.lines.append(line)
             deal_detail = " · ".join(
                 part
                 for part in (
                     f"Amount {format_amount(amount)}" if amount else None,
                     plan.deal_stage_label,
+                    (
+                        f"Close date {plan.deal_to_create['closedate'][:10]}"
+                        if plan.deal_to_create.get("closedate")
+                        else None
+                    ),
                 )
                 if part
             )
@@ -578,11 +712,16 @@ class CRMOperations:
             raise OperationError(
                 "missing_fields", "Which deal should I update? Please include the deal's name."
             )
-        if not (validated.deal_amount or validated.deal_stage or validated.deal_pipeline):
+        if not (
+            validated.deal_amount
+            or validated.deal_stage
+            or validated.deal_pipeline
+            or validated.deal_close_date
+        ):
             raise OperationError(
                 "missing_fields",
                 f"What should I change on {validated.deal_name}? "
-                "I can update a deal's amount, stage or pipeline.",
+                "I can update a deal's amount, stage, pipeline or close date.",
             )
         try:
             deal = await self._resolve_deal(request, validated.deal_name)
@@ -591,6 +730,9 @@ class CRMOperations:
             if validated.deal_amount is not None:
                 changes["amount"] = validated.deal_amount
                 described.append(f"amount → {format_amount(validated.deal_amount)}")
+            if validated.deal_close_date is not None:
+                changes["closedate"] = validated.deal_close_date
+                described.append(f"close date → {validated.deal_close_date[:10]}")
             if validated.deal_stage or validated.deal_pipeline:
                 pipelines = await self._tools.deal_pipelines(request.tenant_id)
                 pipeline, stage = resolve_pipeline_stage(
@@ -1515,7 +1657,7 @@ def _check_plan_inputs(
         )
     if actions["deal"] == "reference" and not validated.deal_name:
         raise OperationError("missing_fields", "Which deal? Please include the deal's name.")
-    if actions["deal"] == "create" and not validated.deal_name and not validated.company_name:
+    if actions["deal"] == "create" and not validated.deal_name:
         raise OperationError("missing_fields", "What should the new deal be called?")
     for link in links:
         _, from_entity, _, to_entity = _LINKS[link]
@@ -1531,12 +1673,15 @@ def _check_plan_inputs(
             "update as its own request.",
         )
     if actions["deal"] == "reference" and (
-        validated.deal_amount or validated.deal_stage or validated.deal_pipeline
+        validated.deal_amount
+        or validated.deal_stage
+        or validated.deal_pipeline
+        or validated.deal_close_date
     ):
         raise OperationError(
             "needs_clarification",
-            "Changing a deal's amount or stage needs your confirmation, so please send that "
-            "update as its own request.",
+            "Changing a deal needs your confirmation, so please send that update as its own "
+            "request.",
         )
 
 

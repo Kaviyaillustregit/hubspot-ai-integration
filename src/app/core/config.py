@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     hubspot_oauth_scopes: str = (
         "crm.objects.contacts.read crm.objects.contacts.write "
         "crm.objects.companies.read crm.objects.companies.write "
-        "crm.objects.deals.read crm.objects.deals.write"
+        "crm.objects.deals.read crm.objects.deals.write "
+        "crm.schemas.deals.read"
     )
     hubspot_token_encryption_key: str | None = None
     hubspot_webhook_secret: str | None = None

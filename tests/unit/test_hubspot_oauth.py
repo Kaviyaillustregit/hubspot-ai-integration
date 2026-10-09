@@ -30,6 +30,7 @@ def test_default_oauth_scopes_match_app_and_omit_implicit_oauth_scope():
         "crm.objects.companies.write",
         "crm.objects.deals.read",
         "crm.objects.deals.write",
+        
     ]
     assert "oauth" not in settings.hubspot_oauth_scopes.split()
 

@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 
 from app.agent.extraction import (
@@ -165,6 +167,57 @@ def test_crm_prompt_maps_deal_query_synonyms_and_account_to_company():
     assert "closed_lost_deals" in prompt
     assert "best_chance_deals" in prompt
     assert "Account means HubSpot company" in prompt
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("2026-10-10", "2026-10-10T00:00:00Z"),
+        ("Oct 10", "2026-10-10T00:00:00Z"),
+        ("October 10th", "2026-10-10T00:00:00Z"),
+        ("10 October 2026", "2026-10-10T00:00:00Z"),
+        ("December 10,2026", "2026-12-10T00:00:00Z"),
+        ("tomorrow", "2026-10-10T00:00:00Z"),
+        ("next Friday", "2026-10-16T00:00:00Z"),
+    ],
+)
+def test_deal_close_dates_are_normalized_from_grounded_phrases(phrase, expected):
+    message = f"Create a deal called Renewal with close date {phrase}"
+    validated = validate_extraction(
+        message,
+        extraction(
+            intent="create_deal",
+            deal_name="Renewal",
+            deal_close_date=phrase,
+        ),
+        today=date(2026, 10, 9),
+    )
+
+    assert validated.deal_close_date == expected
+
+
+@pytest.mark.parametrize(
+    ("phrase", "reason"),
+    [
+        ("2026-02-30", "invalid_format"),
+        ("next month", "ambiguous"),
+        ("Oct 8", "ambiguous"),
+    ],
+)
+def test_ambiguous_or_invalid_deal_close_dates_are_rejected(phrase, reason):
+    with pytest.raises(ExtractionValidationError) as raised:
+        validate_extraction(
+            f"Create a deal called Renewal closing {phrase}",
+            extraction(
+                intent="create_deal",
+                deal_name="Renewal",
+                deal_close_date=phrase,
+            ),
+            today=date(2026, 10, 9),
+        )
+
+    assert raised.value.field == "deal_close_date"
+    assert raised.value.reason == reason
 
 
 def test_unknown_prompt_is_an_integration_error():

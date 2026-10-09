@@ -96,3 +96,18 @@ class HubSpotPipeline(BaseModel):
     label: str
     display_order: int = Field(default=0, validation_alias="displayOrder")
     stages: list[HubSpotPipelineStage] = Field(default_factory=list)
+
+
+class HubSpotPropertyOption(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    label: str
+    value: str
+    hidden: bool = False
+
+
+class HubSpotProperty(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    options: list[HubSpotPropertyOption] = Field(default_factory=list)

@@ -32,7 +32,11 @@ Intents (wording, word order and obvious typos of intent words such as "creat",
 - update_company: change fields (domain, website, phone, city) of an existing company.
 - delete_company: archive an existing company, identifying it by name when possible.
 - create_deal: create a new deal (optionally for a company and/or contact).
-- update_deal: change an existing deal's amount, stage or pipeline ("move X to ...").
+- update_deal: change an existing deal's amount, stage, pipeline or close date
+  ("move X to ...").
+- A deal record needs an explicitly supplied deal name. Do not use the company name,
+  deal type, amount or date as the deal name.
+- "Create a deal type" without a deal name is ambiguous; do not invent a deal name or type.
 - associate_records: link records that already exist ("add Victor Hall to ABC",
   "associate the X deal with Y").
 - multi_step: several of the above in one message.
@@ -92,6 +96,11 @@ Extraction rules:
 - deal_amount: the amount exactly as written, including currency symbols or
   separators ("$50,000", "75000", "50k").
 - deal_stage / deal_pipeline: the stage or pipeline name exactly as written.
+- deal_close_date: the exact date phrase as written (for example "Oct 10",
+  "2026-10-10", "tomorrow" or "next Friday"); do not add or infer a year.
+- deal_type: an explicitly stated deal type only; never treat "deal type" as the deal name.
+- deal_owner: an explicitly stated owner phrase only; do not invent HubSpot owner IDs.
+- deal_currency: an explicitly stated currency code only.
 - contact_id: only an explicit HubSpot contact ID written in the message.
 - For update intents, the field values are the new values to set.
 - question: for crm_question, a short restatement of what is being asked; otherwise null.
@@ -127,5 +136,16 @@ def build_prompt(
 
 def strip_json_fences(text: str) -> str:
     """Models sometimes wrap JSON in a Markdown code fence despite instructions."""
-    matched = _JSON_FENCE.match(text)
-    return matched.group(1) if matched else text
+    value = text.lstrip("\ufeff").strip()
+    if value.startswith("```"):
+        opening_line, separator, body = value.partition("\n")
+        language = opening_line[3:].strip().casefold()
+        if (
+            separator
+            and language in ("", "json")
+            and body.rstrip().endswith("```")
+        ):
+            return body.rstrip()[:-3].strip()
+
+    matched = _JSON_FENCE.match(value)
+    return matched.group(1) if matched else value

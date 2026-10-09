@@ -1,8 +1,15 @@
 from collections.abc import Sequence
 from typing import Protocol
 
+from app.integrations.errors import IntegrationError
 from app.integrations.hubspot.context import TenantContext
-from app.integrations.hubspot.models import HubSpotDeal, HubSpotDealsPage, HubSpotPipeline
+from app.integrations.hubspot.models import (
+    HubSpotDeal,
+    HubSpotDealsPage,
+    HubSpotPipeline,
+    HubSpotProperty,
+    HubSpotPropertyOption,
+)
 from app.services.hubspot_contacts import AccessTokenProvider
 from app.services.hubspot_scopes import require_scope
 
@@ -54,6 +61,10 @@ class DealsClient(Protocol):
     async def list_pipelines(
         self, context: TenantContext, access_token: str
     ) -> list[HubSpotPipeline]: ...
+
+    async def get_deal_type_property(
+        self, context: TenantContext, access_token: str
+    ) -> HubSpotProperty: ...
 
 
 class HubSpotDealsService:
@@ -128,6 +139,15 @@ class HubSpotDealsService:
     async def list_pipelines(self, context: TenantContext) -> list[HubSpotPipeline]:
         access_token, resolved = await self._authorized(context, "crm.objects.deals.read")
         return await self._client.list_pipelines(resolved, access_token)
+
+    async def get_deal_type_options(
+        self, context: TenantContext
+    ) -> list[HubSpotPropertyOption]:
+        access_token, resolved = await self._authorized(context, "crm.schemas.deals.read")
+        prop = await self._client.get_deal_type_property(resolved, access_token)
+        if prop.name != "dealtype":
+            raise IntegrationError("HubSpot returned metadata for an unexpected deal property")
+        return prop.options
 
     async def _authorized(
         self, context: TenantContext, scope: str

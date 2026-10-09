@@ -14,6 +14,7 @@ from app.integrations.hubspot.models import (
     HubSpotContactCompanyAssociations,
     HubSpotDeal,
     HubSpotPipeline,
+    HubSpotPropertyOption,
     HubSpotRecord,
 )
 from app.services.hubspot_associations import HubSpotAssociationsService
@@ -574,6 +575,9 @@ class HubSpotToolRegistry:
 
     async def deal_pipelines(self, tenant_id: str) -> list[HubSpotPipeline]:
         return await self._deals.list_pipelines(self._context(tenant_id))
+
+    async def deal_type_options(self, tenant_id: str) -> list[HubSpotPropertyOption]:
+        return await self._deals.get_deal_type_options(self._context(tenant_id))
 
     async def associate(
         self,

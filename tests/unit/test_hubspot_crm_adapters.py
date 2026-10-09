@@ -15,6 +15,7 @@ from app.integrations.hubspot.companies import HubSpotCompaniesClient
 from app.integrations.hubspot.contacts import HubSpotContactsClient
 from app.integrations.hubspot.context import TenantContext
 from app.integrations.hubspot.deals import HubSpotDealsClient
+from app.integrations.hubspot.models import HubSpotProperty
 from app.integrations.hubspot.oauth import StoredOAuthToken
 from app.services.hubspot_associations import HubSpotAssociationsService
 from app.services.hubspot_deals import HubSpotDealsService
@@ -168,6 +169,30 @@ async def test_deal_create_search_update_and_pipelines():
     assert pipelines.calls[0][:2] == ("GET", "https://api.hubapi.com/crm/v3/pipelines/deals")
     assert result[0].stages[0].label == "Closed Won"
     assert result[0].stages[0].metadata == {"isClosed": "true", "probability": "1.0"}
+
+
+async def test_deal_type_property_options_are_read_from_hubspot():
+    recorder = Recorder(
+        200,
+        {
+            "name": "dealtype",
+            "options": [
+                {"label": "New Business", "value": "newbusiness", "displayOrder": 0},
+                {"label": "Existing Business", "value": "existingbusiness", "displayOrder": 1},
+            ],
+        },
+    )
+
+    prop = await call(HubSpotDealsClient, recorder, "get_deal_type_property")
+
+    assert recorder.calls[0][:2] == (
+        "GET",
+        "https://api.hubapi.com/crm/v3/properties/deals/dealtype",
+    )
+    assert [(option.label, option.value) for option in prop.options] == [
+        ("New Business", "newbusiness"),
+        ("Existing Business", "existingbusiness"),
+    ]
 
 
 async def test_deal_listing_preserves_pagination_cursor_and_pipeline_metadata():
@@ -331,6 +356,46 @@ async def test_missing_deal_scope_fails_before_calling_hubspot():
         )
 
     assert raised.value.scope == "crm.objects.deals.write"
+
+
+async def test_deal_type_property_requires_existing_schema_read_scope():
+    service = HubSpotDealsService(
+        ForbiddenClient(),  # type: ignore[arg-type]
+        Provider(["crm.objects.deals.read", "crm.objects.deals.write"]),
+    )
+
+    with pytest.raises(IntegrationPermissionError) as raised:
+        await service.get_deal_type_options(
+            TenantContext("tenant-a", "", "hubspot-oauth-token")
+        )
+
+    assert raised.value.scope == "crm.schemas.deals.read"
+
+
+async def test_deal_type_property_uses_an_already_granted_schema_scope():
+    class PropertyClient:
+        async def get_deal_type_property(self, context, access_token):
+            assert context.hubspot_account_id == "42"
+            assert access_token == "access-token"
+            return HubSpotProperty(
+                name="dealtype",
+                options=[
+                    {"label": "Existing Business", "value": "existingbusiness"},
+                ],
+            )
+
+    service = HubSpotDealsService(
+        PropertyClient(),  # type: ignore[arg-type]
+        Provider(["crm.schemas.deals.read"]),
+    )
+
+    options = await service.get_deal_type_options(
+        TenantContext("tenant-a", "", "hubspot-oauth-token")
+    )
+
+    assert [(option.label, option.value) for option in options] == [
+        ("Existing Business", "existingbusiness")
+    ]
 
 
 async def test_association_reads_require_both_object_read_scopes():
