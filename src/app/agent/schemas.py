@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,6 +53,8 @@ CRMQueryName = Literal[
     "contact_list",
     "contact_search",
     "contact_deals",
+    "deal_analysis",
+    "deal_follow_up",
 ]
 
 
@@ -120,6 +122,27 @@ class GroundedSummary(BaseModel):
 
     crm_facts: list[str] = Field(default_factory=list)
     observations: list[str] = Field(default_factory=list)
+
+
+class DealAnalysis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    identified_issues: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(min_length=2, max_length=3)
+    follow_up_email_draft: str | None = None
+
+
+class DealFollowUpAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(max_length=400)
+    reason: str = Field(max_length=400)
+    recommendations: list[Annotated[str, Field(max_length=280)]] = Field(
+        min_length=2,
+        max_length=3,
+    )
+    follow_up_email_draft: str = Field(max_length=1200)
 
 
 class AgentResponse(BaseModel):

@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://app:app@postgres:5432/hubspot_ai"
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = 15.0
     max_retries: int = 3
     ai_provider: str = "anthropic"
+    deal_follow_up_batch_size: int = Field(default=10, ge=1, le=25)
 
     openrouter_api_key: str | None = None
     openrouter_model: str = "openrouter/free"

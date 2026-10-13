@@ -171,6 +171,34 @@ async def test_deal_create_search_update_and_pipelines():
     assert result[0].stages[0].metadata == {"isClosed": "true", "probability": "1.0"}
 
 
+async def test_get_deal_requests_and_preserves_last_activity_date():
+    last_activity = "2026-10-13T07:14:19.059Z"
+    recorder = Recorder(
+        200,
+        {
+            "id": "353881528026",
+            "properties": {
+                "dealname": "Deal From John Cena 2",
+                "notes_last_updated": last_activity,
+            },
+        },
+    )
+
+    deal = await call(
+        HubSpotDealsClient,
+        recorder,
+        "get_deal",
+        deal_id="353881528026",
+        properties=("dealname", "notes_last_updated"),
+    )
+
+    assert recorder.calls[0][1].endswith(
+        "/crm/v3/objects/deals/353881528026"
+        "?properties=dealname%2Cnotes_last_updated"
+    )
+    assert deal.properties["notes_last_updated"] == last_activity
+
+
 async def test_deal_type_property_options_are_read_from_hubspot():
     recorder = Recorder(
         200,

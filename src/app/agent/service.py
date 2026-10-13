@@ -1,7 +1,10 @@
 import hashlib
 import logging
 import re
+from asyncio import gather
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from typing import Literal
 
 from app.agent.extraction import (
     ExtractionValidationError,
@@ -16,12 +19,19 @@ from app.agent.schemas import (
     ContactDeleteIntent,
     ContactUpdateIntent,
     CRMIntentExtraction,
+    CRMQueryName,
+    DealAnalysis,
+    DealFollowUpAssessment,
     GroundedSummary,
 )
-from app.agent.tools import HubSpotToolRegistry
+from app.agent.tools import (
+    DEAL_ANALYSIS_PROPERTIES,
+    DEAL_FOLLOW_UP_PROPERTIES,
+    HubSpotToolRegistry,
+)
 from app.ai.service import AIService
 from app.integrations.errors import IntegrationError
-from app.integrations.hubspot.models import HubSpotCompany
+from app.integrations.hubspot.models import HubSpotCompany, HubSpotDeal
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
 
@@ -42,6 +52,25 @@ _CAPABILITIES_TEXT = (
 class _ContactDraft:
     properties: dict[str, str]
     company_name: str | None
+
+
+@dataclass(frozen=True)
+class _DealFollowUpCandidate:
+    deal: HubSpotDeal
+    pipeline: str
+    stage: str
+    activity_date: date
+    inactive_days: int
+    priority: str
+
+
+@dataclass(frozen=True)
+class _DealFollowUpResult:
+    candidate: _DealFollowUpCandidate
+    facts: dict[str, object]
+    hubspot_url: str
+    assessment: DealFollowUpAssessment | None
+
 
 _ACCOUNT_PATTERN = re.compile(
     r"(?:about|for)\s+(.+?)[?.!]*$",
@@ -136,6 +165,18 @@ _REVENUE_QUESTION_PATTERN = re.compile(
     r"|\b(?:what|which)\b.{0,100}\b(?:value|amount)\b.{0,100}\b(?:won|closed)\b",
     re.IGNORECASE,
 )
+_EMAIL_DRAFT_REQUEST_PATTERN = re.compile(
+    r"\b(?:draft|write|compose|prepare|generate|include|create)\b"
+    r".{0,60}\b(?:follow[- ]?up\s+)?email\b|\bfollow[- ]?up\s+email\s+draft\b",
+    re.IGNORECASE,
+)
+_DEAL_FOLLOW_UP_REQUEST_PATTERN = re.compile(
+    r"\b(?:find|show|list|identify|review|analy[sz]e)\b"
+    r".{0,100}\bdeals\b.{0,120}\b"
+    r"(?:follow[- ]?up|next[- ]best\s+actions?|need(?:ing)?\s+follow[- ]?up)\b",
+    re.IGNORECASE,
+)
+_SLACK_MESSAGE_MAX_LENGTH = 39_000
 
 
 class AccountIntelligenceAgent:
@@ -144,11 +185,14 @@ class AccountIntelligenceAgent:
         tools: HubSpotToolRegistry,
         ai_service: AIService,
         action_safety: ActionSafetyService,
+        *,
+        deal_follow_up_batch_size: int = 10,
     ) -> None:
         self._tools = tools
         self._ai_service = ai_service
         self._action_safety = action_safety
         self._operations = CRMOperations(tools, action_safety)
+        self._deal_follow_up_batch_size = deal_follow_up_batch_size
 
     async def respond(self, request: AgentRequest) -> AgentResponse:
         confirmation_action_id = self._confirmation_action_id(request.message)
@@ -392,18 +436,24 @@ class AccountIntelligenceAgent:
                 request,
             )
 
+        if _DEAL_FOLLOW_UP_REQUEST_PATTERN.search(request.message):
+            return await self._review_deals_for_follow_up(request)
+
         extraction = await self._extract_intent(request)
 
         if extraction is None:
             explicit_create = self._explicit_create_extraction(request.message)
             if explicit_create is not None:
                 return await self._respond_to_extraction(request, explicit_create)
+            query: CRMQueryName
             if _ALL_CONTACTS_LIST_PATTERN.search(request.message):
                 query = "contact_list"
             elif _ALL_COMPANIES_LIST_PATTERN.search(request.message):
                 query = "company_list"
             elif _ALL_OPEN_DEALS_LIST_PATTERN.search(request.message):
                 query = "open_deals"
+            elif _DEAL_FOLLOW_UP_REQUEST_PATTERN.search(request.message):
+                query = "deal_follow_up"
             elif _ALL_DEALS_LIST_PATTERN.search(request.message):
                 query = "all_deals"
             else:
@@ -502,6 +552,11 @@ class AccountIntelligenceAgent:
         except ExtractionValidationError as exc:
             return self._safe("invalid_request", exc.user_message, request)
 
+        if extraction.intent == "crm_question" and extraction.query == "deal_analysis":
+            return await self._analyze_deal(request, validated.deal_name)
+        if extraction.intent == "crm_question" and extraction.query == "deal_follow_up":
+            return await self._review_deals_for_follow_up(request)
+
         # Companies, deals and links between records; contact-only requests continue below.
         if CRMOperations.handles(extraction, validated):
             return await self._operations.respond(
@@ -563,6 +618,396 @@ class AccountIntelligenceAgent:
             request,
             validated.company_name or self._company_name(request.message),
             extraction.question,
+        )
+
+    async def _analyze_deal(self, request: AgentRequest, deal_name: str | None) -> AgentResponse:
+        if not deal_name:
+            return self._safe(
+                "missing_fields",
+                "Which deal should I analyze? Please include its name.",
+                request,
+            )
+
+        try:
+            resolution = await self._tools.resolve_deal(request.tenant_id, deal_name)
+            if resolution.status == "ambiguous":
+                return self._safe(
+                    "ambiguous",
+                    f"I found multiple deals matching {deal_name}. Please be more specific.",
+                    request,
+                    ["resolve_deal"],
+                )
+            if resolution.deal is None:
+                return self._safe(
+                    "not_found",
+                    f"I couldn't find a deal named {deal_name} in HubSpot.",
+                    request,
+                    ["resolve_deal"],
+                )
+
+            deal = await self._tools.get_deal(
+                request.tenant_id,
+                resolution.deal.id,
+                properties=DEAL_ANALYSIS_PROPERTIES,
+            )
+            properties = deal.properties
+            pipelines = await self._tools.deal_pipelines(request.tenant_id)
+            pipeline = next(
+                (item for item in pipelines if item.id == properties.get("pipeline")),
+                None,
+            )
+            stage = next(
+                (
+                    item
+                    for item in pipeline.stages
+                    if item.id == properties.get("dealstage")
+                ),
+                None,
+            ) if pipeline is not None else None
+            if pipeline is None or stage is None:
+                return self._safe(
+                    "stage_unknown",
+                    "I couldn't verify that this deal is open from its HubSpot pipeline "
+                    "stage, so I won't generate closing recommendations.",
+                    request,
+                    ["resolve_deal", "get_deal", "deal_pipelines"],
+                )
+            is_closed = stage.metadata.get("isClosed", "").casefold()
+            if is_closed == "true":
+                return self._safe(
+                    "closed_deal",
+                    "This deal is already closed, so I won't generate closing recommendations.",
+                    request,
+                    ["resolve_deal", "get_deal", "deal_pipelines"],
+                )
+            if is_closed != "false":
+                return self._safe(
+                    "stage_unknown",
+                    "I couldn't verify that this deal is open from its HubSpot pipeline "
+                    "stage, so I won't generate closing recommendations.",
+                    request,
+                    ["resolve_deal", "get_deal", "deal_pipelines"],
+                )
+
+            today = datetime.now(UTC).date()
+            activity_date = _hubspot_date(properties.get("notes_last_updated"))
+            close_date = _hubspot_date(properties.get("closedate"))
+            inactivity_days = (
+                max((today - activity_date).days, 0) if activity_date is not None else None
+            )
+            close_date_overdue = close_date < today if close_date is not None else None
+            missing_fields = [
+                label
+                for property_name, label in (
+                    ("amount", "amount"),
+                    ("hubspot_owner_id", "owner"),
+                    ("closedate", "close date"),
+                )
+                if not properties.get(property_name)
+            ]
+            if activity_date is None:
+                missing_fields.append("last activity date")
+            if close_date is None and properties.get("closedate"):
+                missing_fields.append("valid close date")
+
+            facts: dict[str, object] = {
+                "deal_name": properties.get("dealname") or deal_name,
+                "amount": properties.get("amount"),
+                "stage": stage.label,
+                "pipeline": pipeline.label,
+                "owner_id": properties.get("hubspot_owner_id"),
+                "close_date": close_date.isoformat() if close_date else None,
+                "last_activity_date": activity_date.isoformat() if activity_date else None,
+                "inactivity_days": inactivity_days,
+                "close_date_overdue": close_date_overdue,
+                "days_past_close_date": (
+                    (today - close_date).days
+                    if close_date is not None and close_date_overdue
+                    else 0 if close_date is not None else None
+                ),
+                "missing_fields": missing_fields,
+                "stage_is_closed": False,
+            }
+            request_email_draft = bool(_EMAIL_DRAFT_REQUEST_PATTERN.search(request.message))
+            analysis = await self._ai_service.generate(
+                prompt_name="deal-analysis/v1",
+                variables={
+                    "crm_facts": facts,
+                    "requested_email_draft": request_email_draft,
+                },
+                output_schema=DealAnalysis,
+            )
+            hubspot_url = (
+                await self._tools.hubspot_record_urls(
+                    request.tenant_id, [("deals", deal.id)]
+                )
+            )[0]
+            return AgentResponse(
+                status="ok",
+                text=_format_deal_analysis(
+                    analysis,
+                    facts,
+                    hubspot_url,
+                    include_email_draft=request_email_draft,
+                ),
+                request_id=request.request_id,
+                tools_used=[
+                    "resolve_deal",
+                    "get_deal",
+                    "deal_pipelines",
+                    "deal_analysis",
+                    "hubspot_record_urls",
+                ],
+                result={
+                    "kind": "deal_analysis",
+                    "deal": facts,
+                    "hubspot_url": hubspot_url,
+                    "summary": analysis.summary,
+                    "identified_issues": analysis.identified_issues,
+                    "recommendations": analysis.recommendations,
+                    "follow_up_email_draft": (
+                        analysis.follow_up_email_draft if request_email_draft else None
+                    ),
+                },
+            )
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+            )
+        except IntegrationError:
+            logger.exception(
+                "Deal analysis integration failed",
+                extra={"tenant_id": request.tenant_id},
+            )
+            return self._safe(
+                "unavailable",
+                "I couldn't analyze the HubSpot deal right now.",
+                request,
+            )
+
+    async def _review_deals_for_follow_up(self, request: AgentRequest) -> AgentResponse:
+        try:
+            all_deals, pipelines = await gather(
+                self._tools.list_all_deals(
+                    request.tenant_id,
+                    properties=DEAL_FOLLOW_UP_PROPERTIES,
+                ),
+                self._tools.deal_pipelines(request.tenant_id),
+            )
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+            )
+        except IntegrationError:
+            logger.exception(
+                "Deal follow-up data retrieval failed",
+                extra={"tenant_id": request.tenant_id},
+            )
+            return self._safe(
+                "unavailable",
+                "I couldn't retrieve HubSpot deals and pipeline stages right now.",
+                request,
+                ["list_all_deals", "deal_pipelines"],
+            )
+
+        pipeline_stages = {
+            (pipeline.id, stage.id): (pipeline, stage)
+            for pipeline in pipelines
+            for stage in pipeline.stages
+        }
+        today = datetime.now(UTC).date()
+        open_deals: list[_DealFollowUpCandidate] = []
+        open_deal_count = 0
+        unknown_stage_count = 0
+        unknown_activity: list[HubSpotDeal] = []
+        recently_active = 0
+
+        for deal in all_deals:
+            properties = deal.properties
+            pipeline_stage = pipeline_stages.get(
+                (properties.get("pipeline") or "", properties.get("dealstage") or "")
+            )
+            if pipeline_stage is None:
+                unknown_stage_count += 1
+                continue
+            pipeline, stage = pipeline_stage
+            is_closed = stage.metadata.get("isClosed", "").casefold()
+            if is_closed == "true":
+                continue
+            if is_closed != "false":
+                unknown_stage_count += 1
+                continue
+
+            open_deal_count += 1
+            activity_date = _hubspot_date(properties.get("notes_last_updated"))
+            if activity_date is None:
+                unknown_activity.append(deal)
+                continue
+
+            inactive_days = max((today - activity_date).days, 0)
+            if inactive_days <= 2:
+                recently_active += 1
+                continue
+            if inactive_days >= 14:
+                priority = "High"
+            elif inactive_days >= 7:
+                priority = "Medium"
+            else:
+                priority = "Low"
+            open_deals.append(
+                _DealFollowUpCandidate(
+                    deal=deal,
+                    pipeline=pipeline.label,
+                    stage=stage.label,
+                    activity_date=activity_date,
+                    inactive_days=inactive_days,
+                    priority=priority,
+                )
+            )
+
+        priority_order = {"High": 0, "Medium": 1, "Low": 2}
+        open_deals.sort(
+            key=lambda item: (priority_order[item.priority], -item.inactive_days, item.deal.id)
+        )
+        follow_up_count = len(open_deals)
+        selected = open_deals[: self._deal_follow_up_batch_size]
+        unknown_to_show = unknown_activity[: min(self._deal_follow_up_batch_size, 5)]
+        url_records: list[tuple[Literal["deals"], str]] = [
+            ("deals", candidate.deal.id) for candidate in selected
+        ] + [("deals", deal.id) for deal in unknown_to_show]
+
+        try:
+            record_urls = (
+                await self._tools.hubspot_record_urls(request.tenant_id, url_records)
+                if url_records
+                else []
+            )
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+            )
+        except IntegrationError:
+            logger.exception(
+                "HubSpot deal URL generation failed",
+                extra={"tenant_id": request.tenant_id},
+            )
+            return self._safe(
+                "unavailable",
+                "I couldn't generate HubSpot links for the follow-up report.",
+                request,
+                ["hubspot_record_urls"],
+            )
+
+        selected_urls = record_urls[: len(selected)]
+        unknown_urls = record_urls[len(selected):]
+        analysis_results: list[_DealFollowUpResult] = []
+        ai_failures = 0
+        for candidate, hubspot_url in zip(selected, selected_urls, strict=True):
+            properties = candidate.deal.properties
+            close_date = _hubspot_date(properties.get("closedate"))
+            missing_fields = [
+                label
+                for key, label in (
+                    ("amount", "amount"),
+                    ("hubspot_owner_id", "owner"),
+                )
+                if not properties.get(key)
+            ]
+            if close_date is None:
+                missing_fields.append("valid close date")
+            facts: dict[str, object] = {
+                "deal_name": properties.get("dealname") or candidate.deal.id,
+                "amount": properties.get("amount"),
+                "pipeline": candidate.pipeline,
+                "stage": candidate.stage,
+                "owner_id": properties.get("hubspot_owner_id"),
+                "close_date": close_date.isoformat() if close_date else None,
+                "close_date_overdue": close_date < today if close_date else None,
+                "last_activity_date": candidate.activity_date.isoformat(),
+                "inactivity_days": candidate.inactive_days,
+                "priority": candidate.priority,
+                "follow_up_task_status": "Not verified",
+                "missing_fields": missing_fields,
+            }
+            try:
+                assessment = await self._ai_service.generate(
+                    prompt_name="deal-follow-up/v1",
+                    variables={"crm_facts": facts},
+                    output_schema=DealFollowUpAssessment,
+                )
+            except IntegrationError:
+                ai_failures += 1
+                logger.exception(
+                    "AI deal follow-up assessment failed",
+                    extra={
+                        "tenant_id": request.tenant_id,
+                        "deal_id": candidate.deal.id,
+                    },
+                )
+                assessment = None
+
+            analysis_results.append(
+                _DealFollowUpResult(candidate, facts, hubspot_url, assessment)
+            )
+
+        report_text = _format_deal_follow_up_report(
+            open_deal_count=open_deal_count,
+            follow_up_count=follow_up_count,
+            analyzed=analysis_results,
+            unknown_activity=[
+                (deal, url) for deal, url in zip(unknown_to_show, unknown_urls, strict=True)
+            ],
+            unknown_activity_count=len(unknown_activity),
+            recently_active_count=recently_active,
+            unknown_stage_count=unknown_stage_count,
+            batch_size=self._deal_follow_up_batch_size,
+        )
+        return AgentResponse(
+            status="partial" if ai_failures else "ok",
+            text=report_text,
+            request_id=request.request_id,
+            tools_used=[
+                "list_all_deals",
+                "deal_pipelines",
+                "deal_follow_up",
+                *(["deal_follow_up_ai"] if analysis_results else []),
+                *(["hubspot_record_urls"] if url_records else []),
+            ],
+            result={
+                "kind": "deal_follow_up",
+                "open_deals_reviewed": open_deal_count,
+                "deals_needing_follow_up": follow_up_count,
+                "deals_ai_analyzed": len(analysis_results) - ai_failures,
+                "deals_not_ai_analyzed_due_to_limit": max(
+                    0, follow_up_count - len(selected)
+                ),
+                "unknown_activity_count": len(unknown_activity),
+                "recently_active_count": recently_active,
+                "unknown_stage_count": unknown_stage_count,
+                "deals": [
+                    {
+                        **item.facts,
+                        "deal_id": item.candidate.deal.id,
+                        "hubspot_url": item.hubspot_url,
+                        "task_status": "Not verified",
+                        "summary": item.assessment.summary if item.assessment else None,
+                        "reason": item.assessment.reason if item.assessment else None,
+                        "recommendations": (
+                            item.assessment.recommendations if item.assessment else []
+                        ),
+                        "follow_up_email_draft": (
+                            item.assessment.follow_up_email_draft if item.assessment else None
+                        ),
+                    }
+                    for item in analysis_results
+                ],
+            },
         )
 
     async def _resolve_contact_id(
@@ -1195,3 +1640,191 @@ class AccountIntelligenceAgent:
             request_id=request.request_id,
             tools_used=tools or [],
         )
+
+
+def _hubspot_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        if value.isdigit():
+            return datetime.fromtimestamp(int(value) / 1000, UTC).date()
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _format_deal_analysis(
+    analysis: DealAnalysis,
+    facts: dict[str, object],
+    hubspot_url: str,
+    *,
+    include_email_draft: bool,
+) -> str:
+    inactivity_days = facts["inactivity_days"]
+    close_date_overdue = facts["close_date_overdue"]
+    if isinstance(inactivity_days, int):
+        activity_days = str(inactivity_days)
+        activity_status = (
+            "Active today" if inactivity_days == 0 else f"Inactive for {inactivity_days} days"
+        )
+    else:
+        activity_days = "Unknown"
+        activity_status = "Unknown (no activity date in HubSpot)"
+    if close_date_overdue is True:
+        close_status = f"Overdue by {facts['days_past_close_date']} days"
+    elif close_date_overdue is False:
+        close_status = "Not overdue"
+    else:
+        close_status = "Unknown (no valid close date in HubSpot)"
+
+    lines = [
+        f"*Deal closing analysis: {facts['deal_name']}*",
+        f"• Amount: {facts['amount'] or 'Not provided'}",
+        f"• Pipeline / stage: {facts['pipeline']} / {facts['stage']}",
+        f"• Owner ID: {facts['owner_id'] or 'Not assigned'}",
+        f"• Close date: {facts['close_date'] or 'Not provided'} ({close_status})",
+        f"• Last activity date: {facts['last_activity_date'] or 'Unknown'}",
+        f"• Inactive days: {activity_days}",
+        f"• Activity status: {activity_status}",
+        f"• HubSpot: {hubspot_url}",
+        "",
+        f"*Summary*\n{analysis.summary}",
+        "",
+        "*Identified issues*",
+    ]
+    if analysis.identified_issues:
+        lines.extend(f"• {issue}" for issue in analysis.identified_issues)
+    else:
+        lines.append("• No additional issues identified.")
+    lines.extend(["", "*Next best actions*"])
+    lines.extend(
+        f"{index}. {recommendation}"
+        for index, recommendation in enumerate(analysis.recommendations, start=1)
+    )
+    if include_email_draft and analysis.follow_up_email_draft:
+        lines.extend(["", "*Follow-up email draft*"])
+        lines.append(analysis.follow_up_email_draft)
+    return "\n".join(lines)
+
+
+def _format_deal_follow_up_report(
+    *,
+    open_deal_count: int,
+    follow_up_count: int,
+    analyzed: list[_DealFollowUpResult],
+    unknown_activity: list[tuple[HubSpotDeal, str]],
+    unknown_activity_count: int,
+    recently_active_count: int,
+    unknown_stage_count: int,
+    batch_size: int,
+) -> str:
+    ai_successes = sum(item.assessment is not None for item in analyzed)
+    lines = [
+        "*AI-powered deal follow-up*",
+        f"• Open deals reviewed: {open_deal_count}",
+        f"• Deals needing follow-up: {follow_up_count}",
+        f"• AI assessments generated: {ai_successes}/{len(analyzed)}",
+        f"• AI analysis batch limit: {batch_size}",
+        f"• Recently active (0–2 days): {recently_active_count}",
+        f"• Activity date unknown (not counted as inactive): {unknown_activity_count}",
+        f"• Deals excluded because stage was unverified: {unknown_stage_count}",
+        "• Existing follow-up tasks: Not verified (task retrieval is not available)",
+    ]
+    if follow_up_count == 0:
+        lines.extend(
+            ["", "No deals with a known activity date met the 3+ day follow-up threshold."]
+        )
+    elif len(analyzed) < follow_up_count:
+        lines.extend(
+            [
+                "",
+                f"{follow_up_count - len(analyzed)} additional deal(s) need follow-up "
+                "but were not AI-analyzed because of the batch limit.",
+            ]
+        )
+
+    entries: list[str] = []
+    for item in analyzed:
+        candidate = item.candidate
+        facts = item.facts
+        close_date = facts["close_date"]
+        close_status = (
+            "Overdue"
+            if facts["close_date_overdue"] is True
+            else "Not overdue"
+            if facts["close_date_overdue"] is False
+            else "Unknown"
+        )
+        deal_name = _slack_value(facts["deal_name"], 160)
+        deal_lines = [
+            f"*{deal_name}* — {candidate.priority} priority",
+            f"• Amount: {_slack_value(facts['amount'], 80)}",
+            f"• Pipeline / stage: {_slack_value(facts['pipeline'], 100)} / "
+            f"{_slack_value(facts['stage'], 100)}",
+            f"• Owner ID: {_slack_value(facts['owner_id'], 80)}",
+            f"• Expected close date: {_slack_value(close_date, 40)} ({close_status})",
+            f"• Last activity: {candidate.activity_date.isoformat()} "
+            f"({candidate.inactive_days} inactive days)",
+            f"• Missing CRM fields: {_slack_value(facts['missing_fields'], 240)}",
+            "• Upcoming follow-up task: Not verified",
+            f"• <{_slack_value(item.hubspot_url, 500)}|Open in HubSpot>",
+        ]
+        if item.assessment is None:
+            deal_lines.extend(["", "AI recommendations could not be generated for this deal."])
+        else:
+            deal_lines.extend(
+                [
+                    "",
+                    f"*Assessment*\n{item.assessment.summary}",
+                    f"*Why follow-up is recommended*\n{item.assessment.reason}",
+                    "*Prioritized next best actions*",
+                    *(
+                        f"{index}. {recommendation}"
+                        for index, recommendation in enumerate(
+                            item.assessment.recommendations,
+                            start=1,
+                        )
+                    ),
+                    "*Suggested email draft*",
+                    item.assessment.follow_up_email_draft,
+                ]
+            )
+        entries.append("\n".join(deal_lines))
+
+    if unknown_activity:
+        unknown_entries = [
+            f"*Activity unknown:* {_slack_value(deal.properties.get('dealname') or deal.id, 160)} "
+            f"• <{_slack_value(url, 500)}|Open in HubSpot>"
+            for deal, url in unknown_activity
+        ]
+        entries.append("\n".join(["*Deals with missing activity dates*", *unknown_entries]))
+        if unknown_activity_count > len(unknown_activity):
+            entries.append(
+                f"{unknown_activity_count - len(unknown_activity)} additional deal(s) "
+                "have no activity date."
+            )
+
+    message = "\n".join(lines)
+    omitted_entries = 0
+    for entry_text in entries:
+        separator = "\n\n"
+        omission_note = "\n\nAdditional deal details were omitted to fit Slack's message limit."
+        if len(message) + len(separator) + len(entry_text) + len(omission_note) > (
+            _SLACK_MESSAGE_MAX_LENGTH
+        ):
+            omitted_entries += 1
+            continue
+        message += separator + entry_text
+    if omitted_entries:
+        note = (
+            f"\n\n{omitted_entries} deal detail section(s) were omitted to fit "
+            "Slack's message limit."
+        )
+        message = message[: _SLACK_MESSAGE_MAX_LENGTH - len(note)] + note
+    return message
+
+
+def _slack_value(value: object, max_length: int) -> str:
+    if value is None or value == "":
+        return "Not provided"
+    return str(value).replace("\n", " ")[:max_length]

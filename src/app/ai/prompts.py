@@ -64,6 +64,10 @@ query (only for crm_question):
 - contact_company: which company a contact is associated with.
 - contact_deals: deals associated with a contact.
 - deal_details: information about a deal.
+- deal_analysis: analyze a named existing deal and suggest next-best actions to close it.
+  Extract the exact deal_name and treat it as a read-only request.
+- deal_follow_up: find open deals needing follow-up and prepare grounded recommended actions.
+  Treat it as a read-only request; no deal name is required.
 - open_deals: list all deals whose configured pipeline stage is open.
 - closed_deals: list all deals whose configured pipeline stage is closed.
 - closed_won_deals / closed_lost_deals: list only the matching configured closed stage.
@@ -111,6 +115,29 @@ Extraction rules:
 PROMPT_INSTRUCTIONS: dict[str, str] = {
     "account-intelligence/v1": _ACCOUNT_INTELLIGENCE_V1,
     "crm-intent/v2": _CRM_INTENT_V2,
+    "deal-analysis/v1": """\
+Analyze one existing HubSpot deal using only the supplied verified CRM facts and
+deterministic date calculations. Do not invent customer conversations, objections,
+stakeholders, commitments, or facts absent from the input. Treat missing data as
+unknown and mention consequential gaps in identified_issues. Provide a concise summary
+and two or three practical, specific next actions appropriate to the recorded stage,
+activity recency, close date, and missing information. Do not recommend closing a deal
+that is marked closed. Only populate follow_up_email_draft when requested_email_draft is
+true; otherwise it must be null. If requested, draft a concise, professional follow-up
+email grounded only in supplied facts. Do not imply a prior conversation or promise, and
+use neutral language or placeholders for missing context. Keep the summary to one or
+two sentences, each issue and recommendation to one concise sentence, and the email
+draft under 150 words.""",
+    "deal-follow-up/v1": """\
+Assess one open HubSpot deal for follow-up using only supplied verified CRM facts.
+Explain why follow-up is recommended and give two or three prioritized, practical actions
+appropriate to its pipeline stage, inactivity, close date, and any missing CRM fields.
+Do not invent customer conversations, objections, stakeholders, commitments, or scheduled
+tasks. Task status may be "Not verified"; never imply that no task exists. Draft a concise,
+professional email using only supplied facts, with neutral language or placeholders where
+context is missing. Do not send the email or imply prior discussions or promises. Keep the
+summary and reason to one sentence each, each action to one concise sentence, and the
+email draft under 100 words.""",
 }
 
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)

@@ -63,6 +63,8 @@ DEAL_PROPERTIES = (
     "hs_deal_stage_probability",
     "hubspot_owner_id",
 )
+DEAL_ANALYSIS_PROPERTIES = (*DEAL_PROPERTIES, "notes_last_updated")
+DEAL_FOLLOW_UP_PROPERTIES = (*DEAL_PROPERTIES, "notes_last_updated")
 DEAL_LIST_PROPERTIES = (
     *DEAL_PROPERTIES,
     "hs_probability",
@@ -538,12 +540,23 @@ class HubSpotToolRegistry:
             seen.add(page.next_after)
             after = page.next_after
 
-    async def get_deal(self, tenant_id: str, deal_id: str) -> HubSpotDeal:
+    async def get_deal(
+        self,
+        tenant_id: str,
+        deal_id: str,
+        *,
+        properties: Sequence[str] = DEAL_PROPERTIES,
+    ) -> HubSpotDeal:
         return await self._deals.get_deal(
-            self._context(tenant_id), deal_id=deal_id, properties=DEAL_PROPERTIES
+            self._context(tenant_id), deal_id=deal_id, properties=properties
         )
 
-    async def list_all_deals(self, tenant_id: str) -> list[HubSpotDeal]:
+    async def list_all_deals(
+        self,
+        tenant_id: str,
+        *,
+        properties: Sequence[str] = DEAL_LIST_PROPERTIES,
+    ) -> list[HubSpotDeal]:
         """Read every deal page, rejecting repeated cursors rather than truncating silently."""
         deals: list[HubSpotDeal] = []
         after: str | None = None
@@ -553,7 +566,7 @@ class HubSpotToolRegistry:
                 self._context(tenant_id),
                 limit=100,
                 after=after,
-                properties=DEAL_LIST_PROPERTIES,
+                properties=properties,
             )
             deals.extend(page.results)
             if page.next_after is None:

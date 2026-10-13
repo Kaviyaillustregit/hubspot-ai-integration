@@ -10,6 +10,11 @@ from app.integrations.errors import IntegrationError, IntegrationTimeoutError
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
+_DEFAULT_MAX_TOKENS = 700
+_DEAL_ANALYSIS_MAX_TOKENS = 1_400
+_DEAL_ANALYSIS_RETRY_MAX_TOKENS = 2_800
+_DEAL_PROMPTS = frozenset({"deal-analysis/v1", "deal-follow-up/v1"})
+
 
 class AnthropicProvider(AIProvider):
     """Anthropic adapter. The application only depends on ``AIProvider``."""
@@ -34,11 +39,25 @@ class AnthropicProvider(AIProvider):
             max_retries=self._settings.max_retries,
         )
         try:
+            max_tokens = (
+                _DEAL_ANALYSIS_MAX_TOKENS
+                if prompt_name in _DEAL_PROMPTS
+                else _DEFAULT_MAX_TOKENS
+            )
             response = await client.messages.create(
                 model=self._settings.anthropic_model,
-                max_tokens=700,
+                max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
+            if (
+                prompt_name in _DEAL_PROMPTS
+                and response.stop_reason == "max_tokens"
+            ):
+                response = await client.messages.create(
+                    model=self._settings.anthropic_model,
+                    max_tokens=_DEAL_ANALYSIS_RETRY_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             text = "".join(block.text for block in response.content if block.type == "text")
             return output_schema.model_validate_json(strip_json_fences(text))
         except TimeoutError as exc:

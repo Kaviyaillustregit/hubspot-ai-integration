@@ -86,6 +86,7 @@ def get_agent(request: Request) -> AccountIntelligenceAgent:
         tools,
         AIService(create_ai_provider(request.app.state.settings)),
         action_safety,
+        deal_follow_up_batch_size=settings.deal_follow_up_batch_size,
     )
 
 
