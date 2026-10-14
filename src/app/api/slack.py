@@ -87,6 +87,8 @@ def get_agent(request: Request) -> AccountIntelligenceAgent:
         AIService(create_ai_provider(request.app.state.settings)),
         action_safety,
         deal_follow_up_batch_size=settings.deal_follow_up_batch_size,
+        lead_analysis_limit=settings.lead_analysis_limit,
+        lead_ai_batch_size=settings.lead_ai_batch_size,
     )
 
 

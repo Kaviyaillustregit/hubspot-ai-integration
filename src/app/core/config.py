@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     max_retries: int = 3
     ai_provider: str = "anthropic"
     deal_follow_up_batch_size: int = Field(default=10, ge=1, le=25)
+    lead_analysis_limit: int = Field(default=50, ge=1, le=200)
+    lead_ai_batch_size: int = Field(default=5, ge=1, le=10)
 
     openrouter_api_key: str | None = None
     openrouter_model: str = "openrouter/free"

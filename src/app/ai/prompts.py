@@ -68,6 +68,9 @@ query (only for crm_question):
   Extract the exact deal_name and treat it as a read-only request.
 - deal_follow_up: find open deals needing follow-up and prepare grounded recommended actions.
   Treat it as a read-only request; no deal name is required.
+- lead_qualification: analyze HubSpot leads/contacts, score or qualify them, identify
+  high-potential prospects, or recommend which leads to prioritize or contact first.
+  Treat it as a read-only request; no name is required.
 - open_deals: list all deals whose configured pipeline stage is open.
 - closed_deals: list all deals whose configured pipeline stage is closed.
 - closed_won_deals / closed_lost_deals: list only the matching configured closed stage.
@@ -138,6 +141,15 @@ professional email using only supplied facts, with neutral language or placehold
 context is missing. Do not send the email or imply prior discussions or promises. Keep the
 summary and reason to one sentence each, each action to one concise sentence, and the
 email draft under 100 words.""",
+    "lead-qualification/v1": """\
+Assess one HubSpot lead using only the supplied verified CRM facts and the rules-based
+priority already computed. Do not change the priority. Never invent engagement history,
+buying intent, revenue, scores, budget, conversations, or CRM properties; treat absent
+values as unknown and list consequential gaps in missing_information. Give a brief
+qualification assessment, up to four reasons and up to three potential opportunities
+that are directly supported by the facts, one recommended next action, and a suggested
+outreach approach (do not draft or send a message, and do not imply prior contact).
+Keep every item to one concise sentence.""",
 }
 
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)

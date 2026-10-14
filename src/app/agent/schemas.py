@@ -55,6 +55,7 @@ CRMQueryName = Literal[
     "contact_deals",
     "deal_analysis",
     "deal_follow_up",
+    "lead_qualification",
 ]
 
 
@@ -143,6 +144,17 @@ class DealFollowUpAssessment(BaseModel):
         max_length=3,
     )
     follow_up_email_draft: str = Field(max_length=1200)
+
+
+class LeadAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    qualification_assessment: str = Field(max_length=500)
+    reasons: list[Annotated[str, Field(max_length=250)]] = Field(max_length=4)
+    opportunities: list[Annotated[str, Field(max_length=250)]] = Field(max_length=3)
+    missing_information: list[Annotated[str, Field(max_length=120)]] = Field(max_length=6)
+    recommended_next_action: str = Field(max_length=300)
+    outreach_approach: str = Field(max_length=400)
 
 
 class AgentResponse(BaseModel):

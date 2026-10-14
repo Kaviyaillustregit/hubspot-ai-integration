@@ -53,6 +53,11 @@ CONTACT_PROPERTIES = (
     "hs_linkedin_url",
     "associatedcompanyid",
 )
+LEAD_CONTACT_PROPERTIES = (
+    *CONTACT_PROPERTIES,
+    "hs_last_sales_activity_timestamp",
+    "notes_last_updated",
+)
 DEAL_PROPERTIES = (
     "dealname",
     "amount",
@@ -348,6 +353,30 @@ class HubSpotToolRegistry:
             records.extend(page.results)
             if page.next_after is None:
                 return records
+            if page.next_after in seen:
+                raise IntegrationError("HubSpot contact listing repeated a pagination cursor")
+            seen.add(page.next_after)
+            after = page.next_after
+
+    async def list_contacts_limited(
+        self, tenant_id: str, limit: int
+    ) -> tuple[list[HubSpotContact], bool]:
+        """Read at most ``limit`` contacts; the flag says whether more exist."""
+        records: list[HubSpotContact] = []
+        after: str | None = None
+        seen: set[str] = set()
+        while True:
+            page = await self._contacts.list_contacts(
+                self._context(tenant_id),
+                limit=min(100, limit - len(records)),
+                after=after,
+                properties=LEAD_CONTACT_PROPERTIES,
+            )
+            records.extend(page.results)
+            if len(records) >= limit:
+                return records[:limit], page.next_after is not None or len(records) > limit
+            if page.next_after is None:
+                return records, False
             if page.next_after in seen:
                 raise IntegrationError("HubSpot contact listing repeated a pagination cursor")
             seen.add(page.next_after)

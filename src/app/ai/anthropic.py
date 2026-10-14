@@ -13,7 +13,7 @@ OutputT = TypeVar("OutputT", bound=BaseModel)
 _DEFAULT_MAX_TOKENS = 700
 _DEAL_ANALYSIS_MAX_TOKENS = 1_400
 _DEAL_ANALYSIS_RETRY_MAX_TOKENS = 2_800
-_DEAL_PROMPTS = frozenset({"deal-analysis/v1", "deal-follow-up/v1"})
+_DEAL_PROMPTS = frozenset({"deal-analysis/v1", "deal-follow-up/v1", "lead-qualification/v1"})
 
 
 class AnthropicProvider(AIProvider):

@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import re
-from asyncio import gather
+from asyncio import Semaphore, gather
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Literal
@@ -10,6 +10,13 @@ from app.agent.extraction import (
     ExtractionValidationError,
     ValidatedExtraction,
     validate_extraction,
+)
+from app.agent.leads import (
+    LeadReportEntry,
+    ScoredLead,
+    format_lead_report,
+    rank_leads,
+    score_lead,
 )
 from app.agent.operations import CONFIRMED_UPDATE_ACTIONS, OPERATION_INTENTS, CRMOperations
 from app.agent.schemas import (
@@ -23,6 +30,7 @@ from app.agent.schemas import (
     DealAnalysis,
     DealFollowUpAssessment,
     GroundedSummary,
+    LeadAssessment,
 )
 from app.agent.tools import (
     DEAL_ANALYSIS_PROPERTIES,
@@ -31,7 +39,7 @@ from app.agent.tools import (
 )
 from app.ai.service import AIService
 from app.integrations.errors import IntegrationError
-from app.integrations.hubspot.models import HubSpotCompany, HubSpotDeal
+from app.integrations.hubspot.models import HubSpotCompany, HubSpotContact, HubSpotDeal
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
 
@@ -176,6 +184,13 @@ _DEAL_FOLLOW_UP_REQUEST_PATTERN = re.compile(
     r"(?:follow[- ]?up|next[- ]best\s+actions?|need(?:ing)?\s+follow[- ]?up)\b",
     re.IGNORECASE,
 )
+_LEAD_QUALIFICATION_REQUEST_PATTERN = re.compile(
+    r"\b(?:leads?|prospects?)\b.{0,100}\b(?:qualif\w*|prioriti[sz]\w*|scor\w*|high[- ]potential)\b"
+    r"|\b(?:qualif\w*|prioriti[sz]\w*|scor\w*|high[- ]potential)\b.{0,60}\b(?:leads?|prospects?)\b"
+    r"|\bwhich\s+(?:leads?|prospects?)\b.{0,60}\b(?:contact|call|reach|prioriti[sz]e|focus)\b",
+    re.IGNORECASE,
+)
+_LEAD_CONCURRENCY = 5
 _SLACK_MESSAGE_MAX_LENGTH = 39_000
 
 
@@ -187,12 +202,16 @@ class AccountIntelligenceAgent:
         action_safety: ActionSafetyService,
         *,
         deal_follow_up_batch_size: int = 10,
+        lead_analysis_limit: int = 50,
+        lead_ai_batch_size: int = 5,
     ) -> None:
         self._tools = tools
         self._ai_service = ai_service
         self._action_safety = action_safety
         self._operations = CRMOperations(tools, action_safety)
         self._deal_follow_up_batch_size = deal_follow_up_batch_size
+        self._lead_analysis_limit = lead_analysis_limit
+        self._lead_ai_batch_size = lead_ai_batch_size
 
     async def respond(self, request: AgentRequest) -> AgentResponse:
         confirmation_action_id = self._confirmation_action_id(request.message)
@@ -439,6 +458,13 @@ class AccountIntelligenceAgent:
         if _DEAL_FOLLOW_UP_REQUEST_PATTERN.search(request.message):
             return await self._review_deals_for_follow_up(request)
 
+        if _LEAD_QUALIFICATION_REQUEST_PATTERN.search(request.message) and not (
+            _CONTACT_CREATE_PATTERN.search(request.message)
+            or _CONTACT_UPDATE_PATTERN.search(request.message)
+            or _CONTACT_DELETE_PATTERN.search(request.message)
+        ):
+            return await self._qualify_leads(request)
+
         extraction = await self._extract_intent(request)
 
         if extraction is None:
@@ -556,6 +582,8 @@ class AccountIntelligenceAgent:
             return await self._analyze_deal(request, validated.deal_name)
         if extraction.intent == "crm_question" and extraction.query == "deal_follow_up":
             return await self._review_deals_for_follow_up(request)
+        if extraction.intent == "crm_question" and extraction.query == "lead_qualification":
+            return await self._qualify_leads(request)
 
         # Companies, deals and links between records; contact-only requests continue below.
         if CRMOperations.handles(extraction, validated):
@@ -1009,6 +1037,154 @@ class AccountIntelligenceAgent:
                 ],
             },
         )
+
+    async def _qualify_leads(self, request: AgentRequest) -> AgentResponse:
+        tenant_id = request.tenant_id
+        try:
+            contacts, has_more = await self._tools.list_contacts_limited(
+                tenant_id, self._lead_analysis_limit
+            )
+            company_by_contact = await self._companies_for_contacts(tenant_id, contacts)
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+            )
+        except IntegrationError:
+            logger.exception("Lead data retrieval failed", extra={"tenant_id": tenant_id})
+            return self._safe(
+                "unavailable",
+                "I couldn't retrieve HubSpot leads right now.",
+                request,
+                ["list_contacts_limited"],
+            )
+
+        today = datetime.now(UTC).date()
+        leads = rank_leads(
+            [
+                score_lead(contact, company_by_contact.get(contact.id), today=today)
+                for contact in contacts
+            ]
+        )
+        selected = [lead for lead in leads if lead.priority != "Low"][
+            : self._lead_ai_batch_size
+        ] or leads[: min(self._lead_ai_batch_size, 3)]
+
+        try:
+            urls = (
+                await self._tools.hubspot_record_urls(
+                    tenant_id, [("contacts", lead.contact.id) for lead in selected]
+                )
+                if selected
+                else []
+            )
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+            )
+        except IntegrationError:
+            logger.exception(
+                "HubSpot contact URL generation failed", extra={"tenant_id": tenant_id}
+            )
+            return self._safe(
+                "unavailable",
+                "I couldn't generate HubSpot links for the lead report.",
+                request,
+                ["hubspot_record_urls"],
+            )
+
+        assessments = await gather(*(self._assess_lead(request, lead) for lead in selected))
+        entries = [
+            LeadReportEntry(lead, url, assessment)
+            for lead, url, assessment in zip(selected, urls, assessments, strict=True)
+        ]
+        ai_failures = sum(item.assessment is None for item in entries)
+        counts = {
+            p: sum(1 for lead in leads if lead.priority == p) for p in ("High", "Medium", "Low")
+        }
+        return AgentResponse(
+            status="partial" if ai_failures else "ok",
+            text=format_lead_report(
+                leads=leads,
+                entries=entries,
+                analysis_limit=self._lead_analysis_limit,
+                has_more=has_more,
+            ),
+            request_id=request.request_id,
+            tools_used=[
+                "list_contacts_limited",
+                "contact_company_associations",
+                "lead_qualification",
+                *(["lead_qualification_ai"] if entries else []),
+                *(["hubspot_record_urls"] if entries else []),
+            ],
+            result={
+                "kind": "lead_qualification",
+                "leads_analyzed": len(leads),
+                "high_priority": counts["High"],
+                "medium_priority": counts["Medium"],
+                "low_priority": counts["Low"],
+                "more_contacts_not_analyzed": has_more,
+                "leads": [
+                    {
+                        **item.lead.facts,
+                        "contact_id": item.lead.contact.id,
+                        "hubspot_url": item.hubspot_url,
+                        "assessment": (
+                            item.assessment.model_dump() if item.assessment else None
+                        ),
+                    }
+                    for item in entries
+                ],
+            },
+        )
+
+    async def _companies_for_contacts(
+        self, tenant_id: str, contacts: list[HubSpotContact]
+    ) -> dict[str, HubSpotCompany]:
+        """Primary associated company per contact, fetching each company once."""
+        semaphore = Semaphore(_LEAD_CONCURRENCY)
+
+        async def company_id_for(contact: HubSpotContact) -> str | None:
+            async with semaphore:
+                associations = await self._tools.contact_company_associations(
+                    tenant_id, contact.id
+                )
+            return associations.results[0].company_id if associations.results else None
+
+        company_ids = await gather(*(company_id_for(contact) for contact in contacts))
+        unique_ids = sorted({cid for cid in company_ids if cid})
+
+        async def fetch(company_id: str) -> HubSpotCompany:
+            async with semaphore:
+                return await self._tools.get_company(tenant_id, company_id)
+
+        fetched = await gather(*(fetch(c) for c in unique_ids))
+        companies = dict(zip(unique_ids, fetched, strict=True))
+        return {
+            contact.id: companies[cid]
+            for contact, cid in zip(contacts, company_ids, strict=True)
+            if cid
+        }
+
+    async def _assess_lead(
+        self, request: AgentRequest, lead: ScoredLead
+    ) -> LeadAssessment | None:
+        try:
+            return await self._ai_service.generate(
+                prompt_name="lead-qualification/v1",
+                variables={"crm_facts": lead.facts},
+                output_schema=LeadAssessment,
+            )
+        except IntegrationError:
+            logger.exception(
+                "AI lead assessment failed",
+                extra={"tenant_id": request.tenant_id, "contact_id": lead.contact.id},
+            )
+            return None
 
     async def _resolve_contact_id(
         self, request: AgentRequest, validated: ValidatedExtraction
