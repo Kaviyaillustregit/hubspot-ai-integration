@@ -66,8 +66,16 @@ class HubSpotDealsClient(HubSpotApiClient):
         limit: int = 100,
         after: str | None = None,
         properties: Sequence[str] = (),
+        filter_groups: Sequence[dict[str, object]] | None = None,
+        sorts: Sequence[dict[str, str]] | None = None,
     ) -> HubSpotDealsPage:
-        body: dict[str, object] = {"query": query, "limit": limit}
+        body: dict[str, object] = {"limit": limit}
+        if query or not filter_groups:
+            body["query"] = query
+        if filter_groups:
+            body["filterGroups"] = list(filter_groups)
+        if sorts:
+            body["sorts"] = list(sorts)
         if after:
             body["after"] = after
         if properties:

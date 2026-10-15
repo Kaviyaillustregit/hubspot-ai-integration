@@ -47,6 +47,21 @@ class Companies:
             ]
         )
 
+    async def search_companies(self, context, **kwargs):
+        assert context.tenant_id == "tenant-a"
+
+        return HubSpotCompaniesPage(
+            results=[
+                HubSpotCompany(
+                    id="company-1",
+                    properties={
+                        "name": "Test AI Company",
+                        "industry": "Software",
+                    },
+                )
+            ]
+        )
+
     async def get_contact_company_associations(
         self,
         context,
@@ -58,6 +73,18 @@ class Companies:
 
 class Contacts:
     async def list_contacts(self, context, **kwargs):
+        assert context.tenant_id == "tenant-a"
+
+        return HubSpotContactsPage(
+            results=[
+                HubSpotContact(
+                    id="contact-1",
+                    properties={"email": "a@example.com"},
+                )
+            ]
+        )
+
+    async def search_contacts(self, context, **kwargs):
         assert context.tenant_id == "tenant-a"
 
         return HubSpotContactsPage(

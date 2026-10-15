@@ -67,6 +67,8 @@ DEAL_PROPERTIES = (
     "hs_probability",
     "hs_deal_stage_probability",
     "hubspot_owner_id",
+    "hs_priority",
+    "dealtype",
 )
 DEAL_ANALYSIS_PROPERTIES = (*DEAL_PROPERTIES, "notes_last_updated")
 DEAL_FOLLOW_UP_PROPERTIES = (*DEAL_PROPERTIES, "notes_last_updated")
@@ -75,6 +77,8 @@ DEAL_LIST_PROPERTIES = (
     "hs_probability",
     "hs_deal_stage_probability",
     "hubspot_owner_id",
+    "hs_priority",
+    "dealtype",
 )
 
 
@@ -569,6 +573,40 @@ class HubSpotToolRegistry:
             seen.add(page.next_after)
             after = page.next_after
 
+    async def search_deals_filtered(
+        self,
+        tenant_id: str,
+        filter_groups: list[dict[str, object]],
+        *,
+        sorts: list[dict[str, str]] | None = None,
+        max_results: int | None = None,
+        properties: Sequence[str] = DEAL_LIST_PROPERTIES,
+    ) -> tuple[list[HubSpotDeal], bool]:
+        """Run a validated HubSpot Search filter; returns (deals, truncated)."""
+        records: list[HubSpotDeal] = []
+        after: str | None = None
+        seen: set[str] = set()
+        for _ in range(100):
+            page = await self._deals.search_deals(
+                self._context(tenant_id),
+                query="",
+                limit=100,
+                after=after,
+                properties=properties,
+                filter_groups=filter_groups,
+                sorts=sorts,
+            )
+            records.extend(page.results)
+            if max_results is not None and len(records) >= max_results:
+                return records[:max_results], page.next_after is not None or len(records) > max_results
+            if page.next_after is None:
+                return records, False
+            if page.next_after in seen:
+                raise IntegrationError("HubSpot deal search repeated a pagination cursor")
+            seen.add(page.next_after)
+            after = page.next_after
+        return records, True
+
     async def get_deal(
         self,
         tenant_id: str,
@@ -693,6 +731,7 @@ class HubSpotToolRegistry:
             "resolve_deal",
             "get_deal",
             "list_all_deals",
+            "search_deals_filtered",
             "create_deal",
             "update_deal",
             "deal_pipelines",

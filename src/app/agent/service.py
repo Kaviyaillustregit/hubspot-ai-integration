@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Literal
 
+from app.agent.crm_query import DealFilterSpec, detect_deal_filter, deal_status_query
 from app.agent.extraction import (
     ExtractionValidationError,
     ValidatedExtraction,
@@ -160,7 +161,7 @@ _ALL_COMPANIES_LIST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ALL_OPEN_DEALS_LIST_PATTERN = re.compile(
-    r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+open\s+deals?\b",
+     r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+open\s+(?:deals?|(?:opportunit|oppurtunit)(?:y|ies))\b",
     re.IGNORECASE,
 )
 _ALL_DEALS_LIST_PATTERN = re.compile(
@@ -561,6 +562,25 @@ class AccountIntelligenceAgent:
             and _ALL_CONTACTS_LIST_PATTERN.search(request.message)
         ):
             extraction = extraction.model_copy(update={"query": "contact_list"})
+
+        # Detect structured deal filters for read queries. Keep any explicit deal_stage
+        # extracted by the AI service even when the query is already set.
+        if extraction.intent == "crm_question":
+            deal_filter = detect_deal_filter(request.message)
+            if extraction.deal_stage:
+                stage_value = extraction.deal_stage.strip()
+                if deal_filter is None:
+                    deal_filter = DealFilterSpec(stages=[stage_value])
+                else:
+                    merged_stages = list(dict.fromkeys([*deal_filter.stages, stage_value]))
+                    deal_filter = deal_filter.model_copy(update={"stages": merged_stages})
+            if deal_filter is not None:
+                extraction = extraction.model_copy(
+                    update={
+                        "query": extraction.query or deal_status_query(request.message),
+                        "deal_filter": deal_filter.model_dump(),
+                    }
+                )
 
         if (
             extraction.intent in _WRITE_INTENTS

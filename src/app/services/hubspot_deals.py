@@ -34,6 +34,8 @@ class DealsClient(Protocol):
         limit: int = 100,
         after: str | None = None,
         properties: Sequence[str] = (),
+        filter_groups: Sequence[dict[str, object]] | None = None,
+        sorts: Sequence[dict[str, str]] | None = None,
     ) -> HubSpotDealsPage: ...
 
     async def get_deal(
@@ -97,10 +99,25 @@ class HubSpotDealsService:
         limit: int = 100,
         after: str | None = None,
         properties: Sequence[str] = (),
+        filter_groups: Sequence[dict[str, object]] | None = None,
+        sorts: Sequence[dict[str, str]] | None = None,
     ) -> HubSpotDealsPage:
         access_token, resolved = await self._authorized(context, "crm.objects.deals.read")
+        # Optional search arguments are only forwarded when used, so existing callers and
+        # clients keep their exact call shape.
+        extra: dict[str, object] = {}
+        if filter_groups:
+            extra["filter_groups"] = filter_groups
+        if sorts:
+            extra["sorts"] = sorts
         return await self._client.search_deals(
-            resolved, access_token, query=query, limit=limit, after=after, properties=properties
+            resolved,
+            access_token,
+            query=query,
+            limit=limit,
+            after=after,
+            properties=properties,
+            **extra,  # type: ignore[arg-type]
         )
 
     async def get_deal(

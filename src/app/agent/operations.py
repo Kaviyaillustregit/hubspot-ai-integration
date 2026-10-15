@@ -17,6 +17,17 @@ from decimal import Decimal, InvalidOperation
 from time import perf_counter
 from typing import Literal, TypeVar
 
+from app.agent.crm_query import (
+    DealFilter,
+    DealFilterError,
+    DealFilterSpec,
+    apply_deal_filter,
+    build_deal_filter,
+    resolve_owner_ids,
+    resolve_pipeline_ids,
+    resolve_stage_ids,
+    to_hubspot_filter_group,
+)
 from app.agent.extraction import ValidatedExtraction
 from app.agent.schemas import AgentRequest, AgentResponse, CRMIntentExtraction, CRMQueryName
 from app.agent.tools import HubSpotToolRegistry
@@ -72,6 +83,36 @@ _LINKS: dict[str, tuple[CRMObjectType, Entity, CRMObjectType, Entity]] = {
 }
 _LIST_LIMIT = 20
 _ENRICHMENT_CONCURRENCY = 8
+
+
+def _merge_deal_filter_dicts(*raw: dict[str, object] | None) -> dict[str, object] | None:
+    """Discard blank strings so an empty Claude value cannot override a valid parsed filter."""
+    merged: dict[str, object] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            merged[key] = value
+
+    if "deal_stage" in merged and "stages" not in merged:
+        stage_value = merged.pop("deal_stage")
+        if isinstance(stage_value, str):
+            stages = [stage_value]
+        elif isinstance(stage_value, list):
+            stages = stage_value
+        else:
+            stages = []
+        cleaned = [str(stage).strip() for stage in stages if str(stage).strip()]
+        if cleaned:
+            merged["stages"] = list(dict.fromkeys(cleaned))
+
+    return merged or None
+
+
 _DEAL_OWNER_REQUEST_PATTERN = re.compile(
     r"\b(?:assign(?:ed)?|(?:deal\s+)?owner\s+(?:is|to)|owned\s+by|as\s+owner)\b",
     re.IGNORECASE,
@@ -164,7 +205,9 @@ class CRMOperations:
         operation = extraction.query or extraction.intent
         try:
             if extraction.intent == "crm_question" and extraction.query is not None:
-                return await self._answer_query(request, extraction.query, validated)
+                return await self._answer_query(
+                    request, extraction.query, validated, extraction.deal_filter
+                )
             if extraction.intent == "delete_company":
                 return await self._propose_company_delete(request, validated)
             actions = _entity_actions(extraction, validated)
@@ -258,6 +301,8 @@ class CRMOperations:
             return await self._run_plan(request, extraction, validated, actions, idempotency_key)
         except OperationError as exc:
             return _response(request, exc.status, exc.message)
+        except DealFilterError as exc:
+            return _response(request, "invalid_filter", exc.message)
         finally:
             logger.info(
                 "CRM operation timing",
@@ -850,8 +895,20 @@ class CRMOperations:
     # ------------------------------------------------------------------ read queries
 
     async def _answer_query(
-        self, request: AgentRequest, query: CRMQueryName, validated: ValidatedExtraction
+        self,
+        request: AgentRequest,
+        query: CRMQueryName,
+        validated: ValidatedExtraction,
+        deal_filter: dict[str, object] | DealFilterSpec | None = None,
     ) -> AgentResponse:
+        # Convert dict to DealFilterSpec if needed; blank extraction values are ignored so
+        # they cannot override a valid local parse or explicit value in the same request.
+        if isinstance(deal_filter, dict):
+            deal_filter = _merge_deal_filter_dicts(deal_filter)
+            if deal_filter is not None:
+                deal_filter = DealFilterSpec(**deal_filter)
+            else:
+                deal_filter = None
         tenant_id = request.tenant_id
         try:
             if query == "closed_won_revenue":
@@ -1088,7 +1145,7 @@ class CRMOperations:
                 "all_deals",
             }:
                 return await self._answer_deal_list(
-                    request, query, validated.requested_fields
+                    request, query, validated.requested_fields, deal_filter
                 )
 
             if query in ("company_contacts", "company_deals"):
@@ -1280,11 +1337,59 @@ class CRMOperations:
         request: AgentRequest,
         query: CRMQueryName,
         requested_fields: list[str] | None = None,
+        deal_filter: DealFilterSpec | None = None,
     ) -> AgentResponse:
-        pipelines, all_deals = await asyncio.gather(
-            self._tools.deal_pipelines(request.tenant_id),
-            self._tools.list_all_deals(request.tenant_id),
-        )
+        flt: DealFilter | None = None
+        user_stage_ids: list[str] = []
+        pipeline_ids: list[str] = []
+        owner_ids: list[str] = []
+        if deal_filter is None:
+            pipelines, all_deals = await asyncio.gather(
+                self._tools.deal_pipelines(request.tenant_id),
+                self._tools.list_all_deals(request.tenant_id),
+            )
+        else:
+            # Validate before any HubSpot call so an unsupported filter is never ignored.
+            flt = build_deal_filter(deal_filter)
+            pipelines = await self._tools.deal_pipelines(request.tenant_id)
+            user_stage_ids = resolve_stage_ids(
+                flt.stages,
+                {stage.id: stage for pipeline in pipelines for stage in pipeline.stages},
+            )
+            pipeline_map = {pipeline.id: pipeline for pipeline in pipelines}
+            if flt.pipeline:
+                try:
+                    pipeline_ids = resolve_pipeline_ids((flt.pipeline,), pipeline_map)
+                except DealFilterError:
+                    pipeline_ids = [flt.pipeline]
+            if flt.owner:
+                if hasattr(self._tools, "list_owners"):
+                    owners = await self._tools.list_owners(request.tenant_id)
+                    if isinstance(owners, dict):
+                        owner_map = owners
+                    else:
+                        owner_map = {}
+                        for item in owners or []:
+                            if isinstance(item, dict):
+                                owner_map[str(item.get("id") or item.get("owner_id") or "")] = str(
+                                    item.get("name") or item.get("owner_name") or ""
+                                )
+                            elif hasattr(item, "id") and hasattr(item, "name"):
+                                owner_map[str(getattr(item, "id"))] = str(getattr(item, "name") or "")
+                    if owner_map:
+                        try:
+                            owner_ids = resolve_owner_ids((flt.owner,), owner_map)
+                        except DealFilterError:
+                            owner_ids = [flt.owner]
+                else:
+                    owner_ids = [flt.owner]
+            if flt.numeric or user_stage_ids or pipeline_ids or flt.priority or flt.deal_type or owner_ids or flt.unassigned:
+                all_deals, _ = await self._tools.search_deals_filtered(
+                    request.tenant_id,
+                    to_hubspot_filter_group(flt, user_stage_ids, pipeline_ids=pipeline_ids, owner_ids=owner_ids),
+                )
+            else:
+                all_deals = await self._tools.list_all_deals(request.tenant_id)
         stages = {
             stage.id: stage
             for pipeline in pipelines
@@ -1324,6 +1429,9 @@ class CRMOperations:
             deals = [deal for deal in all_deals if is_closed(deal) is True and is_won(deal)]
         else:
             deals = [deal for deal in all_deals if is_closed(deal) is True and is_lost(deal)]
+
+        if flt is not None:
+            deals = apply_deal_filter(deals, flt, user_stage_ids, pipeline_ids, owner_ids)
 
         probabilities = {deal.id: _deal_probability(deal) for deal in deals}
         if query == "best_chance_deals":
@@ -1390,6 +1498,21 @@ class CRMOperations:
             title = f"{status_label.capitalize()} Deals"
             if not deals:
                 summary = f"No {status_label} deals were found."
+            if flt is not None:
+                applied = flt.describe()
+                if flt.limit is not None:
+                    applied += (", " if applied else "") + f"limited to {flt.limit}"
+                if flt.sort_property:
+                    applied += (
+                        f", sorted by {flt.sort_property} "
+                        + ("descending" if flt.sort_direction == "desc" else "ascending")
+                    )
+                summary = (
+                    (f"No {status_label} deals match" if not deals else
+                     f"Found {len(deals)} {status_label} deal{'s' if len(deals) != 1 else ''}"
+                     " matching")
+                    + f" ({applied}). Deals without a valid amount are excluded."
+                )
 
         deal_columns = _columns_for_request(_deal_columns(), requested_fields or [])
         if requested_fields:

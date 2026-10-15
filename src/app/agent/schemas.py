@@ -97,6 +97,8 @@ class CRMIntentExtraction(BaseModel):
     requested_fields: list[str] = Field(default_factory=list, max_length=20)
     question: str | None = Field(default=None, max_length=3000)
     confidence: float = Field(ge=0, le=1)
+    # Structured deal filters for read queries: amount, stage, sort, limit conditions
+    deal_filter: dict[str, object] | None = Field(default=None)
 
 class ContactCreateIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
