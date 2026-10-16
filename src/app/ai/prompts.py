@@ -113,6 +113,24 @@ Extraction rules:
 - question: for crm_question, a short restatement of what is being asked; otherwise null.
 - Ignore Slack mention tokens such as <@U123ABC>. Slack wraps emails and links as
   <mailto:a@b.com|a@b.com> or <http://x.com|x.com>; extract only the plain value.
+- chart_requested: true only when the user explicitly asks for a chart, graph, visual,
+  or visualization. Do not set this for ordinary deal-list or CRM questions.
+- chart_type: one of "bar", "line", "pie", "doughnut", or "funnel" only when the user
+  explicitly names a chart type. If chart_requested is true but chart_type is omitted,
+  leave it as null and choose the best supported chart type later based on the data.
+- Never invent a chart type. If the user does not specify it, do not guess at extraction time.
+- Use the CRM query flow for ordinary deal results and only call QuickChart when a chart is
+  explicitly requested and validated.
+- deal_filter: only when this is a structured deal read filter. Use a canonical object with
+  only the following keys: status, stages, conditions, priority, deal_type, owner,
+  pipeline, unassigned, sort, limit, unsupported. Do not send raw chart metadata,
+  visualization payloads, stage_status, stage_type, stage_state, output, or other
+  alias keys inside deal_filter. Set chart intent at the top level using chart_requested and
+  chart_type instead.
+- sort: either {"property": "amount" or "closedate", "direction": "asc" or "desc"} or null.
+- status: "open", "closed", "closed_won", or "closed_lost" when the user explicitly asks
+  for a deal status filter; map aliases such as stage_type="open" or stage_status="closed"
+  to this canonical status value before returning the object.
 - confidence: a number from 0 to 1 for how certain you are about the intent."""
 
 PROMPT_INSTRUCTIONS: dict[str, str] = {

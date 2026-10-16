@@ -3,11 +3,12 @@ import hmac
 import json
 import time
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, unquote
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from app.agent.schemas import AgentResponse
 from app.api.app import create_app
@@ -26,6 +27,8 @@ from app.integrations.slack.home import (
 )
 from app.integrations.slack.http_client import SlackWebApiClient
 from app.services.action_safety import RecentAction
+from app.agent.crm_query import DealFilterSpec, detect_deal_filter
+from app.services.quickchart import QuickChartService
 
 ACTION_ID = "0123456789abcdef0123456789abcdef"
 
@@ -185,6 +188,189 @@ def test_single_record_result_renders_existing_hubspot_link():
     )
 
     assert blocks[-1]["text"]["text"] == f"<{record_url}|View in HubSpot>"
+
+
+def test_deal_chart_result_renders_image_block():
+    chart_url = "https://quickchart.io/chart?c=%7B%22type%22%3A%22bar%22%7D"
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Found 2 open deals.",
+            request_id="r",
+            result={
+                "kind": "deal_chart",
+                "chart_url": chart_url,
+                "chart_title": "Top 2 deals by value",
+            },
+        )
+    )
+
+    assert blocks[0]["text"]["text"] == "✓  *Here's what I found*"
+    assert blocks[1]["text"]["text"] == "Found 2 open deals."
+    assert blocks[2]["type"] == "image"
+    assert blocks[2]["image_url"] == chart_url
+
+
+def test_quickchart_service_generates_chart_for_deals_from_real_data():
+    deals = [
+        SimpleNamespace(id="deal-1", properties={"dealname": "Alpha", "amount": "120000"}),
+        SimpleNamespace(id="deal-2", properties={"dealname": "Beta", "amount": "60000"}),
+    ]
+
+    assert QuickChartService.detect_chart_type("Show me the top 2 highest-value deals as a bar chart") == "bar"
+    chart_url = QuickChartService.chart_for_deals(
+        deals,
+        title="Top deals by value",
+        chart_type="bar",
+        limit=2,
+    )
+
+    assert chart_url is not None
+    assert chart_url.startswith("https://quickchart.io/chart?")
+    assert "c=" in chart_url
+    assert "%22Alpha%22" in chart_url
+
+
+def test_bar_chart_renders_full_labels_zero_baseline_and_currency_ticks():
+    deals = [
+        SimpleNamespace(id="deal-1", properties={"dealname": "Regional Expansion North America 2025", "amount": "3500000"}),
+        SimpleNamespace(id="deal-2", properties={"dealname": "Global Services Renewal 2025", "amount": "2500000"}),
+        SimpleNamespace(id="deal-3", properties={"dealname": "Enterprise Upsell West Region", "amount": "1500000"}),
+        SimpleNamespace(id="deal-4", properties={"dealname": "Customer Success Add-On Bundle", "amount": "500000"}),
+        SimpleNamespace(id="deal-5", properties={"dealname": "Consulting Retainer 2025", "amount": "600000"}),
+    ]
+
+    chart_url = QuickChartService.chart_for_deals(
+        deals,
+        title="Top deals by value",
+        chart_type="bar",
+        limit=5,
+    )
+
+    assert chart_url is not None
+    decoded = unquote(chart_url)
+    assert '"beginAtZero":true' in decoded
+    assert '"maxRotation":45' in decoded
+    assert "toLocaleString('en-US')" in decoded
+    assert "Regional Expansion North America 2025" in decoded
+    assert "Customer Success Add-On Bundle" in decoded
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Show me the top 5 deals as a doughnut chart", "doughnut"),
+        ("Show me a pie chart for open deals", "pie"),
+        ("Show me the sales pipeline as a funnel chart", "funnel"),
+        ("Show me the pipeline chart", "funnel"),
+    ],
+)
+def test_quickchart_service_detects_supported_chart_types(message, expected):
+    assert QuickChartService.detect_chart_type(message) == expected
+
+
+def test_quickchart_service_generates_pipeline_chart_from_real_stage_data():
+    deals = [
+        SimpleNamespace(id="deal-1", properties={"dealname": "Alpha", "amount": "120000", "dealstage": "qualified"}),
+        SimpleNamespace(id="deal-2", properties={"dealname": "Beta", "amount": "60000", "dealstage": "qualified"}),
+        SimpleNamespace(id="deal-3", properties={"dealname": "Gamma", "amount": "20000", "dealstage": "proposal"}),
+    ]
+
+    chart_url = QuickChartService.chart_for_deals(
+        deals,
+        title="Sales pipeline",
+        chart_type="funnel",
+        limit=10,
+        pipeline_stage_map={"qualified": "Qualified", "proposal": "Proposal"},
+        pipeline_stage_order=["qualified", "proposal", "closedwon"],
+    )
+
+    assert chart_url is not None
+    decoded = unquote(chart_url)
+    assert '"type":"bar"' in decoded
+    assert '"indexAxis":"y"' in decoded
+    assert "Qualified" in decoded
+    assert "Proposal" in decoded
+    assert QuickChartService.chart_summary_for_deals(
+        deals,
+        chart_type="funnel",
+        pipeline_stage_map={"qualified": "Qualified", "proposal": "Proposal"},
+        pipeline_stage_order=["qualified", "proposal", "closedwon"],
+    ) == (
+        "3 deals are in the pipeline with a total value of $200,000.00. "
+        "The largest stage is Qualified at $180,000.00."
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_type"),
+    [
+        ("Show me the distribution of deals by pipeline stage as a doughnut chart.", "doughnut"),
+        ("Show my sales pipeline as a funnel chart with stage-wise colors and summary.", "funnel"),
+        ("Show the deal values by stage as a pie chart.", "pie"),
+    ],
+)
+def test_deal_chart_messages_are_not_misread_as_pipeline_filters(message, expected_type):
+    assert QuickChartService.detect_chart_type(message) == expected_type
+    assert detect_deal_filter(message) is None
+
+
+def test_deal_filter_spec_ignores_visualization_and_sort_metadata():
+    spec = DealFilterSpec(
+        **{
+            "status": "open",
+            "sort_by": "amount",
+            "sort_order": "desc",
+            "visualization": "bar",
+            "limit": 3,
+            "sort": {"property": "amount", "direction": "desc"},
+        }
+    )
+
+    assert spec.limit == 3
+    assert spec.sort is not None
+    assert spec.sort.property == "amount"
+    assert spec.sort.direction == "desc"
+    assert spec.status == "open"
+    assert spec.model_dump(exclude_none=True) == {
+        "conditions": [],
+        "stages": [],
+        "status": "open",
+        "unassigned": False,
+        "sort": {"property": "amount", "direction": "desc"},
+        "limit": 3,
+        "unsupported": [],
+    }
+
+
+def test_top_three_highest_value_open_deals_still_uses_normal_deal_filter_flow():
+    message = "Show me the top 3 highest-value open deals."
+    flt = detect_deal_filter(message)
+    assert flt is not None
+    assert flt.limit == 3
+    assert flt.sort is not None
+    assert flt.sort.direction == "desc"
+    assert not flt.stages
+
+
+def test_chart_summary_renders_under_image_block():
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Found 2 open deals.",
+            request_id="r",
+            result={
+                "kind": "deal_chart",
+                "chart_url": "https://quickchart.io/chart?c=%7B%22type%22%3A%22bar%22%7D",
+                "chart_title": "Sales pipeline",
+                "chart_summary": "2 deals total $180,000.00 in value.",
+            },
+        )
+    )
+
+    text = all_text(blocks)
+    assert "Found 2 open deals." in text
+    assert "2 deals total $180,000.00 in value." in text
 
 
 def test_pending_confirmation_renders_confirm_button_instead_of_typed_instructions():

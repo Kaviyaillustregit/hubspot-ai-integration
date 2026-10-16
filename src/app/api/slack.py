@@ -132,10 +132,25 @@ async def _respond(
         return
 
     try:
-        await client.post_message(
-            parsed.channel_id,
-            response.text,
-        )
+        result = response.result or {}
+        if isinstance(result.get("chart_url"), str) and result.get("chart_url"):
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": response.text},
+                },
+                {
+                    "type": "image",
+                    "image_url": result["chart_url"],
+                    "alt_text": str(result.get("chart_title") or "Deal chart"),
+                },
+            ]
+            await client.post_message(parsed.channel_id, response.text, blocks=blocks)
+        else:
+            await client.post_message(
+                parsed.channel_id,
+                response.text,
+            )
     except IntegrationError:
         logger.error(
             "Slack response delivery failed",

@@ -4,6 +4,7 @@ import pytest
 from app.agent.crm_query import (
     DealFilterError,
     DealFilterSpec,
+    DealSort,
     apply_deal_filter,
     build_deal_filter,
     deal_status_query,
@@ -15,6 +16,7 @@ from app.agent.extraction import ValidatedExtraction
 from app.agent.operations import CRMOperations, _merge_deal_filter_dicts
 from app.agent.schemas import AgentRequest, CRMIntentExtraction
 from app.integrations.hubspot.models import HubSpotDeal, HubSpotPipeline, HubSpotPipelineStage
+from app.services.quickchart import build_chart_config
 
 
 PIPELINES = [
@@ -102,6 +104,110 @@ def test_detect_deal_filter_handles_correct_spelling():
     assert deal_filter.conditions[0].property == "amount"
     assert deal_filter.conditions[0].operator == "gt"
     assert deal_filter.conditions[0].value == "20000"
+
+
+def test_deal_filter_aliases_are_normalized_before_validation():
+    spec = DealFilterSpec.model_validate({
+        "stage_type": "open",
+        "sort": "amount_desc",
+        "limit": 5,
+        "output": "bar_chart",
+    })
+
+    assert spec.status == "open"
+    assert spec.sort == DealSort(property="amount", direction="desc")
+    assert spec.limit == 5
+
+
+def test_deal_filter_rejects_unknown_fields_before_validation():
+    with pytest.raises(ValueError, match="Unsupported deal filter field 'metadata'"):
+        DealFilterSpec.model_validate({
+            "status": "open",
+            "metadata": {"raw": "should-not-pass"},
+        })
+
+
+def test_pipeline_and_chart_language_are_not_treated_as_pipeline_names():
+    assert detect_deal_filter("Show my sales pipeline as a chart.") is None
+
+    pipeline_filter = detect_deal_filter("Show deals in the Enterprise Sales pipeline.")
+    assert pipeline_filter is not None
+    assert pipeline_filter.pipeline == "Enterprise Sales"
+
+
+def test_count_based_bar_chart_uses_zero_baseline_and_whole_number_ticks():
+    config = build_chart_config("bar", "Open deals by stage", ["New", "Qualified", "Won"], [1, 3, 2], value_label="Deal count")
+    y_axis = config["options"]["scales"]["y"]
+    assert y_axis["min"] == 0
+    assert y_axis["beginAtZero"] is True
+    assert y_axis["ticks"]["precision"] == 0
+    assert "maximumFractionDigits: 0" in y_axis["ticks"]["callback"]
+
+
+def test_quickchart_url_includes_chartjs_version_3():
+    config = build_chart_config("bar", "Open deals by stage", ["New", "Qualified", "Won"], [1, 3, 2], value_label="Deal count")
+    from app.services.quickchart import generate_chart_url
+
+    chart_url = generate_chart_url(config)
+    assert "version=3" in chart_url
+    assert "https://quickchart.io/chart?version=3&c=" in chart_url
+
+
+def test_chartjs_v3_styling_keeps_title_legend_and_axis_visible():
+    config = build_chart_config("bar", "Open deals by stage", ["New", "Qualified", "Won"], [1, 3, 2], value_label="Deal count")
+    assert config["options"]["plugins"]["title"]["display"] is True
+    assert config["options"]["plugins"]["title"]["text"] == "OPEN DEALS BY STAGE"
+    assert config["options"]["plugins"]["legend"]["display"] is False
+    assert config["options"]["scales"]["y"]["ticks"]["display"] is True
+    assert config["options"]["scales"]["y"]["min"] == 0
+    assert config["options"]["scales"]["y"]["beginAtZero"] is True
+
+
+async def test_stage_distribution_summary_does_not_warn_about_amount_for_count_queries():
+    operations = CRMOperations(QueryTools([deal("deal-1", "First", "open", amount="100")]), action_safety=None)  # type: ignore[arg-type]
+    response = await operations._answer_deal_list(  # noqa: SLF001
+        request("Show me the distribution of open deals by stage as a bar chart."),
+        "open_deals",
+        deal_filter=DealFilterSpec(status="open"),
+        chart_requested=True,
+        chart_type="bar",
+    )
+    assert response.text is not None
+    assert "Deals without a valid amount are excluded." not in response.text
+
+
+async def test_chart_and_plain_queries_share_same_filtered_deal_set():
+    deals = [
+        deal("deal-4", "Low Deal", "open", amount="4000"),
+        deal("deal-1", "Top Deal", "open", amount="150000"),
+        deal("deal-3", "Mid Deal", "open", amount="70000"),
+        deal("deal-2", "Second Deal", "open", amount="120000"),
+        deal("deal-5", "Closed Deal", "won", amount="300000"),
+    ]
+    operations = CRMOperations(QueryTools(deals), action_safety=None)  # type: ignore[arg-type]
+    plain_filter = DealFilterSpec(
+        status="open",
+        sort=DealSort(property="amount", direction="desc"),
+        limit=5,
+    )
+    plain = await operations._answer_deal_list(
+        request("Show me the top 5 highest-value open deals"),
+        "open_deals",
+        deal_filter=plain_filter,
+    )
+    chart = await operations._answer_deal_list(
+        request("Show me the top 5 highest-value open deals as a bar chart"),
+        "open_deals",
+        deal_filter=plain_filter,
+        chart_requested=True,
+        chart_type="bar",
+    )
+
+    plain_names = [row["name"] for row in plain.result["table"]["rows"]]  # type: ignore[index]
+    chart_names = [row["name"] for row in chart.result["table"]["rows"]]  # type: ignore[index]
+    assert plain_names == chart_names
+    assert chart.result.get("chart_url") is not None  # type: ignore[union-attr]
+    assert plain.result.get("chart_url") is None  # type: ignore[union-attr]
 
 
 def test_build_deal_filter_creates_hubspot_filters():
@@ -336,6 +442,102 @@ def test_deal_filter_spec_accepts_priority_type_owner_pipeline_and_unassigned():
 def test_merge_deal_filter_dicts_ignores_blank_values():
     merged = _merge_deal_filter_dicts({"priority": "high", "deal_type": " "}, {"deal_type": "New Business"})
     assert merged == {"priority": "high", "deal_type": "New Business"}
+
+
+def test_claude_filter_aliases_normalize_to_supported_dealfilterspec():
+    spec = DealFilterSpec.model_validate({
+        "stage_status": "open",
+        "sort": "amount_desc",
+        "limit": 5,
+        "visualization": "bar",
+    })
+
+    assert spec.status == "open"
+    assert spec.sort == DealSort(property="amount", direction="desc")
+    assert spec.limit == 5
+
+
+def test_chart_output_metadata_is_ignored_by_deal_filter_validation():
+    spec = DealFilterSpec.model_validate({
+        "status": "open",
+        "output": "bar_chart",
+        "sort": {"property": "amount", "direction": "desc"},
+        "limit": 3,
+    })
+
+    assert spec.status == "open"
+    assert spec.sort == DealSort(property="amount", direction="desc")
+    assert spec.limit == 3
+
+
+async def test_normal_queries_remain_non_chart_and_chart_requests_render_chart_data():
+    deals = [
+        deal("deal-1", "Alpha", "open", amount="90000"),
+        deal("deal-2", "Beta", "open", amount="20000"),
+    ]
+    operations = CRMOperations(QueryTools(deals), action_safety=None)  # type: ignore[arg-type]
+
+    normal = await operations._answer_deal_list(  # noqa: SLF001
+        request("Show me the top 2 highest-value open deals"),
+        "open_deals",
+        ["name", "amount"],
+        DealFilterSpec(status="open", sort=DealSort(property="amount", direction="desc"), limit=2),
+    )
+    assert normal.result is not None
+    assert normal.result["kind"] == "crm_records"
+
+    chart = await operations._answer_deal_list(  # noqa: SLF001
+        request("Show me the top 2 highest-value open deals as a chart"),
+        "open_deals",
+        ["name", "amount"],
+        DealFilterSpec(status="open", sort=DealSort(property="amount", direction="desc"), limit=2),
+        chart_requested=True,
+    )
+    assert chart.result is not None
+    assert chart.result["kind"] == "deal_chart"
+    assert chart.result["chart_url"]
+
+
+@pytest.mark.parametrize("chart_type", ["bar", "line"])
+async def test_top_open_deals_chart_queries_accept_claude_legacy_filter_shapes(chart_type: str):
+    deals = [
+        deal("deal-2", "Beta", "open", amount="20000"),
+        deal("deal-1", "Alpha", "open", amount="90000"),
+        deal("deal-3", "Gamma", "won", amount="100000"),
+    ]
+    operations = CRMOperations(QueryTools(deals), action_safety=None)  # type: ignore[arg-type]
+
+    response = await operations._answer_deal_list(  # noqa: SLF001
+        request(f"Show me the top 5 highest-value open deals as a {chart_type} chart"),
+        "open_deals",
+        deal_filter=DealFilterSpec.model_validate({
+            "stage_status": "open",
+            "sort": "amount_desc",
+            "limit": 5,
+            "visualization": chart_type,
+        }),
+    )
+
+    assert response.status == "ok"
+    assert response.result is not None
+    assert response.result["kind"] == "deal_chart"
+    assert response.result["chart_url"]
+    assert "Top 2 deals by value" in str(response.result["chart_title"]) or "Top 2" in str(response.result["chart_title"])
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Show me the sales pipeline as a funnel chart", "funnel"),
+        ("Show me the pipeline chart", "funnel"),
+    ],
+)
+def test_pipeline_and_funnel_chart_queries_still_respect_existing_pipeline_detection(message: str, expected: str):
+    from app.agent.operations import _chart_request
+
+    chart_request = _chart_request(message)
+    assert chart_request is not None
+    assert chart_request[0] == expected
 
 
 async def test_invalid_priority_returns_clear_user_facing_error_response():

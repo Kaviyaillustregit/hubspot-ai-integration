@@ -300,6 +300,21 @@ def render_response_blocks(response: AgentResponse) -> list[Block]:
     else:
         heading = "⚠  *Unable to complete request*"
 
+    chart_url = result.get("chart_url")
+    if isinstance(chart_url, str) and chart_url:
+        title = str(result.get("chart_title") or heading)
+        blocks = [_section(heading), *(_section(chunk) for chunk in _split_text(response.text))]
+        blocks.append({
+            "type": "image",
+            "image_url": chart_url,
+            "alt_text": title,
+        })
+        chart_summary = result.get("chart_summary")
+        if isinstance(chart_summary, str) and chart_summary.strip():
+            blocks.extend(_section(chunk) for chunk in _split_text(chart_summary))
+        blocks.extend(_record_link_blocks(response))
+        return blocks
+
     table = _validated_table(result.get("table"))
     if table is not None:
         return _render_table_response(heading, response.text, table)

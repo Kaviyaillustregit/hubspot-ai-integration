@@ -43,6 +43,7 @@ from app.integrations.errors import IntegrationError
 from app.integrations.hubspot.models import HubSpotCompany, HubSpotContact, HubSpotDeal
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
+from app.services.quickchart import QuickChartService
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,38 @@ _CAPABILITIES_TEXT = (
     "I can create, update, or delete HubSpot contacts and answer questions about "
     "companies and their contacts."
 )
+
+
+def _normalise_chart_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", " ").replace("_", " ")
+    if not text:
+        return None
+    if "pipeline" in text or "funnel" in text:
+        return "funnel"
+    if "doughnut" in text or "donut" in text:
+        return "doughnut"
+    if "pie" in text:
+        return "pie"
+    if "line" in text:
+        return "line"
+    if "bar" in text:
+        return "bar"
+    return None
+
+
+def _infer_chart_type(message: str, *, query: str | None = None) -> str | None:
+    text = message.casefold()
+    if re.search(r"\b(?:sales\s+pipeline|pipeline)\b", text):
+        return "funnel"
+    if re.search(r"\b(?:distribution|breakdown|by\s+stage|stage\s+breakdown|deal\s+mix)\b", text):
+        return "doughnut"
+    if re.search(r"\b(?:trend|over\s+time|by\s+month|month\s+to\s+month|quarter|week)\b", text):
+        return "line"
+    if query in {"open_deals", "closed_deals", "closed_won_deals", "closed_lost_deals", "all_deals"}:
+        return "bar"
+    return None
 
 
 @dataclass(frozen=True)
@@ -551,6 +584,19 @@ class AccountIntelligenceAgent:
         ):
             extraction = extraction.model_copy(
                 update={"query": "closed_won_revenue"}
+            )
+
+        if extraction.intent == "crm_question" and extraction.chart_requested:
+            resolved_query = extraction.query or deal_status_query(request.message)
+            resolved_chart_type = _normalise_chart_type(extraction.chart_type)
+            if resolved_chart_type is None:
+                resolved_chart_type = _infer_chart_type(request.message, query=resolved_query)
+            extraction = extraction.model_copy(
+                update={
+                    "intent": "crm_question",
+                    "query": resolved_query,
+                    "chart_type": resolved_chart_type,
+                }
             )
 
         if extraction.intent == "unsupported":

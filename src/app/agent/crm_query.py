@@ -13,12 +13,13 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.integrations.hubspot.models import HubSpotDeal, HubSpotPipeline, HubSpotPipelineStage
 
 NumericOperator = Literal["gt", "gte", "lt", "lte", "eq", "neq", "between"]
 SortDirection = Literal["asc", "desc"]
+DealStatus = Literal["open", "closed", "closed_won", "closed_lost"]
 
 # Allowlisted deal properties. Anything else is rejected with an explanation.
 NUMERIC_PROPERTIES = frozenset({"amount"})
@@ -34,6 +35,123 @@ _HUBSPOT_OPERATORS = {
     "neq": "NEQ",
 }
 _SYMBOLS = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<=", "eq": "=", "neq": "!="}
+_CANONICAL_DEAL_FILTER_FIELDS = frozenset(
+    {
+        "conditions",
+        "stages",
+        "status",
+        "priority",
+        "deal_type",
+        "owner",
+        "pipeline",
+        "unassigned",
+        "sort",
+        "limit",
+        "unsupported",
+    }
+)
+_CHART_METADATA_KEYS = frozenset(
+    {
+        "output",
+        "visualization",
+        "chart_requested",
+        "chart_type",
+        "chart",
+    }
+)
+_STATUS_ALIASES = {
+    "stage_status": "status",
+    "stage_state": "status",
+    "stage_type": "status",
+}
+
+
+def _normalise_deal_filter_payload(data: object) -> object:
+    """Accept only canonical CRM deal filter keys and normalize known aliases."""
+    if not isinstance(data, dict):
+        return data
+
+    normalised: dict[str, object] = {}
+    has_explicit_status = "status" in data
+    has_explicit_sort = "sort" in data
+    if "sort_by" in data or "sort_order" in data:
+        if not has_explicit_sort:
+            sort_by = data.get("sort_by")
+            sort_order = data.get("sort_order")
+            existing_sort = data.get("sort") if "sort" in data else None
+            if isinstance(existing_sort, dict):
+                normalised["sort"] = dict(existing_sort)
+            elif isinstance(existing_sort, str):
+                normalised["sort"] = existing_sort
+            if sort_by is not None and isinstance(normalised.get("sort"), dict):
+                normalised["sort"]["property"] = str(sort_by)
+            elif sort_by is not None:
+                normalised["sort"] = {"property": str(sort_by)}
+            if sort_order is not None and isinstance(normalised.get("sort"), dict):
+                normalised["sort"]["direction"] = str(sort_order)
+
+    for key, value in data.items():
+        if key in {"sort_by", "sort_order"} and has_explicit_sort:
+            continue
+        if key in _STATUS_ALIASES and has_explicit_status:
+            continue
+        if value is None and key not in _CANONICAL_DEAL_FILTER_FIELDS:
+            continue
+        if key in _CHART_METADATA_KEYS:
+            continue
+
+        canonical_key = _STATUS_ALIASES.get(key, key)
+        if canonical_key not in _CANONICAL_DEAL_FILTER_FIELDS:
+            raise ValueError(
+                f"Unsupported deal filter field '{key}'. Only canonical CRM filter fields are allowed."
+            )
+
+        if canonical_key == "status":
+            if "status" in normalised and value is not None:
+                continue
+            if isinstance(value, str):
+                compact = re.sub(r"[^a-z]", "", value.casefold())
+                if compact in {"open", "stageopen"}:
+                    normalised["status"] = "open"
+                    continue
+                if compact in {"closed", "stageclosed"}:
+                    normalised["status"] = "closed"
+                    continue
+                if compact in {"closedwon", "won"}:
+                    normalised["status"] = "closed_won"
+                    continue
+                if compact in {"closedlost", "lost"}:
+                    normalised["status"] = "closed_lost"
+                    continue
+                if compact in {"all", "any", "total"}:
+                    normalised["status"] = None
+                    continue
+            normalised["status"] = value
+            continue
+
+        normalised[canonical_key] = value
+
+    raw_sort = normalised.get("sort")
+    if isinstance(raw_sort, str):
+        match = re.fullmatch(
+            r"(?P<property>amount|closedate|close_date|close-date|deal_amount|deal-amount)"
+            r"(?:[-_: ])?(?P<direction>asc|desc)",
+            raw_sort.strip(),
+            flags=re.IGNORECASE,
+        )
+        if match:
+            prop = match.group("property").lower().replace("-", "_").replace(" ", "_")
+            normalised["sort"] = {
+                "property": "amount" if prop in {"amount", "deal_amount"} else "closedate",
+                "direction": match.group("direction").lower(),
+            }
+    elif isinstance(raw_sort, dict):
+        property_name = str(raw_sort.get("property") or raw_sort.get("field") or "").strip()
+        direction = str(raw_sort.get("direction") or raw_sort.get("order") or "").strip().lower()
+        if property_name and direction and direction in {"asc", "desc"}:
+            normalised["sort"] = {"property": property_name, "direction": direction}
+
+    return normalised
 
 
 class NumericCondition(BaseModel):
@@ -59,6 +177,7 @@ class DealFilterSpec(BaseModel):
 
     conditions: list[NumericCondition] = Field(default_factory=list, max_length=6)
     stages: list[str] = Field(default_factory=list, max_length=10)
+    status: DealStatus | None = None
     priority: str | None = Field(default=None, max_length=20)
     deal_type: str | None = Field(default=None, max_length=50)
     owner: str | None = Field(default=None, max_length=200)
@@ -68,6 +187,12 @@ class DealFilterSpec(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=100)
     # Conditions the interpreter could not express; the request is refused, never trimmed.
     unsupported: list[str] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_non_crm_metadata(cls, data: object) -> object:
+        """Normalize allowed CRM filter aliases and reject unsupported raw AI metadata."""
+        return _normalise_deal_filter_payload(data)
 
 
 class DealFilterError(Exception):
@@ -463,6 +588,40 @@ _WRITE_VERBS = re.compile(
     r"\b(?:create|add|update|set|change|delete|remove|associate|link)\b", re.IGNORECASE
 )
 _OR_CONDITIONS = re.compile(r"\b(?:or)\b", re.IGNORECASE)
+_CHART_REQUEST = re.compile(
+    r"\b(?:bar|doughnut|pie|line|funnel)\s+chart\b|"
+    r"\b(?:as|in)\s+(?:a|an)?\s*(?:bar|doughnut|pie|line|funnel)\s+chart\b|"
+    r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|doughnut|pie|line|funnel|chart)\s*(?:chart)?\b|"
+    r"\b(?:as|in)\s+(?:a|an)?\s*chart\b|"
+    r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*chart\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_visualisation_noise(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(
+        r"^\s*(?:sales\s+)?pipeline\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|line|pie|doughnut|donut|funnel|chart|graph|visualization|visualisation)\s*(?:chart|graph)?\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|line|pie|doughnut|donut|funnel|chart|graph|visualization|visualisation)\s*(?:chart|graph)?\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+\b(?:pipeline)\b\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(?:the|a|an|as|in)\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+(?:chart|graph|visualization|visualisation)\s*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def _operator_name(match: re.Match[str]) -> str:
@@ -483,6 +642,8 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
 
     Returns None when the message is not a deal read request or has no recognisable filter.
     """
+    if _CHART_REQUEST.search(message):
+        return None
     if not _DEAL_WORDS.search(message) or _WRITE_VERBS.search(message):
         return None
     if not _READ_VERBS.search(message):
@@ -541,17 +702,24 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
     )
     for pattern in stage_patterns:
         for match in pattern.finditer(message):
+            if re.search(r"\bpipeline\b", match.group(0), flags=re.IGNORECASE):
+                continue
             name = (match.group("name") or "").strip()
             if not name:
                 continue
             name = re.sub(r"\s+(?:stage|stages)\s*$", "", name, flags=re.IGNORECASE)
-            name = re.sub(r"^(?:the|a|an)\s+", "", name, flags=re.IGNORECASE)
+            name = _strip_visualisation_noise(name)
+            name = re.sub(r"^(?:the|a|an|as|in)\s+", "", name, flags=re.IGNORECASE)
             name = re.split(r"\s+(?:and|with|where|that|for|or|but)\b", name, maxsplit=1)[0].strip()
             if not name:
                 continue
             if re.match(r"^(?:and|with|where|that|for|or|but)\b", name, re.IGNORECASE):
                 continue
             if re.fullmatch(r"(?:all|every|open|closed|won|lost|deal|deals|opportunity|opportunities|pipeline)", name, re.IGNORECASE):
+                continue
+            if re.search(r"\bpipeline\b", name, flags=re.IGNORECASE):
+                continue
+            if re.search(r"\b(?:chart|graph|visualization|visualisation)\b", name, flags=re.IGNORECASE):
                 continue
             if name.casefold() in {"open", "closed", "won", "lost", "high", "medium", "low", "new business", "existing business"}:
                 continue
@@ -570,7 +738,7 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
             re.IGNORECASE,
         )
         pipeline_match = re.search(
-            r"\b(?:pipeline|in\s+pipeline)\b.*?(?:named\s+)?([A-Za-z0-9][A-Za-z0-9 _-]{1,80})",
+            r"\b(?:in|for|at|on|with)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+pipeline\b",
             message,
             re.IGNORECASE,
         )
@@ -601,10 +769,14 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
         re.IGNORECASE,
     )
     pipeline_match = re.search(
-        r"\b(?:pipeline|in\s+pipeline)\b.*?(?:named\s+)?([A-Za-z0-9][A-Za-z0-9 _-]{1,80})",
+        r"\b(?:in|for|at|on|with)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+pipeline\b",
         message,
         re.IGNORECASE,
     )
+    pipeline_name = None
+    if pipeline_match:
+        pipeline_name = _strip_visualisation_noise((pipeline_match.group("name") or "").strip())
+        pipeline_name = re.sub(r"\s+\b(?:sales\s+pipeline|pipeline)\b\s*$", "", pipeline_name, flags=re.IGNORECASE).strip()
     owner_match = re.search(
         r"\b(?:owner|assigned\s+to|owned\s+by)\b\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z' .-]{1,80})",
         message,
@@ -626,7 +798,7 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
         priority=(priority_value.group(1).lower() if priority_match and priority_value else None),
         deal_type=(deal_type_value.group(0) if deal_type_match and deal_type_value else None),
         owner=(owner_match.group(1).strip() if owner_match else None),
-        pipeline=(pipeline_match.group(1).strip() if pipeline_match else None),
+        pipeline=(pipeline_name if pipeline_name else None),
         unassigned=unassigned,
         sort=sort,
         limit=limit,

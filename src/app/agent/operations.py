@@ -48,6 +48,7 @@ from app.integrations.hubspot.models import (
 )
 from app.services.action_safety import ActionSafetyService, ConfirmedAction
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
+from app.services.quickchart import QuickChartService
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,60 @@ def _merge_deal_filter_dicts(*raw: dict[str, object] | None) -> dict[str, object
             merged["stages"] = list(dict.fromkeys(cleaned))
 
     return merged or None
+
+
+def _chart_request(message: str) -> tuple[str | None, int] | None:
+    chart_match = re.search(
+        r"\b(?:bar|doughnut|pie|line|funnel)\s+chart\b|"
+        r"\b(?:as|in)\s+(?:a|an)?\s*(bar|doughnut|pie|line|funnel)\s+chart\b|"
+        r"\b(?:sales\s+pipeline|pipeline)\s+chart\b",
+        message,
+        re.IGNORECASE,
+    )
+    if chart_match is None:
+        return None
+
+    candidate_groups = []
+    for index in (1, 2):
+        try:
+            value = chart_match.group(index)
+        except IndexError:
+            continue
+        if value is not None:
+            candidate_groups.append(value)
+    candidate_groups.append(chart_match.group(0))
+    raw_type = next((group for group in candidate_groups if group is not None), "")
+    chart_type = re.search(r"(bar|doughnut|pie|line|funnel|pipeline)", raw_type, re.IGNORECASE)
+    chart_name = (chart_type.group(1) if chart_type else raw_type).lower()
+    if chart_name in {"pipeline", "sales pipeline"}:
+        chart_name = "funnel"
+    if chart_name not in {"bar", "doughnut", "pie", "line", "funnel"}:
+        chart_name = "bar"
+    top_match = re.search(r"\btop\s+(\d+)\b", message, re.IGNORECASE)
+    limit = min(int(top_match.group(1)), 10) if top_match else 5
+    return chart_name, limit
+
+
+def _is_stage_distribution_request(message: str) -> bool:
+    text = message.casefold()
+    if not re.search(r"\b(?:distribution|breakdown|by\s+stage|stage\s+breakdown|deal\s+mix)\b", text):
+        return False
+    if not re.search(r"\b(?:open|closed|all)\s+deals?\b|\b(?:deals?)\b.*\bby\s+stage\b", text):
+        return False
+    return True
+
+
+def _infer_stage_chart_type(message: str, *, explicit: str | None = None) -> str | None:
+    if explicit is not None:
+        return explicit
+    text = message.casefold()
+    if re.search(r"\b(?:sales\s+pipeline|pipeline)\b", text):
+        return "funnel"
+    if re.search(r"\b(?:distribution|breakdown|deal\s+mix|by\s+stage)\b", text):
+        return "doughnut"
+    if re.search(r"\b(?:trend|over\s+time|by\s+month|month\s+to\s+month|quarter|week)\b", text):
+        return "line"
+    return None
 
 
 _DEAL_OWNER_REQUEST_PATTERN = re.compile(
@@ -206,7 +261,12 @@ class CRMOperations:
         try:
             if extraction.intent == "crm_question" and extraction.query is not None:
                 return await self._answer_query(
-                    request, extraction.query, validated, extraction.deal_filter
+                    request,
+                    extraction.query,
+                    validated,
+                    extraction.deal_filter,
+                    chart_requested=extraction.chart_requested,
+                    chart_type=extraction.chart_type,
                 )
             if extraction.intent == "delete_company":
                 return await self._propose_company_delete(request, validated)
@@ -900,13 +960,22 @@ class CRMOperations:
         query: CRMQueryName,
         validated: ValidatedExtraction,
         deal_filter: dict[str, object] | DealFilterSpec | None = None,
+        *,
+        chart_requested: bool = False,
+        chart_type: str | None = None,
     ) -> AgentResponse:
         # Convert dict to DealFilterSpec if needed; blank extraction values are ignored so
         # they cannot override a valid local parse or explicit value in the same request.
         if isinstance(deal_filter, dict):
             deal_filter = _merge_deal_filter_dicts(deal_filter)
             if deal_filter is not None:
-                deal_filter = DealFilterSpec(**deal_filter)
+                try:
+                    deal_filter = DealFilterSpec.model_validate(deal_filter)
+                except ValueError as exc:
+                    raise DealFilterError(
+                        "I couldn't understand the deal filter metadata in that request. "
+                        "Please simplify the filters or ask in plain language."
+                    ) from exc
             else:
                 deal_filter = None
         tenant_id = request.tenant_id
@@ -1145,7 +1214,12 @@ class CRMOperations:
                 "all_deals",
             }:
                 return await self._answer_deal_list(
-                    request, query, validated.requested_fields, deal_filter
+                    request,
+                    query,
+                    validated.requested_fields,
+                    deal_filter,
+                    chart_requested=chart_requested,
+                    chart_type=chart_type,
                 )
 
             if query in ("company_contacts", "company_deals"):
@@ -1338,6 +1412,9 @@ class CRMOperations:
         query: CRMQueryName,
         requested_fields: list[str] | None = None,
         deal_filter: DealFilterSpec | None = None,
+        *,
+        chart_requested: bool = False,
+        chart_type: str | None = None,
     ) -> AgentResponse:
         flt: DealFilter | None = None
         user_stage_ids: list[str] = []
@@ -1430,6 +1507,16 @@ class CRMOperations:
         else:
             deals = [deal for deal in all_deals if is_closed(deal) is True and is_lost(deal)]
 
+        if deal_filter is not None and deal_filter.status:
+            if deal_filter.status == "open":
+                deals = [deal for deal in deals if is_closed(deal) is False]
+            elif deal_filter.status == "closed":
+                deals = [deal for deal in deals if is_closed(deal) is True]
+            elif deal_filter.status == "closed_won":
+                deals = [deal for deal in deals if is_closed(deal) is True and is_won(deal)]
+            elif deal_filter.status == "closed_lost":
+                deals = [deal for deal in deals if is_closed(deal) is True and is_lost(deal)]
+
         if flt is not None:
             deals = apply_deal_filter(deals, flt, user_stage_ids, pipeline_ids, owner_ids)
 
@@ -1465,6 +1552,64 @@ class CRMOperations:
             }
 
         rows = await _bounded_map(deals, deal_row)
+
+        chart_request = _chart_request(request.message)
+        chart_url = None
+        chart_title = None
+        chart_summary = None
+        stage_distribution_request = _is_stage_distribution_request(request.message)
+        resolved_chart_type = chart_type or (chart_request[0] if chart_request else None)
+        if chart_requested and not resolved_chart_type:
+            resolved_chart_type = _infer_stage_chart_type(request.message)
+        if not resolved_chart_type and stage_distribution_request:
+            resolved_chart_type = _infer_stage_chart_type(request.message)
+
+        if (chart_requested or chart_request is not None or stage_distribution_request) and deals:
+            stage_labels = {stage.id: stage.label for pipeline in pipelines for stage in pipeline.stages}
+            stage_order = [stage.id for pipeline in pipelines for stage in sorted(pipeline.stages, key=lambda stage: stage.display_order)]
+            if stage_distribution_request:
+                status_label = {
+                    "open_deals": "Open",
+                    "closed_deals": "Closed",
+                    "closed_won_deals": "Closed won",
+                    "closed_lost_deals": "Closed lost",
+                    "all_deals": "All",
+                }.get(query, "Open")
+                chart_title = f"{status_label} deals by stage"
+                chart_url = QuickChartService.stage_distribution_chart(
+                    deals,
+                    title=chart_title,
+                    chart_type=resolved_chart_type,
+                    stage_map=stage_labels,
+                    stage_order=stage_order,
+                )
+                if chart_url is not None:
+                    chart_summary = QuickChartService.stage_distribution_summary(
+                        deals,
+                        stage_map=stage_labels,
+                        stage_order=stage_order,
+                    )
+            else:
+                chart_limit = chart_request[1] if chart_request else min(len(deals), 5)
+                if chart_type is None and chart_request is not None:
+                    resolved_chart_type = chart_request[0]
+                chart_url = QuickChartService.chart_for_deals(
+                    deals,
+                    title=f"Top {min(chart_limit, len(deals))} deals by value",
+                    chart_type=resolved_chart_type,
+                    limit=chart_limit,
+                    pipeline_stage_map=stage_labels,
+                    pipeline_stage_order=stage_order,
+                )
+                chart_title = f"Top {min(chart_limit, len(deals))} deals by value"
+                if resolved_chart_type in {"funnel", "pipeline"}:
+                    chart_title = "Sales pipeline by deal stage"
+                chart_summary = QuickChartService.chart_summary_for_deals(
+                    deals,
+                    chart_type=resolved_chart_type,
+                    pipeline_stage_map=stage_labels,
+                    pipeline_stage_order=stage_order,
+                )
 
         await _add_hubspot_urls(
             self._tools, request.tenant_id, rows, [("deals", deal.id) for deal in deals]
@@ -1507,11 +1652,13 @@ class CRMOperations:
                         f", sorted by {flt.sort_property} "
                         + ("descending" if flt.sort_direction == "desc" else "ascending")
                     )
+                amount_warning = bool(flt.numeric or flt.sort_property == "amount")
                 summary = (
                     (f"No {status_label} deals match" if not deals else
                      f"Found {len(deals)} {status_label} deal{'s' if len(deals) != 1 else ''}"
                      " matching")
-                    + f" ({applied}). Deals without a valid amount are excluded."
+                    + f" ({applied})"
+                    + (". Deals without a valid amount are excluded." if amount_warning else ".")
                 )
 
         deal_columns = _columns_for_request(_deal_columns(), requested_fields or [])
@@ -1521,24 +1668,32 @@ class CRMOperations:
                     if key in requested_fields and not row.get(key):
                         row[key] = "—"
 
+        result: dict[str, object] = {
+            "kind": "crm_records",
+            "title": title,
+            "message": summary,
+            "table": {
+                "columns": [
+                    {"key": key, "label": label}
+                    for key, label in deal_columns
+                ]
+                + [{"key": "view_url", "label": "View in HubSpot"}],
+                "rows": rows,
+            },
+        }
+        if chart_url is not None:
+            result["kind"] = "deal_chart"
+            result["chart_url"] = chart_url
+            result["chart_title"] = chart_title or title
+            if chart_summary is not None:
+                result["chart_summary"] = chart_summary
+
         return AgentResponse(
             status="ok",
             text=summary,
             request_id=request.request_id,
             tools_used=["deal_pipelines", "list_all_deals", "associated_records"],
-            result={
-                "kind": "crm_records",
-                "title": title,
-                "message": summary,
-                "table": {
-                    "columns": [
-                        {"key": key, "label": label}
-                        for key, label in deal_columns
-                    ]
-                    + [{"key": "view_url", "label": "View in HubSpot"}],
-                    "rows": rows,
-                },
-            },
+            result=result,
         )
 
     async def _answer_closed_won_revenue(self, request: AgentRequest) -> AgentResponse:

@@ -12,14 +12,22 @@ class SlackWebApiClient(SlackClient):
         self._settings = settings
         self._client = client
 
-    async def post_message(self, channel: str, text: str) -> None:
+    async def post_message(
+        self,
+        channel: str,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> None:
         if not self._settings.slack_bot_token:
             raise IntegrationError("Slack bot token is not configured")
+        payload: dict[str, Any] = {"channel": channel, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
         try:
             if self._client is not None:
                 response = await self._client.post(
                     "https://slack.com/api/chat.postMessage",
-                    json={"channel": channel, "text": text},
+                    json=payload,
                     headers={"Authorization": f"Bearer {self._settings.slack_bot_token}"},
                 )
             else:
@@ -28,7 +36,7 @@ class SlackWebApiClient(SlackClient):
                 ) as client:
                     response = await client.post(
                         "https://slack.com/api/chat.postMessage",
-                        json={"channel": channel, "text": text},
+                        json=payload,
                         headers={"Authorization": f"Bearer {self._settings.slack_bot_token}"},
                     )
         except httpx.TimeoutException as exc:

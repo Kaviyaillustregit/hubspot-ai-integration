@@ -6,7 +6,12 @@ class SlackClient(ABC):
     """Business-facing Slack contract; signing and transport remain adapter concerns."""
 
     @abstractmethod
-    async def post_message(self, channel: str, text: str) -> None: ...
+    async def post_message(
+        self,
+        channel: str,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> None: ...
 
     @abstractmethod
     async def publish_home_view(self, user_id: str, view: dict[str, Any]) -> None: ...

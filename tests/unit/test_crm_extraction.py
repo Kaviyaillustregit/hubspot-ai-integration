@@ -122,6 +122,30 @@ def test_extraction_schema_rejects_unknown_fields_and_intents():
         )
 
 
+def test_chart_intent_is_normalized_separately_from_crm_filters():
+    legacy = CRMIntentExtraction.model_validate({
+        "intent": "crm_question",
+        "query": "open_deals",
+        "confidence": 0.9,
+        "output": "bar_chart",
+    })
+
+    assert legacy.chart_requested is True
+    assert legacy.chart_type == "bar"
+    assert legacy.deal_filter is None
+
+    explicit = CRMIntentExtraction.model_validate({
+        "intent": "crm_question",
+        "query": "open_deals",
+        "confidence": 0.9,
+        "chart_requested": True,
+        "chart_type": "doughnut",
+    })
+
+    assert explicit.chart_requested is True
+    assert explicit.chart_type == "doughnut"
+
+
 @pytest.mark.parametrize(
     ("name", "normalized"),
     [
