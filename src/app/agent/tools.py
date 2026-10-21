@@ -21,6 +21,8 @@ from app.services.hubspot_associations import HubSpotAssociationsService
 from app.services.hubspot_companies import HubSpotCompaniesService
 from app.services.hubspot_contacts import HubSpotContactsService
 from app.services.hubspot_deals import HubSpotDealsService
+from app.services.hubspot_properties import HubSpotPropertiesService
+from app.services.hubspot_owners import HubSpotOwnersService
 
 COMPANY_PROPERTIES = (
     "name",
@@ -64,6 +66,7 @@ DEAL_PROPERTIES = (
     "dealstage",
     "pipeline",
     "closedate",
+    "createdate",
     "hs_probability",
     "hs_deal_stage_probability",
     "hubspot_owner_id",
@@ -74,6 +77,7 @@ DEAL_ANALYSIS_PROPERTIES = (*DEAL_PROPERTIES, "notes_last_updated")
 DEAL_FOLLOW_UP_PROPERTIES = (*DEAL_PROPERTIES, "notes_last_updated")
 DEAL_LIST_PROPERTIES = (
     *DEAL_PROPERTIES,
+    "deal_currency_code",
     "hs_probability",
     "hs_deal_stage_probability",
     "hubspot_owner_id",
@@ -197,11 +201,17 @@ class HubSpotToolRegistry:
         contacts: HubSpotContactsService,
         deals: HubSpotDealsService | None = None,
         associations: HubSpotAssociationsService | None = None,
+        max_read_pages: int = 100,
+        properties: HubSpotPropertiesService | None = None,
+        owners: HubSpotOwnersService | None = None,
     ) -> None:
         self._companies = companies
         self._contacts = contacts
         self._deals_service = deals
         self._associations_service = associations
+        self._max_read_pages = max_read_pages
+        self._properties_service = properties
+        self._owners_service = owners
 
     @property
     def _deals(self) -> HubSpotDealsService:
@@ -272,7 +282,7 @@ class HubSpotToolRegistry:
         records: list[HubSpotCompany] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(self._max_read_pages):
             if after is None:
                 page = await self._companies.search_companies(
                     self._context(tenant_id),
@@ -295,12 +305,13 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot company search repeated a pagination cursor")
             seen.add(page.next_after)
             after = page.next_after
+        raise IntegrationError("HubSpot company search exceeded the configured page limit")
 
     async def _search_contacts(self, tenant_id: str, query: str) -> list[HubSpotContact]:
         records: list[HubSpotContact] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(self._max_read_pages):
             if after is None:
                 page = await self._contacts.search_contacts(
                     self._context(tenant_id),
@@ -323,17 +334,20 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot contact search repeated a pagination cursor")
             seen.add(page.next_after)
             after = page.next_after
+        raise IntegrationError("HubSpot contact search exceeded the configured page limit")
 
-    async def list_all_companies(self, tenant_id: str) -> list[HubSpotCompany]:
+    async def list_all_companies(
+        self, tenant_id: str, *, properties: Sequence[str] = COMPANY_PROPERTIES
+    ) -> list[HubSpotCompany]:
         records: list[HubSpotCompany] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(self._max_read_pages):
             page = await self._companies.list_companies(
                 self._context(tenant_id),
                 limit=100,
                 after=after,
-                properties=COMPANY_PROPERTIES,
+                properties=properties,
             )
             records.extend(page.results)
             if page.next_after is None:
@@ -342,17 +356,20 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot company listing repeated a pagination cursor")
             seen.add(page.next_after)
             after = page.next_after
+        raise IntegrationError("HubSpot company listing exceeded the configured page limit")
 
-    async def list_all_contacts(self, tenant_id: str) -> list[HubSpotContact]:
+    async def list_all_contacts(
+        self, tenant_id: str, *, properties: Sequence[str] = CONTACT_PROPERTIES
+    ) -> list[HubSpotContact]:
         records: list[HubSpotContact] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(self._max_read_pages):
             page = await self._contacts.list_contacts(
                 self._context(tenant_id),
                 limit=100,
                 after=after,
-                properties=CONTACT_PROPERTIES,
+                properties=properties,
             )
             records.extend(page.results)
             if page.next_after is None:
@@ -361,6 +378,7 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot contact listing repeated a pagination cursor")
             seen.add(page.next_after)
             after = page.next_after
+        raise IntegrationError("HubSpot contact listing exceeded the configured page limit")
 
     async def list_contacts_limited(
         self, tenant_id: str, limit: int
@@ -369,7 +387,7 @@ class HubSpotToolRegistry:
         records: list[HubSpotContact] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(min(self._max_read_pages, (limit + 99) // 100 + 1)):
             page = await self._contacts.list_contacts(
                 self._context(tenant_id),
                 limit=min(100, limit - len(records)),
@@ -385,6 +403,7 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot contact listing repeated a pagination cursor")
             seen.add(page.next_after)
             after = page.next_after
+        return records[:limit], after is not None
 
     async def contact_company_associations(
         self, tenant_id: str, contact_id: str
@@ -519,6 +538,24 @@ class HubSpotToolRegistry:
             )
 
         match = _resolve_text_match(list(candidates.values()), query, contact_name)
+        if match[0] == "not_found":
+            # HubSpot search can omit a record present in the tenant's paged contact list.
+            # Use that authorized read path only when search returned no confident match.
+            try:
+                listed = await self.list_all_contacts(
+                    tenant_id, properties=["firstname", "lastname"]
+                )
+            except IntegrationError:
+                listed = []
+            listed_candidates = {item.id: item for item in listed}
+            exact_matches = _exact_text_matches(
+                list(listed_candidates.values()), query, contact_name
+            )
+            if len(exact_matches) > 1:
+                return ContactResolution("ambiguous")
+            if exact_matches:
+                return ContactResolution("found", exact_matches[0])
+            match = _resolve_text_match(list(listed_candidates.values()), query, contact_name)
         return ContactResolution(*match)
 
     async def resolve_deal(self, tenant_id: str, name: str) -> DealResolution:
@@ -549,7 +586,7 @@ class HubSpotToolRegistry:
         records: list[HubSpotDeal] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(self._max_read_pages):
             if after is None:
                 page = await self._deals.search_deals(
                     self._context(tenant_id),
@@ -572,6 +609,7 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot deal search repeated a pagination cursor")
             seen.add(page.next_after)
             after = page.next_after
+        raise IntegrationError("HubSpot deal search exceeded the configured page limit")
 
     async def search_deals_filtered(
         self,
@@ -586,7 +624,7 @@ class HubSpotToolRegistry:
         records: list[HubSpotDeal] = []
         after: str | None = None
         seen: set[str] = set()
-        for _ in range(100):
+        for _ in range(self._max_read_pages):
             page = await self._deals.search_deals(
                 self._context(tenant_id),
                 query="",
@@ -598,14 +636,21 @@ class HubSpotToolRegistry:
             )
             records.extend(page.results)
             if max_results is not None and len(records) >= max_results:
-                return records[:max_results], page.next_after is not None or len(records) > max_results
+                return (
+                    records[:max_results],
+                    page.next_after is not None or len(records) > max_results,
+                )
             if page.next_after is None:
                 return records, False
             if page.next_after in seen:
-                raise IntegrationError("HubSpot deal search repeated a pagination cursor")
+                raise IntegrationError(
+                    "HubSpot deal search repeated a pagination cursor"
+                )
             seen.add(page.next_after)
             after = page.next_after
-        return records, True
+        if max_results is not None:
+            return records[:max_results], True
+        raise IntegrationError("HubSpot filtered deal search exceeded the configured page limit")
 
     async def get_deal(
         self,
@@ -628,7 +673,7 @@ class HubSpotToolRegistry:
         deals: list[HubSpotDeal] = []
         after: str | None = None
         seen_cursors: set[str] = set()
-        while True:
+        for _ in range(self._max_read_pages):
             page = await self._deals.list_deals(
                 self._context(tenant_id),
                 limit=100,
@@ -642,6 +687,7 @@ class HubSpotToolRegistry:
                 raise IntegrationError("HubSpot deal listing returned a repeated pagination cursor")
             seen_cursors.add(page.next_after)
             after = page.next_after
+        raise IntegrationError("HubSpot deal listing exceeded the configured page limit")
 
     async def create_deal(self, tenant_id: str, properties: dict[str, str]) -> HubSpotDeal:
         return await self._deals.create_deal(self._context(tenant_id), properties=properties)
@@ -655,6 +701,24 @@ class HubSpotToolRegistry:
 
     async def deal_pipelines(self, tenant_id: str) -> list[HubSpotPipeline]:
         return await self._deals.list_pipelines(self._context(tenant_id))
+
+    async def discover_properties(self, tenant_id: str, object_type: str):
+        if self._properties_service is None:
+            raise IntegrationError("HubSpot property discovery is not configured")
+        if object_type not in {"contacts", "companies", "deals"}:
+            raise IntegrationError("Unsupported HubSpot object type")
+        return await self._properties_service.list_properties(
+            self._context(tenant_id), object_type  # type: ignore[arg-type]
+        )
+
+    async def list_owners(self, tenant_id: str):
+        if self._owners_service is None:
+            raise IntegrationError("HubSpot owner lookup is not configured")
+        return await self._owners_service.list_owners(self._context(tenant_id))
+
+    @property
+    def property_discovery_available(self) -> bool:
+        return self._properties_service is not None
 
     async def deal_type_options(self, tenant_id: str) -> list[HubSpotPropertyOption]:
         return await self._deals.get_deal_type_options(self._context(tenant_id))
@@ -735,6 +799,7 @@ class HubSpotToolRegistry:
             "create_deal",
             "update_deal",
             "deal_pipelines",
+            "discover_properties",
             "associate",
             "associated_records",
         )

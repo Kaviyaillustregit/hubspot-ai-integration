@@ -9,6 +9,7 @@ from app.integrations.errors import (
     IntegrationAuthenticationError,
     IntegrationNotFoundError,
     IntegrationPermissionError,
+    IntegrationRateLimitError,
 )
 from app.integrations.hubspot.associations import HubSpotAssociationsClient
 from app.integrations.hubspot.companies import HubSpotCompaniesClient
@@ -36,6 +37,16 @@ class Recorder:
         )
         assert request.headers["Authorization"] == "Bearer access-token"
         return httpx.Response(self.status, json=self.body)
+
+
+class SequencedRecorder:
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self.responses = responses
+        self.calls = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        return self.responses.pop(0)
 
 
 async def call(client_class, recorder: Recorder, method: str, **kwargs):
@@ -169,6 +180,46 @@ async def test_deal_create_search_update_and_pipelines():
     assert pipelines.calls[0][:2] == ("GET", "https://api.hubapi.com/crm/v3/pipelines/deals")
     assert result[0].stages[0].label == "Closed Won"
     assert result[0].stages[0].metadata == {"isClosed": "true", "probability": "1.0"}
+
+
+async def test_safe_hubspot_reads_retry_rate_limits_and_honor_retry_after(monkeypatch):
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("app.integrations.hubspot.http.asyncio.sleep", record_sleep)
+    recorder = SequencedRecorder(
+        [
+            httpx.Response(429, headers={"Retry-After": "0"}, json={"message": "busy"}),
+            httpx.Response(200, json={"id": "1", "properties": {"dealname": "Renewal"}}),
+        ]
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as http:
+        deal = await HubSpotDealsClient(
+            Settings(hubspot_read_retry_attempts=1), http
+        ).get_deal(CONTEXT, "access-token", deal_id="1")
+
+    assert recorder.calls == 2
+    assert sleeps == [0.0]
+    assert deal.id == "1"
+
+
+async def test_hubspot_writes_are_not_retried(monkeypatch):
+    async def unexpected_sleep(seconds: float) -> None:
+        raise AssertionError("write requests must not be retried")
+
+    monkeypatch.setattr("app.integrations.hubspot.http.asyncio.sleep", unexpected_sleep)
+    recorder = SequencedRecorder(
+        [httpx.Response(429, headers={"Retry-After": "0"}, json={"message": "busy"})]
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as http:
+        with pytest.raises(IntegrationRateLimitError):
+            await HubSpotDealsClient(
+                Settings(hubspot_read_retry_attempts=3), http
+            ).create_deal(CONTEXT, "access-token", properties={"dealname": "Renewal"})
+
+    assert recorder.calls == 1
 
 
 async def test_get_deal_requests_and_preserves_last_activity_date():

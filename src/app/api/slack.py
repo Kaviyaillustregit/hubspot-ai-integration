@@ -1,5 +1,6 @@
 import json
 import logging
+from inspect import Parameter, signature
 from time import perf_counter
 from typing import Annotated
 from urllib.parse import parse_qs
@@ -21,6 +22,8 @@ from app.integrations.errors import IntegrationError
 from app.integrations.hubspot.associations import HubSpotAssociationsClient
 from app.integrations.hubspot.deals import HubSpotDealsClient
 from app.integrations.hubspot.oauth import HubSpotOAuthTokenClient
+from app.integrations.hubspot.owners import HubSpotOwnersClient
+from app.integrations.hubspot.properties import HubSpotPropertiesClient
 from app.integrations.slack.client import SlackClient
 from app.integrations.slack.events import (
     SlackRequestVerifier,
@@ -35,11 +38,16 @@ from app.integrations.slack.home import (
     parse_home_interaction,
 )
 from app.integrations.slack.http_client import SlackWebApiClient
+from app.integrations.slack.response_formatting import format_slack_response
+from app.integrations.slack.welcome_banner import build_welcome_banner_url
 from app.repositories.hubspot_oauth import HubSpotOAuthRepository
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_associations import HubSpotAssociationsService
 from app.services.hubspot_contacts import HubSpotAccessTokenProvider
 from app.services.hubspot_deals import HubSpotDealsService
+from app.services.hubspot_owners import HubSpotOwnersService
+from app.services.hubspot_properties import HubSpotPropertiesService
+from app.services.slack_conversation import SlackConversationService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/slack", tags=["slack"])
@@ -76,6 +84,9 @@ def get_agent(request: Request) -> AccountIntelligenceAgent:
         get_contacts_service(request),
         HubSpotDealsService(HubSpotDealsClient(settings), token_provider),
         HubSpotAssociationsService(HubSpotAssociationsClient(settings), token_provider),
+        max_read_pages=settings.hubspot_read_max_pages,
+        properties=HubSpotPropertiesService(HubSpotPropertiesClient(settings), token_provider),
+        owners=HubSpotOwnersService(HubSpotOwnersClient(settings), token_provider),
     )
 
     action_safety = ActionSafetyService(
@@ -98,6 +109,10 @@ def get_slack_client(request: Request) -> SlackClient:
 
 def get_action_safety(request: Request) -> ActionSafetyService:
     return ActionSafetyService(request.app.state.session_factory)
+
+
+def get_conversation_history(request: Request) -> SlackConversationService:
+    return SlackConversationService(request.app.state.session_factory)
 
 
 async def _respond(
@@ -132,25 +147,19 @@ async def _respond(
         return
 
     try:
-        result = response.result or {}
-        if isinstance(result.get("chart_url"), str) and result.get("chart_url"):
-            blocks = [
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": response.text},
-                },
-                {
-                    "type": "image",
-                    "image_url": result["chart_url"],
-                    "alt_text": str(result.get("chart_title") or "Deal chart"),
-                },
-            ]
-            await client.post_message(parsed.channel_id, response.text, blocks=blocks)
-        else:
-            await client.post_message(
-                parsed.channel_id,
-                response.text,
+        formatted = format_slack_response(response, surface="channel")
+        for index, blocks in enumerate(formatted.messages):
+            fallback_text = (
+                formatted.fallback_text
+                if index == 0
+                else "Continued response details."
             )
+            if _post_message_accepts_blocks(client):
+                await client.post_message(parsed.channel_id, fallback_text, blocks=blocks)
+            else:
+                # Keep compatibility with existing injected text-only clients.
+                # The production SlackClient accepts Block Kit payloads.
+                await client.post_message(parsed.channel_id, fallback_text)
     except IntegrationError:
         logger.error(
             "Slack response delivery failed",
@@ -158,17 +167,33 @@ async def _respond(
         )
 
 
+def _post_message_accepts_blocks(client: SlackClient) -> bool:
+    try:
+        parameters = signature(client.post_message).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "blocks" or parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 async def _publish_home(
     client: SlackClient,
     action_safety: ActionSafetyService,
+    conversation_history: SlackConversationService,
     *,
     tenant_id: str,
+    team_id: str,
     user_id: str,
     request_text: str | None = None,
     response: AgentResponse | None = None,
+    history_detail: object | None = None,
+    history_page: int = 0,
     working: bool = False,
     draft: str | None = None,
     timing_label: str | None = None,
+    banner_image_url: str | None = None,
 ) -> None:
     started = perf_counter()
     activity_started = perf_counter()
@@ -182,6 +207,20 @@ async def _publish_home(
     finally:
         _log_timing("slack_home.recent_activity", activity_started, tenant_id)
 
+    history_started = perf_counter()
+    try:
+        history = await conversation_history.latest(
+            tenant_id=tenant_id, team_id=team_id, user_id=user_id, limit=5
+        )
+    except Exception:
+        logger.exception(
+            "Slack Home conversation history lookup failed",
+            extra={"tenant_id": tenant_id},
+        )
+        history = []
+    finally:
+        _log_timing("slack_home.conversation_history", history_started, tenant_id)
+
     build_started = perf_counter()
     view = build_home_view(
         recent=recent,
@@ -190,6 +229,15 @@ async def _publish_home(
         working=working,
         draft=draft,
         recent_unavailable=recent_unavailable,
+        history=history,
+        history_detail=history_detail,
+        history_page=history_page,
+        active_delivery_id=(
+            history[-1].delivery_id
+            if history and history[-1].question == request_text and response is not None
+            else None
+        ),
+        banner_image_url=banner_image_url,
     )
     _log_timing("slack_home.view_build", build_started, tenant_id)
 
@@ -211,28 +259,66 @@ async def _handle_home_interaction(
     agent: AccountIntelligenceAgent,
     client: SlackClient,
     action_safety: ActionSafetyService,
+    conversation_history: SlackConversationService,
     interaction: HomeInteraction,
     tenant_id: str,
     request_id: str,
+    banner_image_url: str | None = None,
 ) -> None:
+    if interaction.kind == "view_full_response":
+        try:
+            exchange = await conversation_history.get_owned(
+                tenant_id=tenant_id,
+                team_id=interaction.team_id,
+                user_id=interaction.user_id,
+                delivery_id=interaction.history_delivery_id,
+            )
+        except Exception:
+            logger.warning(
+                "Slack Home full response lookup failed",
+                extra={"tenant_id": tenant_id},
+            )
+            return
+        if exchange is None:
+            # Do not distinguish missing records from records owned by another user.
+            return
+        await _publish_home(
+            client,
+            action_safety,
+            conversation_history,
+            tenant_id=tenant_id,
+            team_id=interaction.team_id,
+            user_id=interaction.user_id,
+            history_detail=exchange,
+            history_page=interaction.history_page,
+            banner_image_url=banner_image_url,
+        )
+        return
+
     if interaction.kind == "quick_action":
         await _publish_home(
             client,
             action_safety,
+            conversation_history,
             tenant_id=tenant_id,
+            team_id=interaction.team_id,
             user_id=interaction.user_id,
             draft=interaction.template,
-        )
+            banner_image_url=banner_image_url,
+            )
         return
 
     if interaction.kind == "input":
         await _publish_home(
             client,
             action_safety,
+            conversation_history,
             tenant_id=tenant_id,
+            team_id=interaction.team_id,
             user_id=interaction.user_id,
             draft=interaction.text,
-        )
+            banner_image_url=banner_image_url,
+            )
         return
 
     message = (
@@ -249,22 +335,46 @@ async def _handle_home_interaction(
         await _publish_home(
             client,
             action_safety,
+            conversation_history,
             tenant_id=tenant_id,
+            team_id=interaction.team_id,
             user_id=interaction.user_id,
             response=response,
-        )
+            banner_image_url=banner_image_url,
+            )
         return
 
     await _publish_home(
         client,
         action_safety,
+        conversation_history,
         tenant_id=tenant_id,
+        team_id=interaction.team_id,
         user_id=interaction.user_id,
         request_text=message,
         working=True,
         timing_label="loading",
+        banner_image_url=banner_image_url,
     )
     agent_started = perf_counter()
+    conversation_context = None
+    if interaction.kind == "submit":
+        try:
+            prior_turns = await conversation_history.latest(
+                tenant_id=tenant_id,
+                team_id=interaction.team_id,
+                user_id=interaction.user_id,
+                limit=3,
+            )
+            conversation_context = "\n".join(
+                f"User: {turn.question}\nAssistant: {turn.response_text[:400]}"
+                for turn in prior_turns
+            )[-2000:] or None
+        except Exception:
+            logger.warning(
+                "Slack Home conversation context lookup failed",
+                extra={"tenant_id": tenant_id},
+            )
     try:
         response = await agent.respond(
             AgentRequest(
@@ -275,6 +385,7 @@ async def _handle_home_interaction(
                 channel_id=f"apphome:{interaction.user_id}",
                 message_ts=interaction.action_ts or None,
                 event_id=interaction.action_ts or None,
+                conversation_context=conversation_context,
             )
         )
     except Exception:
@@ -289,14 +400,31 @@ async def _handle_home_interaction(
         )
     finally:
         _log_timing("agent.respond", agent_started, tenant_id)
+    if interaction.kind == "submit":
+        try:
+            await conversation_history.save_completed(
+                tenant_id=tenant_id,
+                team_id=interaction.team_id,
+                user_id=interaction.user_id,
+                delivery_id=interaction.action_ts,
+                question=message,
+                response=response,
+            )
+        except Exception:
+            logger.exception(
+                "Slack Home conversation history save failed", extra={"tenant_id": tenant_id}
+            )
     await _publish_home(
         client,
         action_safety,
+        conversation_history,
         tenant_id=tenant_id,
+        team_id=interaction.team_id,
         user_id=interaction.user_id,
         request_text=message,
         response=response,
         timing_label="final",
+        banner_image_url=banner_image_url,
     )
 
 
@@ -307,6 +435,9 @@ async def interactions(
     client: Annotated[SlackClient, Depends(get_slack_client)],
     agent: Annotated[AccountIntelligenceAgent, Depends(get_agent)],
     action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
+    conversation_history: Annotated[
+        SlackConversationService, Depends(get_conversation_history)
+    ],
 ) -> Response:
     """Handle input and actions from the in-Slack App Home conversation."""
     settings = request.app.state.settings
@@ -350,9 +481,11 @@ async def interactions(
         agent,
         client,
         action_safety,
+        conversation_history,
         interaction,
         tenant_id=tenant_id,
         request_id=request.state.request_id,
+        banner_image_url=build_welcome_banner_url(settings.web_app_base_url),
     )
 
     return Response(status_code=200)
@@ -371,6 +504,9 @@ async def events(
         Depends(get_slack_client),
     ],
     action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
+    conversation_history: Annotated[
+        SlackConversationService, Depends(get_conversation_history)
+    ],
 ) -> Response:
     settings = request.app.state.settings
 
@@ -428,9 +564,12 @@ async def events(
             _publish_home,
             client,
             action_safety,
+            conversation_history,
             tenant_id=home_tenant_id,
+            team_id=home_opened.team_id,
             user_id=home_opened.user_id,
-        )
+            banner_image_url=build_welcome_banner_url(settings.web_app_base_url),
+            )
         return Response(status_code=200)
 
     parsed = parse_message(payload)

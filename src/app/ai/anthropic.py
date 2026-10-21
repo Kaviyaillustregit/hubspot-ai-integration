@@ -49,13 +49,15 @@ class AnthropicProvider(AIProvider):
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
-            if (
-                prompt_name in _DEAL_PROMPTS
-                and response.stop_reason == "max_tokens"
-            ):
+            if response.stop_reason in {"max_tokens", "length"}:
+                retry_max_tokens = (
+                    _DEAL_ANALYSIS_RETRY_MAX_TOKENS
+                    if prompt_name in _DEAL_PROMPTS
+                    else max_tokens * 2
+                )
                 response = await client.messages.create(
                     model=self._settings.anthropic_model,
-                    max_tokens=_DEAL_ANALYSIS_RETRY_MAX_TOKENS,
+                    max_tokens=retry_max_tokens,
                     messages=[{"role": "user", "content": prompt}],
                 )
             text = "".join(block.text for block in response.content if block.type == "text")

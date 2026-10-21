@@ -3,6 +3,7 @@ import hmac
 import json
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.agent.schemas import AgentResponse, CRMIntentExtraction
@@ -10,7 +11,12 @@ from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
 from app.ai.service import AIService
 from app.api.app import create_app
-from app.api.slack import get_agent, get_slack_client
+from app.api.slack import (
+    get_action_safety,
+    get_agent,
+    get_conversation_history,
+    get_slack_client,
+)
 from app.core.config import Settings
 from app.integrations.hubspot.models import HubSpotContact
 from app.integrations.slack.events import (
@@ -43,6 +49,17 @@ def event_payload() -> dict[str, object]:
             "text": "Tell me about Test AI Company",
         },
     }
+
+
+def override_unused_event_dependencies(app) -> None:
+    # Signature and URL-verification requests must not construct HubSpot services.
+    for dependency in (
+        get_agent,
+        get_slack_client,
+        get_action_safety,
+        get_conversation_history,
+    ):
+        app.dependency_overrides[dependency] = lambda: None
 
 
 def test_valid_slack_message_routes_server_mapped_tenant_to_agent():
@@ -79,10 +96,54 @@ def test_valid_slack_message_routes_server_mapped_tenant_to_agent():
     }
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Found 1 companies. Showing 1 records.\n*Company name:* Northwind | "
+        "*Industry:* Software | *City:* Not available | "
+        "*Number of employees:* 120 | *View in HubSpot:* "
+        "<https://hubspot.test/co-1|Open in HubSpot>",
+        "Found 1 contacts. Showing 1 records.\n*First name:* Ava | *Email:* Not available | "
+        "*City:* Pune | *View in HubSpot:* <https://hubspot.test/c-1|Open in HubSpot>",
+    ],
+)
+def test_slack_event_delivers_final_batch2_table_text_verbatim(text):
+    received = {}
+
+    class Agent:
+        async def respond(self, request):
+            return AgentResponse(
+                status="ok",
+                text=text,
+                request_id=request.request_id,
+                result={"kind": "crm_intelligence", "table": {"columns": [], "rows": []}},
+            )
+
+    class Client:
+        async def post_message(self, channel, message, blocks=None):
+            received["channel"] = channel
+            received["text"] = message
+
+    app = create_app(
+        Settings(slack_signing_secret="signing", slack_team_tenant_map='{"T1":"tenant-a"}')
+    )
+    app.dependency_overrides[get_agent] = lambda: Agent()
+    app.dependency_overrides[get_slack_client] = lambda: Client()
+    body = json.dumps(event_payload()).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/slack/events", content=body, headers=signed_headers(body, "signing")
+        )
+
+    assert response.status_code == 200
+    assert received == {"channel": "C1", "text": text}
+
+
 def test_invalid_slack_signature_is_rejected_without_agent_routing():
     app = create_app(
         Settings(slack_signing_secret="signing", slack_team_tenant_map='{"T1":"tenant-a"}')
     )
+    override_unused_event_dependencies(app)
     body = json.dumps(event_payload()).encode()
     with TestClient(app) as client:
         response = client.post(
@@ -100,6 +161,7 @@ def test_invalid_slack_signature_is_rejected_without_agent_routing():
 
 def test_url_verification_returns_slack_challenge_after_signature_validation():
     app = create_app(Settings(slack_signing_secret="signing"))
+    override_unused_event_dependencies(app)
     body = json.dumps({"type": "url_verification", "challenge": "challenge-value"}).encode()
     with TestClient(app) as client:
         response = client.post(
@@ -198,6 +260,9 @@ def test_slack_contact_create_request_creates_contact_directly():
         pass
 
     class Contacts:
+        async def get_hubspot_account_id(self, context):
+            return "42"
+
         async def create_contact(self, context, *, properties):
             assert context.tenant_id == "tenant-a"
             created["properties"] = properties

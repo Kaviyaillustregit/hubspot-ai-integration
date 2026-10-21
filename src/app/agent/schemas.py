@@ -11,6 +11,7 @@ class AgentRequest(BaseModel):
     actor_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=3000)
     request_id: str = Field(min_length=1, max_length=128)
+    conversation_context: str | None = Field(default=None, max_length=2000)
     # Source-message identity, used as the idempotency basis for direct CRM writes.
     channel_id: str | None = Field(default=None, max_length=128)
     message_ts: str | None = Field(default=None, max_length=64)
@@ -54,6 +55,7 @@ CRMQueryName = Literal[
     "contact_list",
     "contact_search",
     "contact_deals",
+    "deal_contacts",
     "deal_analysis",
     "deal_follow_up",
     "lead_qualification",

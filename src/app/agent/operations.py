@@ -36,6 +36,8 @@ from app.integrations.errors import (
     IntegrationError,
     IntegrationNotFoundError,
     IntegrationPermissionError,
+    IntegrationRateLimitError,
+    IntegrationTimeoutError,
 )
 from app.integrations.hubspot.associations import CRMObjectType
 from app.integrations.hubspot.models import (
@@ -231,6 +233,23 @@ class CRMOperations:
     def __init__(self, tools: HubSpotToolRegistry, action_safety: ActionSafetyService) -> None:
         self._tools = tools
         self._safety = action_safety
+
+    async def _resolve_owner_labels(self, tenant_id: str, rows: list[dict]) -> None:
+        owner_ids = {
+            str(row.get("owner")) for row in rows
+            if row.get("owner") not in {None, ""}
+        }
+        if not owner_ids or not hasattr(self._tools, "list_owners"):
+            return
+        try:
+            owners = await self._tools.list_owners(tenant_id)
+        except IntegrationError:
+            return
+        labels = {owner.id: owner.display_name for owner in owners}
+        for row in rows:
+            owner_id = row.get("owner")
+            if owner_id not in {None, ""}:
+                row["owner"] = labels.get(str(owner_id), owner_id)
 
     @staticmethod
     def handles(extraction: CRMIntentExtraction, validated: ValidatedExtraction) -> bool:
@@ -986,18 +1005,30 @@ class CRMOperations:
             if query == "company_list":
                 companies = await self._tools.list_all_companies(tenant_id)
 
-                async def company_deals(company: HubSpotCompany) -> tuple[str, str]:
+                async def company_deals(company: HubSpotCompany) -> tuple[str, str, list[dict]]:
                     deals = await self._tools.associated_records(
                         tenant_id,
                         from_type="companies",
                         from_id=company.id,
                         to_type="deals",
                     )
+                    try:
+                        urls = await self._tools.hubspot_record_urls(
+                            tenant_id, [("deals", item.id) for item in deals]
+                        ) if deals else []
+                    except IntegrationError:
+                        urls = []
+                    links = [
+                        {"name": str(item.properties.get("dealname") or item.id), "url": url}
+                        for item, url in zip(deals, urls, strict=False)
+                    ]
                     return company.id, ", ".join(
                         str(deal.properties.get("dealname") or deal.id) for deal in deals
-                    )
+                    ), links
 
-                deal_names = dict(await _bounded_map(companies, company_deals))
+                deal_data = await _bounded_map(companies, company_deals)
+                deal_names = {company_id: names for company_id, names, _ in deal_data}
+                deal_links = {company_id: links for company_id, _, links in deal_data}
                 rows = [
                     {
                         "name": item.properties.get("name") or item.id,
@@ -1012,9 +1043,14 @@ class CRMOperations:
                             item.properties.get("notes_last_contacted")
                         ),
                         "associated_deals": deal_names[item.id],
+                        "associated_deals_links": deal_links[item.id],
                     }
                     for item in companies
                 ]
+                for row in rows:
+                    if not row["associated_deals"]:
+                        row["associated_deals"] = "No associated deals"
+                await self._resolve_owner_labels(tenant_id, rows)
                 await _add_hubspot_urls(
                     self._tools, tenant_id, rows, [("companies", item.id) for item in companies]
                 )
@@ -1033,6 +1069,7 @@ class CRMOperations:
                         ("lead_status", "Lead Status"),
                         ("last_contacted", "Last Contacted"),
                         ("associated_deals", "Associated Deals"),
+                        ("associated_deals_links", "Associated Deal Links"),
                     ],
                     rows,
                     tools=["list_all_companies", "associated_records"],
@@ -1059,10 +1096,21 @@ class CRMOperations:
                         )
                         row["associated_deals"] = ", ".join(
                             str(deal.properties.get("dealname") or deal.id) for deal in deals
-                        )
+                        ) if deals else "No associated deals"
+                        try:
+                            urls = await self._tools.hubspot_record_urls(
+                                tenant_id, [("deals", deal.id) for deal in deals]
+                            ) if deals else []
+                        except IntegrationError:
+                            urls = []
+                        row["associated_deals_links"] = [
+                            {"name": str(deal.properties.get("dealname") or deal.id), "url": url}
+                            for deal, url in zip(deals, urls, strict=False)
+                        ]
                         return row
 
                     company_search_rows = await _bounded_map(companies, company_search_row)
+                    await self._resolve_owner_labels(tenant_id, company_search_rows)
                     await _add_hubspot_urls(
                         self._tools,
                         tenant_id,
@@ -1084,6 +1132,7 @@ class CRMOperations:
                             ("lead_status", "Lead Status"),
                             ("last_contacted", "Last Contacted"),
                             ("associated_deals", "Associated Deals"),
+                            ("associated_deals_links", "Associated Deal Links"),
                         ],
                         company_search_rows,
                         tools=["search_companies", "associated_records"],
@@ -1098,7 +1147,57 @@ class CRMOperations:
                 row = _company_row(record)
                 row["associated_deals"] = ", ".join(
                     str(deal.properties.get("dealname") or deal.id) for deal in associated
-                )
+                ) if associated else "No associated deals"
+                associated_urls = await self._tools.hubspot_record_urls(
+                    tenant_id, [("deals", deal.id) for deal in associated]
+                ) if associated else []
+                row["associated_deals_links"] = [
+                    {"name": str(deal.properties.get("dealname") or deal.id), "url": url}
+                    for deal, url in zip(associated, associated_urls, strict=False)
+                ]
+                detail_columns = [
+                    ("name", "Name"),
+                    ("owner", "Owner"),
+                    ("phone", "Phone"),
+                    ("city", "City"),
+                    ("industry", "Industry"),
+                    ("employees", "Number of Employees"),
+                    ("lifecycle", "Lifecycle Stage"),
+                    ("lead_status", "Lead Status"),
+                    ("last_contacted", "Last Contacted"),
+                    ("associated_deals", "Associated Deals"),
+                    ("associated_deals_links", "Deal links"),
+                ]
+                if re.search(r"\bassociated\s+contacts?\b", request.message, re.I):
+                    associated_contacts = await self._tools.associated_records(
+                        tenant_id,
+                        from_type="companies",
+                        from_id=company.id,
+                        to_type="contacts",
+                    )
+                    contact_urls = await self._tools.hubspot_record_urls(
+                        tenant_id, [("contacts", item.id) for item in associated_contacts]
+                    ) if associated_contacts else []
+                    row["associated_contacts"] = ", ".join(
+                        " ".join(filter(None, (
+                            item.properties.get("firstname"), item.properties.get("lastname")
+                        ))) or item.id
+                        for item in associated_contacts
+                    ) if associated_contacts else "No associated contacts"
+                    row["associated_contacts_links"] = [
+                        {
+                            "name": " ".join(filter(None, (
+                                item.properties.get("firstname"), item.properties.get("lastname")
+                            ))) or item.id,
+                            "url": url,
+                        }
+                        for item, url in zip(associated_contacts, contact_urls, strict=False)
+                    ]
+                    detail_columns.extend([
+                        ("associated_contacts", "Associated Contacts"),
+                        ("associated_contacts_links", "Contact links"),
+                    ])
+                await self._resolve_owner_labels(tenant_id, [row])
                 await _add_hubspot_urls(
                     self._tools, tenant_id, [row], [("companies", company.id)]
                 )
@@ -1106,18 +1205,7 @@ class CRMOperations:
                     request,
                     "Company Details",
                     "Company details from HubSpot.",
-                    [
-                        ("name", "Name"),
-                        ("owner", "Owner"),
-                        ("phone", "Phone"),
-                        ("city", "City"),
-                        ("industry", "Industry"),
-                        ("employees", "Number of Employees"),
-                        ("lifecycle", "Lifecycle Stage"),
-                        ("lead_status", "Lead Status"),
-                        ("last_contacted", "Last Contacted"),
-                        ("associated_deals", "Associated Deals"),
-                    ],
+                    detail_columns,
                     [row],
                     tools=["resolve_company", "get_company", "associated_records"],
                     requested_fields=validated.requested_fields,
@@ -1136,7 +1224,7 @@ class CRMOperations:
                 )
                 async def contact_enrichment(
                     contact: HubSpotContact,
-                ) -> tuple[str, HubSpotRecord | None, str]:
+                ) -> tuple[str, HubSpotRecord | None, str, str | None]:
                     associated_companies, deals = await asyncio.gather(
                         self._tools.associated_records(
                             tenant_id,
@@ -1164,17 +1252,31 @@ class CRMOperations:
                     deal_names = ", ".join(
                         str(deal.properties.get("dealname") or deal.id) for deal in deals
                     )
-                    return contact.id, associated_company, deal_names
+                    company_url = None
+                    if associated_company is not None:
+                        try:
+                            urls = await self._tools.hubspot_record_urls(
+                                tenant_id, [("companies", associated_company.id)]
+                            )
+                            company_url = urls[0] if urls else None
+                        except IntegrationError:
+                            pass
+                    return contact.id, associated_company, deal_names, company_url
 
                 enrichment = await _bounded_map(contacts, contact_enrichment)
                 companies_by_contact = {
                     contact_id: company
-                    for contact_id, company, _ in enrichment
+                    for contact_id, company, _, _ in enrichment
                     if company is not None
                 }
                 deals_by_contact = {
                     contact_id: deal_names
-                    for contact_id, _, deal_names in enrichment
+                    for contact_id, _, deal_names, _ in enrichment
+                }
+                company_urls_by_contact = {
+                    contact_id: company_url
+                    for contact_id, _, _, company_url in enrichment
+                    if company_url
                 }
                 summary = (
                     f"Found {len(contacts)} contacts."
@@ -1189,6 +1291,14 @@ class CRMOperations:
                     )
                     for item in contacts
                 ]
+                for item, row in zip(contacts, rows, strict=True):
+                    company = companies_by_contact.get(item.id)
+                    company_url = company_urls_by_contact.get(item.id)
+                    row["associated_company_links"] = ([{
+                        "name": str(company.properties.get("name") or company.id),
+                        "url": company_url,
+                    }] if company is not None and company_url else [])
+                await self._resolve_owner_labels(tenant_id, rows)
                 await _add_hubspot_urls(
                     self._tools, tenant_id, rows, [("contacts", item.id) for item in contacts]
                 )
@@ -1369,13 +1479,70 @@ class CRMOperations:
                     rows,
                     [("companies", record.id) for record in contact_records],
                 )
+                if query == "contact_company":
+                    company_details = [
+                        f"<{row['view_url']}|{row['name']}>" if row.get("view_url") else row["name"]
+                        for row in rows
+                    ]
+                    summary = (
+                        f"{label} works for " + ", ".join(company_details) + "."
+                        if company_details
+                        else f"I couldn't find a company associated with {label}."
+                    )
                 return _table_response(
                     request,
                     f"Companies for {label}",
-                    f"Found {len(contact_records)} associated companies.",
+                    summary
+                    if query == "contact_company"
+                    else f"Found {len(contact_records)} associated companies.",
                     [("name", "Name")],
                     rows,
                     tools=["resolve_contact", "associated_records"],
+                    requested_fields=validated.requested_fields,
+                )
+
+            if query == "deal_contacts":
+                if not validated.deal_name:
+                    raise OperationError("missing_fields", "Which deal? Please include its name.")
+                deal = await self._resolve_deal(request, validated.deal_name)
+                contacts = await self._tools.associated_records(
+                    tenant_id, from_type="deals", from_id=deal.id, to_type="contacts"
+                )
+                rows = [
+                    {
+                        "name": " ".join(
+                            part for part in (
+                                record.properties.get("firstname"),
+                                record.properties.get("lastname"),
+                            ) if part
+                        ) or record.id,
+                        "email": record.properties.get("email") or "",
+                        "job_title": record.properties.get("jobtitle") or "",
+                    }
+                    for record in contacts
+                ]
+                await _add_hubspot_urls(
+                    self._tools, tenant_id, rows,
+                    [("contacts", record.id) for record in contacts],
+                )
+                contact_details = []
+                for row in rows:
+                    person = row["name"]
+                    if row.get("email"):
+                        person += f" ({row['email']})"
+                    contact_details.append(
+                        f"<{row['view_url']}|{person}>" if row.get("view_url") else person
+                    )
+                summary = (
+                    f"Found {len(contacts)} associated contacts for {validated.deal_name}: "
+                    + (", ".join(contact_details) if contact_details else "none")
+                    + "."
+                )
+                return _table_response(
+                    request, f"Contacts for {validated.deal_name}",
+                    summary,
+                    [("name", "Name"), ("email", "Email"), ("job_title", "Job title")],
+                    rows, tools=["resolve_deal", "associated_records"],
                     requested_fields=validated.requested_fields,
                 )
 
@@ -1388,16 +1555,40 @@ class CRMOperations:
                 tenant_id, from_type="deals", from_id=deal.id, to_type="companies"
             )
             row = _deal_row(deal, await self._stage_labels(tenant_id))
+            owner_id = row.get("owner")
+            if owner_id and hasattr(self._tools, "list_owners"):
+                try:
+                    owners = await self._tools.list_owners(tenant_id)
+                    for owner in owners or []:
+                        owner_value = owner if isinstance(owner, dict) else vars(owner)
+                        found_id = owner_value.get("id") or owner_value.get("owner_id")
+                        if str(found_id) == owner_id:
+                            row["owner"] = str(
+                                owner_value.get("display_name")
+                                or getattr(owner, "display_name", None)
+                                or owner_value.get("name")
+                                or owner_id
+                            )
+                            break
+                except IntegrationError:
+                    # Report the HubSpot owner ID when this grant cannot read owner names.
+                    pass
             if associated_companies:
                 row["company"] = str(
                     associated_companies[0].properties.get("name")
                     or associated_companies[0].id
                 )
             await _add_hubspot_urls(self._tools, tenant_id, [row], [("deals", deal.id)])
+            details_summary = "Deal details from HubSpot."
+            if re.search(r"\bwho\s+owns\b", request.message, re.I):
+                owner = row.get("owner") or "Not assigned"
+                details_summary = f"{row['name']} is owned by {owner}."
+                if row.get("view_url"):
+                    details_summary += f" <{row['view_url']}|Open in HubSpot>"
             return _table_response(
                 request,
                 "Deal Details",
-                "Deal details from HubSpot.",
+                details_summary,
                 _deal_columns(),
                 [row],
                 tools=["resolve_deal", "get_deal", "associated_records"],
@@ -1552,6 +1743,7 @@ class CRMOperations:
             }
 
         rows = await _bounded_map(deals, deal_row)
+        await self._resolve_owner_labels(request.tenant_id, rows)
 
         chart_request = _chart_request(request.message)
         chart_url = None
@@ -2039,6 +2231,16 @@ def _is_closed_won(
 
 
 def _hubspot_failure(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, IntegrationRateLimitError):
+        return (
+            "hubspot_rate_limited",
+            "HubSpot is temporarily rate limiting requests. Please wait briefly and try again.",
+        )
+    if isinstance(exc, IntegrationTimeoutError):
+        return (
+            "hubspot_timeout",
+            "HubSpot did not respond in time. Please try again shortly.",
+        )
     if isinstance(exc, IntegrationPermissionError):
         scope = f" ({exc.scope})" if exc.scope else ""
         return (
@@ -2171,6 +2373,7 @@ def _contact_columns() -> list[tuple[str, str]]:
         ("email", "Email"),
         ("phone", "Phone"),
         ("company", "Associated Company"),
+        ("associated_company_links", "Associated Company Link"),
         ("city", "City"),
         ("state", "State/Region"),
         ("industry", "Industry"),

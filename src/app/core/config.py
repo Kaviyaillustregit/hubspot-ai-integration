@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     database_url: str = DEFAULT_DATABASE_URL
     request_timeout_seconds: float = 15.0
     max_retries: int = 3
+    hubspot_read_retry_attempts: int = Field(default=2, ge=0, le=5)
+    hubspot_read_max_pages: int = Field(default=100, ge=1, le=1000)
     ai_provider: str = "anthropic"
     deal_follow_up_batch_size: int = Field(default=10, ge=1, le=25)
     lead_analysis_limit: int = Field(default=50, ge=1, le=200)
@@ -36,10 +38,12 @@ class Settings(BaseSettings):
         "crm.objects.contacts.read crm.objects.contacts.write "
         "crm.objects.companies.read crm.objects.companies.write "
         "crm.objects.deals.read crm.objects.deals.write "
-        "crm.schemas.deals.read"
+        "crm.schemas.deals.read crm.schemas.contacts.read crm.schemas.companies.read "
+        "crm.objects.owners.read"
     )
     hubspot_token_encryption_key: str | None = None
     hubspot_webhook_secret: str | None = None
+    web_app_base_url: str | None = None
     tavily_api_key: str | None = None
     bright_data_api_key: str | None = None
     slack_signing_secret: str | None = None

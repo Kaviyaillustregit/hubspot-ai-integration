@@ -513,6 +513,24 @@ async def test_find_company_returns_details_card(h, message):
     assert h.safety.claimed == {}
 
 
+async def test_company_details_include_requested_associated_contacts_and_links(h):
+    company_id = h.company("BlueNova Systems")
+    contact_id = h.contact("Mira", "Patel", "mira@bluenova.example")
+    h.crm.links.append(("contacts", contact_id, "companies", company_id))
+
+    result = await h.say(
+        "Show BlueNova Systems with associated contacts",
+        "crm_question", query="company_details", company_name="BlueNova Systems",
+    )
+
+    row = result.result["table"]["rows"][0]
+    assert row["associated_contacts"] == "Mira Patel"
+    assert row["associated_contacts_links"] == [{
+        "name": "Mira Patel",
+        "url": f"https://app.hubspot.com/contacts/42/record/0-1/{contact_id}",
+    }]
+
+
 async def test_update_company_requires_confirmation_then_updates(h):
     company_id = h.company("ABC Technologies")
 
@@ -1649,3 +1667,42 @@ async def test_partial_failure_keeps_cards_for_saved_records(h):
 
     assert result.status == "partial"
     assert [card["kind"] for card in result.cards] == ["company", "contact"]
+
+
+@pytest.mark.asyncio
+async def test_manual_contact_company_question_resolves_and_links_company(h):
+    company_id = h.company("Northwind")
+    contact_id = h.contact("Maria", "Johnson")
+    h.crm.links.append(("contacts", contact_id, "companies", company_id))
+
+    result = await h.say("Which company does Maria Johnson work for?", "crm_question")
+
+    assert result.status == "ok"
+    assert "Northwind" in result.text
+    assert "https://app.hubspot.com/contacts/42/record/0-2/" in result.text
+
+
+@pytest.mark.asyncio
+async def test_manual_deal_contact_question_lists_associated_contact_and_link(h):
+    deal_id = h.deal("enterprise worth Ai deal")
+    contact_id = h.contact("John", "Smith", "john@example.test")
+    h.crm.links.append(("deals", deal_id, "contacts", contact_id))
+
+    result = await h.say(
+        "Who is the contact person for the enterprise worth Ai deal?", "crm_question"
+    )
+
+    assert result.status == "ok"
+    assert "John Smith" in result.text
+    assert "john@example.test" in result.text
+    assert "https://app.hubspot.com/contacts/42/record/0-1/" in result.text
+
+
+@pytest.mark.asyncio
+async def test_manual_deal_owner_question_preserves_owner_id_without_owner_permission(h):
+    h.deal("Cloud Migration Project", hubspot_owner_id="owner-17")
+
+    result = await h.say("Who owns the Cloud Migration Project deal?", "crm_question")
+
+    assert result.status == "ok"
+    assert "owner-17" in result.text

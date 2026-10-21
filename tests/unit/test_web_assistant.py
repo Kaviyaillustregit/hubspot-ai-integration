@@ -187,8 +187,11 @@ def test_static_assets_are_served():
 def test_frontend_only_talks_to_this_backend():
     sources = [
         path.read_text(encoding="utf-8")
-        for path in [STATIC / "index.html", *(STATIC / "static").iterdir()]
-        if path.is_file()
+        for path in [
+            STATIC / "index.html",
+            *(STATIC / "static").glob("*.js"),
+            *(STATIC / "static").glob("*.css"),
+        ]
     ]
 
     for source in sources:

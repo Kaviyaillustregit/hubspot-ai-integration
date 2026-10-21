@@ -69,7 +69,7 @@ class HubSpotAssociationsClient(HubSpotApiClient):
         record_ids: list[str] = []
         after: str | None = None
         seen: set[str] = set()
-        while True:
+        for _ in range(self._settings.hubspot_read_max_pages):
             params: dict[str, str | int] = {"limit": limit}
             if after:
                 params["after"] = after
@@ -92,6 +92,7 @@ class HubSpotAssociationsClient(HubSpotApiClient):
                 raise IntegrationError("HubSpot associations repeated a pagination cursor")
             seen.add(next_after)
             after = next_after
+        raise IntegrationError("HubSpot associations exceeded the configured page limit")
 
     async def read_records(
         self,

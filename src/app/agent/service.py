@@ -3,10 +3,25 @@ import logging
 import re
 from asyncio import Semaphore, gather
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
-from app.agent.crm_query import DealFilterSpec, detect_deal_filter, deal_status_query
+from app.agent.crm_intelligence import (
+    CRMIntelligencePlanner,
+    CRMQueryPlan,
+    _parse_decimal,
+    _parse_hubspot_date,
+    analyze_deals,
+    build_chart_payload,
+    plan_crm_query,
+    unsupported_intelligence_message,
+)
+from app.agent.crm_query import DealFilterSpec, deal_status_query, detect_deal_filter
+from app.agent.crm_query_intelligence import (
+    UnsupportedCRMField,
+    execute_record_query,
+    resolve_catalog_fields,
+)
 from app.agent.extraction import (
     ExtractionValidationError,
     ValidatedExtraction,
@@ -36,26 +51,99 @@ from app.agent.schemas import (
 from app.agent.tools import (
     DEAL_ANALYSIS_PROPERTIES,
     DEAL_FOLLOW_UP_PROPERTIES,
+    DEAL_LIST_PROPERTIES,
     HubSpotToolRegistry,
 )
 from app.ai.service import AIService
-from app.integrations.errors import IntegrationError
+from app.integrations.errors import (
+    IntegrationError,
+    IntegrationPermissionError,
+    IntegrationRateLimitError,
+    IntegrationTimeoutError,
+)
 from app.integrations.hubspot.models import HubSpotCompany, HubSpotContact, HubSpotDeal
+from app.integrations.hubspot.properties import HubSpotPropertyDefinition
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
-from app.services.quickchart import QuickChartService
+from app.services.quickchart import build_chart_config, generate_chart_url
 
 logger = logging.getLogger(__name__)
+
+_STAGE_ANALYTICS_QUERIES = frozenset(
+    {"all_deals", "open_deals", "closed_deals", "closed_won_deals", "closed_lost_deals"}
+)
+_STAGE_ANALYTICS_PATTERN = re.compile(
+    r"\b(?:(?:each|every|per|by)\s+(?:deal\s+)?stages?|group(?:ed)?\s*by"
+    r"|pipeline\s+(?:summary|breakdown)|stage\s+(?:breakdown|comparison|distribution))\b",
+    re.IGNORECASE,
+)
+_DEAL_INTELLIGENCE_PATTERN = re.compile(
+    r"\b(?:deal|deals|opportunit\w*|closing|close|closed|date|dated|quarter|q[1-4]|month|year|"
+    r"latest|newest|oldest|earliest|recent|top|bottom|highest|lowest|group|breakdown|"
+    r"pipeline|stage|owner|amount|value|created|creation|from|between|before|after)\b|"
+    r"\b\d{4}-\d{2}-\d{2}\b",
+    re.IGNORECASE,
+)
 
 _WRITE_INTENTS = frozenset({"create_contact", "update_contact", "delete_contact"}) | (
     OPERATION_INTENTS
 )
 _MIN_WRITE_CONFIDENCE = 0.6
 _CONTACT_IDENTITY_PROPERTIES = frozenset({"firstname", "lastname", "email"})
+_STANDARD_QUERY_PROPERTIES = {
+    "contact": (
+        ("firstname", "First name", "string"),
+        ("lastname", "Last name", "string"),
+        ("email", "Email", "string"),
+        ("phone", "Phone", "string"),
+        ("company", "Company", "string"),
+        ("jobtitle", "Job title", "string"),
+        ("city", "City", "string"),
+        ("state", "State/Region", "string"),
+        ("country", "Country/Region", "string"),
+        ("industry", "Industry", "string"),
+        ("lifecyclestage", "Lifecycle stage", "enumeration"),
+        ("hs_lead_status", "Lead status", "enumeration"),
+        ("createdate", "Create date", "date"),
+        ("lastmodifieddate", "Last modified date", "date"),
+        ("hubspot_owner_id", "HubSpot owner", "number"),
+    ),
+    "company": (
+        ("name", "Company name", "string"),
+        ("domain", "Company domain", "string"),
+        ("industry", "Industry", "string"),
+        ("city", "City", "string"),
+        ("state", "State/Region", "string"),
+        ("country", "Country/Region", "string"),
+        ("phone", "Phone", "string"),
+        ("numberofemployees", "Number of employees", "number"),
+        ("annualrevenue", "Annual revenue", "number"),
+        ("lifecyclestage", "Lifecycle stage", "enumeration"),
+        ("hs_lead_status", "Lead status", "enumeration"),
+        ("createdate", "Create date", "date"),
+        ("lastmodifieddate", "Last modified date", "date"),
+        ("hubspot_owner_id", "HubSpot owner", "number"),
+    ),
+}
 _CAPABILITIES_TEXT = (
     "I can create, update, or delete HubSpot contacts and answer questions about "
     "companies and their contacts."
 )
+
+
+def _requested_association(message: str, object_type: str) -> str | None:
+    text = message.casefold()
+    if object_type == "contact" and re.search(
+        r"\b(?:associated\s+compan(?:y|ies)|company\s+association|contacts?\s+at\s+)",
+        text,
+    ):
+        return "associated_company"
+    if object_type == "company":
+        if re.search(r"\bassociated\s+deals?\b", text):
+            return "associated_deals"
+        if re.search(r"\bassociated\s+contacts?\b", text):
+            return "associated_contacts"
+    return None
 
 
 def _normalise_chart_type(value: str | None) -> str | None:
@@ -83,9 +171,18 @@ def _infer_chart_type(message: str, *, query: str | None = None) -> str | None:
         return "funnel"
     if re.search(r"\b(?:distribution|breakdown|by\s+stage|stage\s+breakdown|deal\s+mix)\b", text):
         return "doughnut"
-    if re.search(r"\b(?:trend|over\s+time|by\s+month|month\s+to\s+month|quarter|week)\b", text):
+    if re.search(
+        r"\b(?:trend|over\s+time|by\s+month|month\s+to\s+month|quarter|week)\b",
+        text,
+    ):
         return "line"
-    if query in {"open_deals", "closed_deals", "closed_won_deals", "closed_lost_deals", "all_deals"}:
+    if query in {
+        "open_deals",
+        "closed_deals",
+        "closed_won_deals",
+        "closed_lost_deals",
+        "all_deals",
+    }:
         return "bar"
     return None
 
@@ -133,6 +230,12 @@ _EXPLICIT_CREATE_PATTERN = re.compile(
     r"(?:create|add|make)\s+(?:(?:a|an)\s+)?(?:new\s+)?"
     r"(?P<entity>company|contact)\b"
     r"(?P<details>.*)",
+    re.IGNORECASE,
+)
+_DEAL_CREATE_REQUEST_PATTERN = re.compile(
+    r"^\s*(?:(?:please\s+)?(?:(?:can|could|would) you\s+)?"
+    r"(?:i want to|i need to|i(?:'d| would) like to)\s+)?"
+    r"(?:create|add|make)\s+(?:(?:a|an|new)\s+)?deal\b",
     re.IGNORECASE,
 )
 _CREATE_NAME_PATTERN = re.compile(
@@ -194,7 +297,7 @@ _ALL_COMPANIES_LIST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ALL_OPEN_DEALS_LIST_PATTERN = re.compile(
-     r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+open\s+(?:deals?|(?:opportunit|oppurtunit)(?:y|ies))\b",
+     r"\b(?:show|list|display|get|view|find)\b.*\b(?:all|every)\s+open\s+(?:deals?|(?:opportunit|oppurtunit)(?:y|ies))\b",  # noqa: E501
     re.IGNORECASE,
 )
 _ALL_DEALS_LIST_PATTERN = re.compile(
@@ -224,6 +327,11 @@ _LEAD_QUALIFICATION_REQUEST_PATTERN = re.compile(
     r"|\bwhich\s+(?:leads?|prospects?)\b.{0,60}\b(?:contact|call|reach|prioriti[sz]e|focus)\b",
     re.IGNORECASE,
 )
+_LEAD_RETRIEVAL_REQUEST_PATTERN = re.compile(
+    r"\b(?:show|list|display|get|find|who\s+are)\b.{0,80}"
+    r"\b(?:our\s+)?(?:leads?|potential\s+customers?|prospects?)\b",
+    re.IGNORECASE,
+)
 _LEAD_CONCURRENCY = 5
 _SLACK_MESSAGE_MAX_LENGTH = 39_000
 
@@ -243,9 +351,739 @@ class AccountIntelligenceAgent:
         self._ai_service = ai_service
         self._action_safety = action_safety
         self._operations = CRMOperations(tools, action_safety)
+        self._crm_planner = CRMIntelligencePlanner(ai_service=ai_service)
         self._deal_follow_up_batch_size = deal_follow_up_batch_size
         self._lead_analysis_limit = lead_analysis_limit
         self._lead_ai_batch_size = lead_ai_batch_size
+
+    @staticmethod
+    def _supports_read_only_crm_intelligence(plan: CRMQueryPlan, message: str) -> bool:
+        if plan.object != "deal" or unsupported_intelligence_message(plan) is not None:
+            return False
+        text = message.casefold()
+        return bool(
+            plan.group_by is not None
+            or plan.aggregations
+            or plan.filters
+            or plan.sort
+            or plan.date_range is not None
+            or "pipeline" in text
+            or "stage" in text
+            or "summary" in text
+            or "group" in text
+            or "quarter" in text
+            or "latest" in text
+            or re.search(
+                r"\b(?:show|list|display|find|get|retrieve)\b.*\b(?:deals?|opportunities)\b"
+                r"|\b(?:all|latest|newest|oldest|earliest|top|bottom)\b.*"
+                r"\b(?:deals?|opportunities)\b"
+                r"|\bwhat\s+(?:are\s+)?(?:all\s+)?(?:the\s+)?"
+                r"(?:deals?|opportunities)\b",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _recover_missing_date_range(plan: CRMQueryPlan, message: str) -> CRMQueryPlan:
+        parsed_date_range = plan_crm_query(message).date_range
+        if parsed_date_range is None:
+            return plan
+        if plan.date_range is not None:
+            # Quarter names denote complete calendar quarters. Some planner responses
+            # encode the final day as an exclusive end, dropping that day at analysis.
+            # Canonicalize only an explicit quarter request; preserve other valid ranges.
+            if re.search(r"\bq[1-4](?:\s+20\d{2})?\b", message, re.IGNORECASE):
+                return plan.model_copy(update={"date_range": parsed_date_range})
+            return plan
+        return plan.model_copy(update={"date_range": parsed_date_range})
+
+    @staticmethod
+    def _is_unsupported_intelligence_request(plan: CRMQueryPlan) -> bool:
+        if plan.object == "deal":
+            return plan.group_by is not None and unsupported_intelligence_message(plan) is not None
+        return plan.chart_requested
+
+    async def _route_crm_intelligence(
+        self,
+        request: AgentRequest,
+        extraction: CRMIntentExtraction,
+    ) -> AgentResponse | None:
+        if extraction.intent != "crm_question":
+            return None
+        non_deal_query = bool(
+            re.search(
+                r"\b(?:contact|contacts|company|companies|leads?|prospects?|potential\s+customers?)\b",
+                request.message,
+                re.I,
+            )
+            and re.search(
+                r"\b(?:show|list|find|get|display|count|how many|who\s+are|group|"
+                r"breakdown|sort|filter)\b",
+                request.message,
+                re.I,
+            )
+        )
+        if extraction.query is not None and not (
+            extraction.query in _STAGE_ANALYTICS_QUERIES
+            and (
+                _STAGE_ANALYTICS_PATTERN.search(request.message)
+                or _DEAL_INTELLIGENCE_PATTERN.search(request.message)
+            )
+        ) and not (
+            non_deal_query
+            and extraction.query
+            in {"company_list", "company_search", "contact_list", "contact_search"}
+        ):
+            return None
+        if (
+            extraction.query is None
+            and not _DEAL_INTELLIGENCE_PATTERN.search(request.message)
+            and not non_deal_query
+        ):
+            return None
+        try:
+            plan = await self._crm_planner.plan(
+                request.message, conversation_context=request.conversation_context
+            )
+        except ValueError:
+            return None
+        plan = self._recover_missing_date_range(plan, request.message)
+        deterministic_plan = plan_crm_query(request.message)
+        if (
+            _LEAD_RETRIEVAL_REQUEST_PATTERN.search(request.message)
+            or re.search(r"\boverdue\b|\bactive\s+pipeline\b", request.message, re.I)
+            or (
+                deterministic_plan.object == "deal"
+                and deterministic_plan.group_by is not None
+                and re.search(
+                    r"\b(?:group|summary|compare|chart|graph|visuali[sz]e?)\b",
+                    request.message,
+                    re.I,
+                )
+            )
+            or (
+                deterministic_plan.object in {"contact", "company"}
+                and (deterministic_plan.group_by is not None or deterministic_plan.chart_requested)
+            )
+            or re.search(
+                r"\btop\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                request.message,
+                re.I,
+            )
+        ):
+            plan = deterministic_plan
+
+        catalog = []
+        if plan.object in {"company", "contact"}:
+            if not getattr(self._tools, "property_discovery_available", False):
+                if plan.group_by or plan.aggregations or plan.chart_requested:
+                    message = unsupported_intelligence_message(plan) or (
+                        "That analysis is not supported yet."
+                    )
+                    return AgentResponse(
+                        status="ok",
+                        text=message,
+                        request_id=request.request_id,
+                        tools_used=[],
+                        result={"kind": "crm_intelligence_unsupported", "plan": plan.model_dump()},
+                    )
+                return None
+            try:
+                return await self._run_generic_crm_query(request, plan)
+            except UnsupportedCRMField as exc:
+                return AgentResponse(
+                    status="ok",
+                    text=str(exc),
+                    request_id=request.request_id,
+                    tools_used=[],
+                    result={"kind": "crm_intelligence_unsupported", "plan": plan.model_dump()},
+                )
+            except IntegrationRateLimitError:
+                return self._safe(
+                    "hubspot_rate_limited",
+                    "HubSpot is temporarily rate limiting requests. "
+                    "Please wait briefly and try again.",
+                    request,
+                )
+            except IntegrationTimeoutError:
+                return self._safe(
+                    "hubspot_timeout",
+                    "HubSpot did not respond in time. Please try again shortly.",
+                    request,
+                )
+            except IntegrationError:
+                logger.exception("CRM query failed", extra={"tenant_id": request.tenant_id})
+                return self._safe(
+                    "unavailable",
+                    "I couldn't retrieve those HubSpot records right now. "
+                    "Check the requested fields or try again shortly.",
+                    request,
+                )
+        if plan.object == "deal" and getattr(self._tools, "property_discovery_available", False):
+            try:
+                catalog = await self._tools.discover_properties(request.tenant_id, "deals")
+                plan = await self._crm_planner.plan(
+                    request.message,
+                    conversation_context=request.conversation_context,
+                    property_catalog=[
+                        {"name": item.name, "label": item.label, "type": item.type}
+                        for item in catalog
+                    ],
+                )
+                plan = self._recover_missing_date_range(plan, request.message)
+                plan = resolve_catalog_fields(plan, catalog)
+            except IntegrationError:
+                # Stage 1's standard-property path remains available for tenants whose
+                # HubSpot grant does not include schema-read permission.
+                catalog = []
+
+        if self._is_unsupported_intelligence_request(plan) and not catalog:
+            message = unsupported_intelligence_message(plan) or (
+                "I can't run that analysis yet. CRM analytics currently cover deals only."
+            )
+            return AgentResponse(
+                status="ok",
+                text=message,
+                request_id=request.request_id,
+                tools_used=[],
+                result={"kind": "crm_intelligence_unsupported", "plan": plan.model_dump()},
+            )
+        if not catalog and not self._supports_read_only_crm_intelligence(plan, request.message):
+            return None
+
+        try:
+            deal_properties = tuple(dict.fromkeys((
+                *DEAL_LIST_PROPERTIES,
+                *plan.properties,
+                *(item.field for item in plan.filters),
+                *(item.field for item in plan.sort),
+                *(item.field for item in plan.aggregations),
+            )))
+            all_deals = await self._tools.list_all_deals(
+                request.tenant_id, properties=deal_properties
+            )
+            pipelines = await self._tools.deal_pipelines(request.tenant_id)
+            analysis, text = analyze_deals(plan, list(all_deals), pipelines, request.message)
+            rows = analysis["rows"]
+            await self._resolve_owner_labels(request.tenant_id, rows)
+            if plan.group_by == "hubspot_owner_id":
+                owner_groups = [
+                    {"hubspot_owner_id": row.get("label")}
+                    for row in rows
+                    if row.get("label") not in {None, "", "Unassigned owner"}
+                ]
+                await self._resolve_owner_labels(request.tenant_id, owner_groups)
+                unresolved_groups = [
+                    item for item in rows
+                    if item.get("label") not in {None, "", "Unassigned owner"}
+                ]
+                for row, owner_group in zip(
+                    unresolved_groups,
+                    owner_groups,
+                    strict=False,
+                ):
+                    previous_label = row.get("label")
+                    resolved_label = owner_group["hubspot_owner_id"]
+                    if previous_label and resolved_label != previous_label:
+                        text = text.replace(f"*{previous_label}*:", f"*{resolved_label}*:")
+                    row["label"] = resolved_label
+                    row["stage"] = row["label"]
+            payload: dict[str, object] = {
+                "kind": "crm_intelligence",
+                "plan": plan.model_dump(),
+                "rows": rows,
+                "summary": analysis["summary"],
+            }
+            if analysis.get("details"):
+                details = analysis["details"]
+                await self._resolve_owner_labels(request.tenant_id, details)
+                try:
+                    detail_urls = await self._tools.hubspot_record_urls(
+                        request.tenant_id,
+                        [("deals", str(row["id"])) for row in details if row.get("id")],
+                    )
+                except Exception:
+                    detail_urls = []
+                for row, url in zip(details, detail_urls, strict=False):
+                    row["view_url"] = url
+                payload["details"] = details
+                payload["details_table"] = {
+                    "columns": [
+                        {"key": key, "label": label}
+                        for key, label in (
+                            ("dealname", "Deal name"),
+                            ("amount", "Amount"),
+                            ("stage", "Deal stage"),
+                            ("closedate", "Closing date"),
+                            ("hubspot_owner_id", "Owner"),
+                            ("view_url", "View in HubSpot"),
+                        )
+                    ],
+                    "rows": details,
+                }
+                text += (
+                    f"\n*Latest deal details* (showing {len(details)} of "
+                    f"{analysis['summary']['matched_records']}):"
+                )
+                for row in details:
+                    amount = row.get("amount")
+                    currency = row.get("deal_currency_code")
+                    amount_text = (
+                        f"{currency} {amount}"
+                        if amount and currency
+                        else (amount or "Not available")
+                    )
+                    close = _parse_hubspot_date(str(row.get("closedate") or ""))
+                    close_text = (
+                        f"{close.strftime('%b')} {close.day}, {close.year}"
+                        if close
+                        else "Not available"
+                    )
+                    link = f" <{row['view_url']}|Open in HubSpot>" if row.get("view_url") else ""
+                    detail = (
+                        f"\n- *{row['dealname']}* - {row['stage']} - "
+                        f"{amount_text} - closes {close_text} - "
+                        f"owner {row.get('hubspot_owner_id') or 'Unassigned'}{link}"
+                    )
+                    if len(text) + len(detail) > _SLACK_MESSAGE_MAX_LENGTH - 80:
+                        text += "\nAdditional deal details omitted to fit Slack's message limit."
+                        break
+                    text += detail
+            grouped = plan.group_by is not None
+            if not grouped and not plan.aggregations and rows:
+                try:
+                    urls = await self._tools.hubspot_record_urls(
+                        request.tenant_id,
+                        [("deals", str(row["id"])) for row in rows if row.get("id")],
+                    )
+                except Exception:
+                    logger.warning(
+                        "HubSpot deal link resolution failed",
+                        extra={"tenant_id": request.tenant_id},
+                    )
+                    urls = []
+                for row, url in zip(rows, urls, strict=False):
+                    row["view_url"] = url
+                property_labels = {
+                    "dealname": "Deal name",
+                    "amount": "Amount",
+                    "dealstage": "Deal stage",
+                    "stage": "Deal stage",
+                    "pipeline": "Pipeline",
+                    "hubspot_owner_id": "Owner ID",
+                    "closedate": "Closing date",
+                    "createdate": "Creation date",
+                }
+                property_labels.update(
+                    {item.name: item.label for item in catalog}
+                )
+                requested = [
+                    "dealname",
+                    *[
+                        "stage" if prop == "dealstage" else prop
+                        for prop in plan.properties
+                        if prop != "dealname"
+                    ],
+                ]
+                columns = [
+                    {"key": key, "label": property_labels[key]}
+                    for key in dict.fromkeys(requested)
+                    if key in property_labels and any(row.get(key) is not None for row in rows)
+                ]
+                if urls:
+                    columns.append({"key": "view_url", "label": "View in HubSpot"})
+                payload["table"] = {"columns": columns, "rows": rows}
+                range_label = plan.date_range.relative if plan.date_range else None
+                if range_label == "this quarter":
+                    start = plan.date_range.start
+                    if start:
+                        start_date = date.fromisoformat(start)
+                        quarter = (start_date.month - 1) // 3 + 1
+                        range_label = f"Q{quarter} {start_date.year}"
+                    heading = f"Deals closing this quarter ({range_label})"
+                elif plan.date_range:
+                    range_start = plan.date_range.start
+                    range_end = plan.date_range.end
+                    if range_start and range_end and date.fromisoformat(range_end) == (
+                        date.fromisoformat(range_start) + timedelta(days=1)
+                    ):
+                        exact_date = date.fromisoformat(range_start)
+                        heading = (
+                            f"Deals closing on {exact_date.strftime('%b')} "
+                            f"{exact_date.day}, {exact_date.year}"
+                        )
+                    elif range_label and re.fullmatch(r"q[1-4] \d{4}", range_label):
+                        heading = f"Deals closing in {range_label.upper()}"
+                    else:
+                        heading = f"Deals closing ({range_label or 'requested date range'})"
+                else:
+                    heading = "Latest deals" if any(
+                        item.field in {"closedate", "createdate"} and item.direction == "desc"
+                        for item in plan.sort
+                    ) else "Deals"
+                text_lines = text.splitlines()
+                text = (
+                    f"*{heading}*: showing {len(rows)} of "
+                    f"{analysis['summary']['matched_records']} deals"
+                )
+                if len(text_lines) > 1:
+                    text += "\n" + "\n".join(text_lines[1:])
+                for row in rows:
+                    amount = row.get("amount")
+                    currency_code = row.get("deal_currency_code")
+                    if amount is not None and currency_code:
+                        row["amount"] = f"{currency_code} {amount}"
+                    for date_key in ("closedate", "createdate"):
+                        raw_date = row.get(date_key)
+                        if raw_date:
+                            parsed = _parse_hubspot_date(
+                                str(raw_date),
+                                plan.date_range.timezone if plan.date_range else "UTC",
+                            )
+                            row[date_key] = (
+                                f"{parsed.strftime('%b')} {parsed.day}, {parsed.year}"
+                                if parsed
+                                else raw_date
+                            )
+                record_links = [
+                    f"<{row['view_url']}|Open>"
+                    for row in rows
+                    if row.get("view_url")
+                ]
+                if record_links:
+                    links_line = "\n*HubSpot records:* " + ", ".join(record_links)
+                    if len(text) + len(links_line) <= _SLACK_MESSAGE_MAX_LENGTH:
+                        text += links_line
+            if plan.chart_requested and rows and grouped:
+                chart = build_chart_payload(plan, rows)
+                payload.update(chart)
+                payload["chart_url"] = generate_chart_url(chart["chart"])
+                payload["chart_title"] = f"Deals by {plan.group_by or 'stage'}"
+                text += "\n_Chart shown below._"
+            elif plan.chart_requested and rows and not grouped and plan.sort:
+                chart_rows = rows[: plan.limit or len(rows)]
+                labels = [str(row.get("dealname") or "Untitled deal") for row in chart_rows]
+                values = [
+                    float(_parse_decimal(str(row.get("amount") or "0").split()[-1]) or 0)
+                    for row in chart_rows
+                ]
+                chart = build_chart_config(
+                    plan.chart_type or "bar", "Top deals by amount", labels, values,
+                    value_label="Deal amount",
+                )
+                payload.update({
+                    "chart": chart,
+                    "chart_type": plan.chart_type or "bar",
+                    "chart_url": generate_chart_url(chart),
+                    "chart_title": "Top deals by amount",
+                })
+                text += "\n_Chart shown below._"
+            return AgentResponse(
+                status="ok",
+                text=text,
+                request_id=request.request_id,
+                tools_used=["list_all_deals", "deal_pipelines"],
+                result=payload,
+            )
+        except ValueError:
+            return self._safe(
+                "hubspot_not_authorized",
+                "HubSpot is not connected for this workspace.",
+                request,
+                ["list_all_deals", "deal_pipelines"],
+            )
+        except IntegrationRateLimitError:
+            logger.warning(
+                "CRM intelligence query rate limited",
+                extra={"tenant_id": request.tenant_id},
+            )
+            return self._safe(
+                "hubspot_rate_limited",
+                "HubSpot is temporarily rate limiting requests. Please wait briefly and try again.",
+                request,
+                ["list_all_deals", "deal_pipelines"],
+            )
+        except IntegrationTimeoutError:
+            logger.warning(
+                "CRM intelligence query timed out",
+                extra={"tenant_id": request.tenant_id},
+            )
+            return self._safe(
+                "hubspot_timeout",
+                "HubSpot did not respond in time. Please try again shortly.",
+                request,
+                ["list_all_deals", "deal_pipelines"],
+            )
+        except UnsupportedCRMField as exc:
+            return AgentResponse(
+                status="ok", text=str(exc), request_id=request.request_id, tools_used=[],
+                result={"kind": "crm_intelligence_unsupported", "plan": plan.model_dump()},
+            )
+        except IntegrationError:
+            logger.exception(
+                "CRM intelligence query failed",
+                extra={"tenant_id": request.tenant_id},
+            )
+            return self._safe(
+                "unavailable",
+                "I couldn't retrieve the CRM summary right now.",
+                request,
+                ["list_all_deals", "deal_pipelines"],
+            )
+
+    async def _run_generic_crm_query(
+        self, request: AgentRequest, initial_plan: CRMQueryPlan
+    ) -> AgentResponse:
+        object_type = {"company": "companies", "contact": "contacts"}[initial_plan.object]
+        metadata_scope = f"crm.schemas.{object_type}.read"
+        metadata_scope_missing = False
+        try:
+            catalog = await self._tools.discover_properties(request.tenant_id, object_type)
+        except IntegrationPermissionError as exc:
+            if exc.scope != metadata_scope:
+                raise
+            metadata_scope_missing = True
+            catalog = [
+                HubSpotPropertyDefinition(name=name, label=label, type=kind)
+                for name, label, kind in _STANDARD_QUERY_PROPERTIES[initial_plan.object]
+            ]
+        catalog_payload = [
+            {
+                "name": item.name,
+                "label": item.label,
+                "type": item.type,
+                "options": item.options,
+            }
+            for item in catalog
+        ]
+        plan = await self._crm_planner.plan(
+            request.message,
+            conversation_context=request.conversation_context,
+            property_catalog=catalog_payload,
+        )
+        # Keep a deterministic initial intent if a follow-up planner returns another object.
+        if plan.object not in {"company", "contact"}:
+            plan = initial_plan
+        if (
+            initial_plan.group_by is not None
+            or initial_plan.aggregations
+            or _LEAD_RETRIEVAL_REQUEST_PATTERN.search(request.message)
+        ):
+            plan = initial_plan.model_copy(update={"properties": plan.properties})
+        plan = _ground_explicit_query_properties(request.message, plan, catalog)
+        association_key = _requested_association(request.message, plan.object)
+        if association_key == "associated_company":
+            plan = plan.model_copy(update={
+                "properties": [
+                    prop for prop in plan.properties
+                    if prop.casefold() not in {"company", "company_name", "associatedcompanyid"}
+                ]
+            })
+        try:
+            plan = resolve_catalog_fields(plan, catalog)
+        except UnsupportedCRMField as exc:
+            if not metadata_scope_missing:
+                raise
+            raise UnsupportedCRMField(
+                f"{exc} HubSpot property metadata permission ({metadata_scope}) is missing, "
+                "so only standard properties can be queried."
+            ) from exc
+        required = list(dict.fromkeys([
+            *plan.properties,
+            *(item.field for item in plan.filters),
+            *(item.field for item in plan.sort),
+            *(item.field for item in plan.aggregations),
+            *(
+                [plan.group_by]
+                if plan.group_by and plan.group_by not in {"month", "quarter", "year"}
+                else []
+            ),
+            *([plan.date_range.field] if plan.date_range else []),
+            "name" if plan.object == "company" else "firstname",
+            "lastname" if plan.object == "contact" else "name",
+        ]))
+        known = {item.name for item in catalog}
+        records = await (
+            self._tools.list_all_companies(
+                request.tenant_id, properties=[field for field in required if field in known]
+            )
+            if plan.object == "company"
+            else self._tools.list_all_contacts(
+                request.tenant_id, properties=[field for field in required if field in known]
+            )
+        )
+        result = execute_record_query(plan, records, catalog)
+        rows = result["rows"]
+        option_labels = {
+            item.name: {option.get("value"): option.get("label") for option in item.options}
+            for item in catalog
+            if item.options
+        }
+        for row in rows:
+            for field, labels in option_labels.items():
+                raw_value = row.get(field)
+                if isinstance(raw_value, str) and raw_value in labels and labels[raw_value]:
+                    row[f"{field}_raw"] = raw_value
+                    row[field] = labels[raw_value]
+        await self._resolve_owner_labels(request.tenant_id, rows)
+        record_type = "companies" if plan.object == "company" else "contacts"
+        association_type = association_key
+        if association_type and rows:
+            target_type = {
+                "associated_company": "companies",
+                "associated_deals": "deals",
+                "associated_contacts": "contacts",
+            }[association_type]
+
+            async def enrich_associations(row: dict) -> None:
+                record_id = str(row.get("id") or "")
+                try:
+                    associated = await self._tools.associated_records(
+                        request.tenant_id,
+                        from_type="contacts" if plan.object == "contact" else "companies",
+                        from_id=record_id,
+                        to_type=target_type,
+                    )
+                    row[association_type] = ", ".join(
+                        str(item.properties.get("name") or item.properties.get(
+                            "dealname" if target_type == "deals" else "firstname"
+                        ) or item.id)
+                        for item in associated
+                    ) if associated else f"No associated {target_type}"
+                    urls = await self._tools.hubspot_record_urls(
+                        request.tenant_id, [(target_type, item.id) for item in associated]
+                    ) if associated else []
+                    row[f"{association_type}_links"] = [
+                        {
+                            "name": str(item.properties.get("name") or item.properties.get(
+                                "dealname" if target_type == "deals" else "firstname"
+                            ) or item.id),
+                            "url": url,
+                        }
+                        for item, url in zip(associated, urls, strict=False)
+                    ]
+                except IntegrationError:
+                    logger.warning(
+                        "CRM association lookup failed",
+                        extra={"tenant_id": request.tenant_id, "record_type": plan.object},
+                    )
+                    row[association_type] = f"Could not verify associated {target_type}"
+                    row[f"{association_type}_links"] = []
+
+            await gather(*(enrich_associations(row) for row in rows))
+            result["columns"].extend([
+                {"key": association_type, "label": {
+                    "associated_company": "Associated company",
+                    "associated_deals": "Associated deals",
+                    "associated_contacts": "Associated contacts",
+                }[association_type]},
+                {"key": f"{association_type}_links", "label": "Association links"},
+            ])
+        if not plan.group_by and not plan.aggregations and rows:
+            urls = await self._tools.hubspot_record_urls(
+                request.tenant_id,
+                [(record_type, str(row["id"])) for row in rows if row.get("id")],
+            )
+            for row, url in zip(rows, urls, strict=False):
+                row["view_url"] = url
+            result["columns"].append({"key": "view_url", "label": "View in HubSpot"})
+        text = (
+            f"Found {result['matched_records']} {record_type}. "
+            f"Showing {result['total']} records."
+        )
+        if result.get("has_more"):
+            text += f" Use offset {result['offset'] + result['total']} to view the next page."
+        text = _format_batch2_slack_table(text, result.get("columns", []), rows)
+        chart_url = None
+        should_chart = bool(
+            result.get("rows")
+            and (
+                plan.chart_requested
+                or (plan.group_by is not None and plan.object in {"contact", "company"})
+            )
+        )
+        if should_chart:
+            chart_rows = result["rows"]
+            value_key = next(
+                (
+                    f"{item.operation}_{item.field}"
+                    for item in plan.aggregations
+                    if item.operation in {"sum", "avg", "min", "max"}
+                ),
+                "count",
+            )
+            labels = [str(row.get("group") or "Unknown") for row in chart_rows]
+            values = []
+            for row in chart_rows:
+                try:
+                    values.append(float(row.get(value_key) or 0))
+                except (TypeError, ValueError):
+                    values.append(0.0)
+            chart_type = plan.chart_type or "bar"
+            chart = build_chart_config(
+                chart_type,
+                f"{record_type.title()} by {plan.group_by or 'requested metric'}",
+                labels,
+                values,
+                value_label=(
+                    "Record count"
+                    if value_key == "count"
+                    else value_key.replace("_", " ").title()
+                ),
+            )
+            chart_url = generate_chart_url(chart)
+            text += "\n_Chart shown below._"
+        payload = {
+            "kind": "crm_intelligence", "plan": plan.model_dump(), "rows": rows,
+            "summary": {
+                "matched_records": result["matched_records"],
+                "returned_records": result["total"],
+            },
+            "table": {"columns": result.get("columns", []), "rows": rows},
+            "pagination": {
+                "offset": result["offset"],
+                "limit": plan.limit,
+                "has_more": result["has_more"],
+            },
+        }
+        if chart_url:
+            payload.update({
+                "chart": chart,
+                "chart_type": plan.chart_type or "bar",
+                "chart_url": chart_url,
+                "chart_title": (
+                    f"{record_type.title()} by {plan.group_by or 'requested metric'}"
+                ),
+            })
+        return AgentResponse(
+            status="ok", text=text, request_id=request.request_id,
+            tools_used=[
+                "standard_properties_fallback" if metadata_scope_missing else "discover_properties",
+                f"list_all_{record_type}",
+                "hubspot_record_urls",
+            ],
+            result=payload,
+        )
+
+    async def _resolve_owner_labels(self, tenant_id: str, rows: list[dict]) -> None:
+        owner_ids = {
+            str(row.get("hubspot_owner_id"))
+            for row in rows
+            if row.get("hubspot_owner_id") not in {None, ""}
+        }
+        if not owner_ids:
+            return
+        try:
+            owners = await self._tools.list_owners(tenant_id)
+        except IntegrationError:
+            # Keep stable owner IDs visible when the tenant has not granted owner-read.
+            return
+        names = {owner.id: owner.display_name for owner in owners}
+        for row in rows:
+            owner_id = row.get("hubspot_owner_id")
+            if owner_id is not None:
+                row["hubspot_owner_id"] = names.get(str(owner_id), owner_id)
+
 
     async def respond(self, request: AgentRequest) -> AgentResponse:
         confirmation_action_id = self._confirmation_action_id(request.message)
@@ -499,10 +1337,90 @@ class AccountIntelligenceAgent:
         ):
             return await self._qualify_leads(request)
 
+        if _LEAD_RETRIEVAL_REQUEST_PATTERN.search(request.message):
+            return await self._respond_to_extraction(
+                request,
+                CRMIntentExtraction(
+                    intent="crm_question", query="contact_list", confidence=1.0,
+                    question=request.message,
+                ),
+            )
+
+        company_for_contact = re.search(
+            r"\bwhich\s+company\s+does\s+(?P<name>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,3})\s+work\s+for\b",
+            request.message,
+            re.I,
+        )
+        if company_for_contact:
+            name_parts = company_for_contact.group("name").split()
+            if len(name_parts) >= 2:
+                return await self._respond_to_extraction(
+                    request,
+                    CRMIntentExtraction(
+                        intent="crm_question", query="contact_company", confidence=1.0,
+                        first_name=name_parts[0], last_name=" ".join(name_parts[1:]),
+                        question=request.message,
+                    ),
+                )
+
+        deal_contacts_match = re.search(
+            r"\b(?:who\s+is\s+the\s+contact\s+person\s+for|which\s+contacts?\s+are\s+associated\s+with)\s+(?P<deal>.+?)\s+deal\b",
+            request.message,
+            re.I,
+        )
+        if deal_contacts_match:
+            return await self._respond_to_extraction(
+                request,
+                CRMIntentExtraction(
+                    intent="crm_question", query="deal_contacts", confidence=1.0,
+                    deal_name=deal_contacts_match.group("deal").strip(),
+                    question=request.message,
+                ),
+            )
+
+        deal_owner_match = re.search(
+            r"\bwho\s+owns\s+(?P<deal>.+?)\s+deal\b", request.message, re.I
+        )
+        if deal_owner_match:
+            return await self._respond_to_extraction(
+                request,
+                CRMIntentExtraction(
+                    intent="crm_question", query="deal_details", confidence=1.0,
+                    deal_name=deal_owner_match.group("deal").strip(),
+                    question=request.message,
+                ),
+            )
+
         extraction = await self._extract_intent(request)
 
         if extraction is None:
             explicit_create = self._explicit_create_extraction(request.message)
+            is_legacy_deal_list = bool(
+                _ALL_DEALS_LIST_PATTERN.search(request.message)
+                or _ALL_OPEN_DEALS_LIST_PATTERN.search(request.message)
+            )
+            if (
+                explicit_create is None
+                and not _DEAL_CREATE_REQUEST_PATTERN.search(request.message)
+                and not is_legacy_deal_list
+            ):
+                try:
+                    fallback_plan = await self._crm_planner.plan(request.message)
+                except ValueError:
+                    fallback_plan = None
+                if fallback_plan is not None and self._supports_read_only_crm_intelligence(
+                    fallback_plan,
+                    request.message,
+                ):
+                    return await self._respond_to_extraction(
+                        request,
+                        CRMIntentExtraction(
+                            intent="crm_question",
+                            confidence=1.0,
+                            question=request.message,
+                        ),
+                    )
+
             if explicit_create is not None:
                 return await self._respond_to_extraction(request, explicit_create)
             query: CRMQueryName
@@ -525,6 +1443,7 @@ class AccountIntelligenceAgent:
                     query=query,
                     confidence=1.0,
                 ),
+                skip_intelligence=True,
             )
 
         explicit_create = self._explicit_create_extraction(request.message)
@@ -575,6 +1494,8 @@ class AccountIntelligenceAgent:
         self,
         request: AgentRequest,
         extraction: CRMIntentExtraction,
+        *,
+        skip_intelligence: bool = False,
     ) -> AgentResponse:
         # The LLM only interprets the message. Which writes run directly and which need
         # confirmation is decided here: create runs directly; update/delete stay pending.
@@ -601,6 +1522,14 @@ class AccountIntelligenceAgent:
 
         if extraction.intent == "unsupported":
             return self._safe("unsupported", _CAPABILITIES_TEXT, request)
+
+        intelligence_response = (
+            None
+            if skip_intelligence
+            else await self._route_crm_intelligence(request, extraction)
+        )
+        if intelligence_response is not None:
+            return intelligence_response
 
         if (
             extraction.intent == "crm_question"
@@ -2070,3 +2999,64 @@ def _slack_value(value: object, max_length: int) -> str:
     if value is None or value == "":
         return "Not provided"
     return str(value).replace("\n", " ")[:max_length]
+
+
+def _ground_explicit_query_properties(
+    message: str,
+    plan: CRMQueryPlan,
+    catalog: list[HubSpotPropertyDefinition],
+) -> CRMQueryPlan:
+    """Retain catalog fields explicitly named by the user when the planner omits them."""
+    positions: dict[str, int] = {}
+    for definition in catalog:
+        starts = [
+            match.start()
+            for label in (definition.label, definition.name)
+            if label
+            if (match := re.search(rf"(?<![\w]){re.escape(label)}(?![\w])", message, re.I))
+        ]
+        if starts:
+            positions[definition.name] = min(starts)
+    properties = list(dict.fromkeys([*plan.properties, *positions]))
+    properties.sort(key=lambda name: positions.get(name, float("inf")))
+    return plan.model_copy(update={"properties": properties})
+
+
+def _format_batch2_slack_table(
+    summary: str,
+    columns: list[dict[str, str]],
+    rows: list[dict],
+    *,
+    max_length: int = 39_000,
+) -> str:
+    """Render the Batch 2 table as compact Slack mrkdwn without dropping columns."""
+    if not rows or not columns:
+        return summary[:max_length]
+
+    lines = [summary]
+    included = 0
+    for row in rows:
+        cells: list[str] = []
+        for column in columns:
+            key = column["key"]
+            label = column["label"]
+            value = row.get(key)
+            if key == "view_url" and value:
+                rendered = f"<{value}|Open in HubSpot>"
+            elif value is None or (isinstance(value, str) and not value.strip()):
+                rendered = "Not available"
+            else:
+                rendered = str(value).replace("\n", " ").replace("\r", " ")
+            cells.append(f"*{label}:* {rendered}")
+        row_text = " | ".join(cells)
+        if len("\n".join([*lines, row_text])) > max_length:
+            break
+        lines.append(row_text)
+        included += 1
+
+    if included < len(rows):
+        notice = "Additional rows omitted to fit Slack's message limit."
+        while lines and len("\n".join([*lines, notice])) > max_length:
+            lines.pop()
+        lines.append(notice)
+    return "\n".join(lines)[:max_length]

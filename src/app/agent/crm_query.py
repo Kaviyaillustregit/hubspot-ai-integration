@@ -103,7 +103,8 @@ def _normalise_deal_filter_payload(data: object) -> object:
         canonical_key = _STATUS_ALIASES.get(key, key)
         if canonical_key not in _CANONICAL_DEAL_FILTER_FIELDS:
             raise ValueError(
-                f"Unsupported deal filter field '{key}'. Only canonical CRM filter fields are allowed."
+                "Unsupported deal filter field "
+                f"'{key}'. Only canonical CRM filter fields are allowed."
             )
 
         if canonical_key == "status":
@@ -272,7 +273,9 @@ def _parse_number(raw: str, label: str) -> Decimal:
     try:
         return Decimal(normalize_amount(raw))
     except (ExtractionValidationError, InvalidOperation) as exc:
-        raise DealFilterError(f"I couldn't read '{raw}' as a number for the {label} filter.") from exc
+        raise DealFilterError(
+            f"I couldn't read '{raw}' as a number for the {label} filter."
+        ) from exc
 
 
 def _normalise_filter_value(value: str | None) -> str:
@@ -281,7 +284,10 @@ def _normalise_filter_value(value: str | None) -> str:
 
 def _normalise_priority(value: str | None) -> str:
     if value is None:
-        raise DealFilterError(f"I couldn't match the deal priority '{value}'. Supported values: High, Medium, Low.")
+        raise DealFilterError(
+            f"I couldn't match the deal priority '{value}'. "
+            "Supported values: High, Medium, Low."
+        )
     normalised = re.sub(r"[^a-z]", "", _normalise_filter_value(value))
     if normalised in {"high", "priorityhigh", "highpriority"}:
         return "high"
@@ -289,13 +295,17 @@ def _normalise_priority(value: str | None) -> str:
         return "medium"
     if normalised in {"low", "prioritylow", "lowpriority"}:
         return "low"
-    raise DealFilterError(f"I couldn't match the deal priority '{value}'. Supported values: High, Medium, Low.")
+    raise DealFilterError(
+        f"I couldn't match the deal priority '{value}'. "
+        "Supported values: High, Medium, Low."
+    )
 
 
 def _normalise_deal_type(value: str | None) -> str:
     if value is None:
         raise DealFilterError(
-            f"I couldn't match the deal type '{value}'. Supported values: New Business, Existing Business."
+            f"I couldn't match the deal type '{value}'. "
+            "Supported values: New Business, Existing Business."
         )
     normalised = re.sub(r"[^a-z0-9]+", "", _normalise_filter_value(value))
     if normalised in {"newbusiness", "newbusinessdeal"}:
@@ -303,7 +313,8 @@ def _normalise_deal_type(value: str | None) -> str:
     if normalised in {"existingbusiness", "existingbusinessdeal"}:
         return "existingbusiness"
     raise DealFilterError(
-        f"I couldn't match the deal type '{value}'. Supported values: New Business, Existing Business."
+        f"I couldn't match the deal type '{value}'. "
+        "Supported values: New Business, Existing Business."
     )
 
 
@@ -341,9 +352,9 @@ def build_deal_filter(spec: DealFilterSpec) -> DealFilter:
     owner = spec.owner.strip() if spec.owner is not None else None
     pipeline = spec.pipeline.strip() if spec.pipeline is not None else None
     if owner is not None and not owner:
-        raise DealFilterError("The deal owner filter is blank. Please provide an explicit owner name or ID.")
+        raise DealFilterError("The deal owner filter is blank. Please provide an explicit owner name or ID.")  # noqa: E501
     if pipeline is not None and not pipeline:
-        raise DealFilterError("The deal pipeline filter is blank. Please provide an explicit pipeline name.")
+        raise DealFilterError("The deal pipeline filter is blank. Please provide an explicit pipeline name.")  # noqa: E501
 
     sort_property: str | None = None
     direction: SortDirection = "desc"
@@ -373,7 +384,7 @@ def build_deal_filter(spec: DealFilterSpec) -> DealFilter:
 def resolve_stage_ids(
     names: tuple[str, ...], stages: Mapping[str, HubSpotPipelineStage]
 ) -> list[str]:
-    """Map stage labels (or IDs) to configured stage IDs; unknown or ambiguous stages are rejected."""
+    """Map stage labels (or IDs) to configured stage IDs; unknown or ambiguous stages are rejected."""  # noqa: E501
     resolved: list[str] = []
     for name in names:
         wanted = name.casefold()
@@ -386,7 +397,7 @@ def resolve_stage_ids(
             raise DealFilterError(f"I couldn't find a deal stage named '{name}' in HubSpot.")
         if len(matches) > 1:
             raise DealFilterError(
-                f"I found more than one deal stage matching '{name}'. Please also specify the pipeline "
+                f"I found more than one deal stage matching '{name}'. Please also specify the pipeline "  # noqa: E501
                 "or use the exact stage name."
             )
         resolved.extend(matches)
@@ -409,7 +420,7 @@ def resolve_pipeline_ids(
             raise DealFilterError(f"I couldn't find a deal pipeline named '{name}' in HubSpot.")
         if len(matches) > 1:
             raise DealFilterError(
-                f"I found more than one deal pipeline matching '{name}'. Please use the exact pipeline name."
+                f"I found more than one deal pipeline matching '{name}'. Please use the exact pipeline name."  # noqa: E501
             )
         resolved.extend(matches)
     return list(dict.fromkeys(resolved))
@@ -429,14 +440,14 @@ def resolve_owner_ids(names: tuple[str, ...], owners: Mapping[str, str]) -> list
             raise DealFilterError(f"I couldn't find a deal owner named '{name}' in HubSpot.")
         if len(matches) > 1:
             raise DealFilterError(
-                f"I found more than one deal owner matching '{name}'. Please use the exact owner name."
+                f"I found more than one deal owner matching '{name}'. Please use the exact owner name."  # noqa: E501
             )
         resolved.extend(matches)
     return list(dict.fromkeys(resolved))
 
 
 def to_hubspot_filter_group(
-    flt: DealFilter, stage_ids: list[str], *, pipeline_ids: list[str] | None = None, owner_ids: list[str] | None = None
+    flt: DealFilter, stage_ids: list[str], *, pipeline_ids: list[str] | None = None, owner_ids: list[str] | None = None  # noqa: E501
 ) -> list[dict[str, object]]:
     """One AND-ed HubSpot Search filter group (HubSpot allows up to 6 filters per group)."""
     filters: list[dict[str, object]] = []
@@ -463,7 +474,7 @@ def to_hubspot_filter_group(
     if pipeline_ids:
         filters.append({"propertyName": "pipeline", "operator": "IN", "values": pipeline_ids})
     if flt.priority:
-        filters.append({"propertyName": "hs_priority", "operator": "EQ", "value": flt.priority.lower()})
+        filters.append({"propertyName": "hs_priority", "operator": "EQ", "value": flt.priority.lower()})  # noqa: E501
     if flt.deal_type:
         filters.append({"propertyName": "dealtype", "operator": "EQ", "value": flt.deal_type})
     if owner_ids:
@@ -518,8 +529,8 @@ def apply_deal_filter(
         if pipeline_ids and (deal.properties.get("pipeline") or "") not in pipeline_ids:
             continue
         if flt.priority:
-            priority_value = (deal.properties.get("hs_priority") or deal.properties.get("priority") or "")
-            if _normalise_filter_value(priority_value) not in {flt.priority, f"priority:{flt.priority}"}:
+            priority_value = (deal.properties.get("hs_priority") or deal.properties.get("priority") or "")  # noqa: E501
+            if _normalise_filter_value(priority_value) not in {flt.priority, f"priority:{flt.priority}"}:  # noqa: E501
                 continue
         if flt.deal_type:
             deal_type_value = deal.properties.get("dealtype") or ""
@@ -545,7 +556,7 @@ def apply_deal_filter(
         )
         present = [deal for deal in selected if key(deal) is not None]
         missing = [deal for deal in selected if key(deal) is None]
-        present.sort(key=lambda deal: key(deal), reverse=flt.sort_direction == "desc")  # type: ignore[arg-type,return-value]
+        present.sort(key=lambda deal: key(deal), reverse=flt.sort_direction == "desc")  # type: ignore[arg-type,return-value]  # noqa: E501
         selected = present + missing
     if flt.limit is not None:
         selected = selected[: flt.limit]
@@ -575,7 +586,7 @@ _OPERATOR_VALUE = re.compile(
     rf"(?:{_OPERATORS.pattern})\s*(?P<value>{_AMOUNT}){_UNIT_AFTER}", re.IGNORECASE
 )
 _AMOUNT_WORDS = re.compile(r"\b(?:amount|worth|value|valued|revenue|size|price)\b", re.IGNORECASE)
-_DEAL_WORDS = re.compile(r"\b(?:deals?|(?:opportunit|oppurtunit)(?:y|ies)|pipeline)\b", re.IGNORECASE)
+_DEAL_WORDS = re.compile(r"\b(?:deals?|(?:opportunit|oppurtunit)(?:y|ies)|pipeline)\b", re.IGNORECASE)  # noqa: E501
 _TOP_N = re.compile(r"\b(?:top|first)\s+(\d{1,3})\b", re.IGNORECASE)
 _HIGHEST = re.compile(
     r"\b(?:highest|largest|biggest|most\s+valuable|highest[- ]value|top)\b", re.IGNORECASE
@@ -591,7 +602,7 @@ _OR_CONDITIONS = re.compile(r"\b(?:or)\b", re.IGNORECASE)
 _CHART_REQUEST = re.compile(
     r"\b(?:bar|doughnut|pie|line|funnel)\s+chart\b|"
     r"\b(?:as|in)\s+(?:a|an)?\s*(?:bar|doughnut|pie|line|funnel)\s+chart\b|"
-    r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|doughnut|pie|line|funnel|chart)\s*(?:chart)?\b|"
+    r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|doughnut|pie|line|funnel|chart)\s*(?:chart)?\b|"  # noqa: E501
     r"\b(?:as|in)\s+(?:a|an)?\s*chart\b|"
     r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*chart\b",
     re.IGNORECASE,
@@ -607,20 +618,20 @@ def _strip_visualisation_noise(value: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|line|pie|doughnut|donut|funnel|chart|graph|visualization|visualisation)\s*(?:chart|graph)?\s*$",
+        r"\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|line|pie|doughnut|donut|funnel|chart|graph|visualization|visualisation)\s*(?:chart|graph)?\s*$",  # noqa: E501
         "",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|line|pie|doughnut|donut|funnel|chart|graph|visualization|visualisation)\s*(?:chart|graph)?\s*$",
+        r"\b(?:sales\s+pipeline|pipeline)\s+(?:as|in)\s+(?:a|an)?\s*(?:bar|line|pie|doughnut|donut|funnel|chart|graph|visualization|visualisation)\s*(?:chart|graph)?\s*$",  # noqa: E501
         "",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(r"\s+\b(?:pipeline)\b\s*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^(?:the|a|an|as|in)\s+", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+(?:chart|graph|visualization|visualisation)\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+(?:chart|graph|visualization|visualisation)\s*$", "", text, flags=re.IGNORECASE)  # noqa: E501
     return text.strip()
 
 
@@ -635,6 +646,18 @@ def _plausible_amount(raw: str, has_amount_word: bool) -> bool:
         return False
     marked = bool(re.search(r"[$€£₹]|k$|m$|thousand|million|,", text))
     return has_amount_word or marked or Decimal(digits.split(".")[0] or "0") >= 100
+
+
+def _looks_like_relative_date(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return False
+    return bool(
+        re.fullmatch(r"q[1-4](?:\s+\d{4})?", text, re.IGNORECASE)
+        or re.fullmatch(r"(?:this|last|previous|current)\s+(?:quarter|month|week|year)", text, re.IGNORECASE)  # noqa: E501
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}", text)
+        or re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", text)
+    )
 
 
 def detect_deal_filter(message: str) -> DealFilterSpec | None:
@@ -688,15 +711,15 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
     stages: list[str] = []
     stage_patterns = (
         re.compile(
-            r"\b(?:in|at|on|for)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+stage\b",
+            r"\b(?:in|at|on|for)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+stage\b",  # noqa: E501
             re.IGNORECASE,
         ),
         re.compile(
-            r"\b(?:stage|stages)\s*(?:is|=|:)?\s*(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)(?=\s*(?:$|[.?!,]|\b(?:and|with|where|that|for|or|but)\b))",
+            r"\b(?:stage|stages)\s*(?:is|=|:)?\s*(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)(?=\s*(?:$|[.?!,]|\b(?:and|with|where|that|for|or|but)\b))",  # noqa: E501
             re.IGNORECASE,
         ),
         re.compile(
-            r"\b(?:in|at|on)\s+(?:the\s+)?(?P<name>[A-Z][A-Za-z0-9&'./() -]{1,80}?)(?=\s*(?:$|[.?!,]|\b(?:and|with|where|that|for|or|but)\b))",
+            r"\b(?:in|at|on)\s+(?:the\s+)?(?P<name>[A-Z][A-Za-z0-9&'./() -]{1,80}?)(?=\s*(?:$|[.?!,]|\b(?:and|with|where|that|for|or|but)\b))",  # noqa: E501
             re.IGNORECASE,
         ),
     )
@@ -715,30 +738,34 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
                 continue
             if re.match(r"^(?:and|with|where|that|for|or|but)\b", name, re.IGNORECASE):
                 continue
-            if re.fullmatch(r"(?:all|every|open|closed|won|lost|deal|deals|opportunity|opportunities|pipeline)", name, re.IGNORECASE):
+            if re.fullmatch(r"(?:all|every|open|closed|won|lost|deal|deals|opportunity|opportunities|pipeline)", name, re.IGNORECASE):  # noqa: E501
                 continue
             if re.search(r"\bpipeline\b", name, flags=re.IGNORECASE):
                 continue
-            if re.search(r"\b(?:chart|graph|visualization|visualisation)\b", name, flags=re.IGNORECASE):
+            if re.search(r"\b(?:chart|graph|visualization|visualisation)\b", name, flags=re.IGNORECASE):  # noqa: E501
                 continue
-            if name.casefold() in {"open", "closed", "won", "lost", "high", "medium", "low", "new business", "existing business"}:
+            if _looks_like_relative_date(name):
+                continue
+            if re.fullmatch(r"[a-z]", name, re.IGNORECASE):
+                continue
+            if name.casefold() in {"open", "closed", "won", "lost", "high", "medium", "low", "new business", "existing business"}:  # noqa: E501
                 continue
             stages.append(name)
     stages = list(dict.fromkeys(stage.strip() for stage in stages if stage and stage.strip()))
 
     if not conditions and sort is None and limit is None:
         priority_match = re.search(
-            r"\b(?:high|medium|low)\b.*\b(?:priority|priorit(?:y|ies))\b|\b(?:priority|priorit(?:y|ies))\b.*\b(?:high|medium|low)\b",
+            r"\b(?:high|medium|low)\b.*\b(?:priority|priorit(?:y|ies))\b|\b(?:priority|priorit(?:y|ies))\b.*\b(?:high|medium|low)\b",  # noqa: E501
             message,
             re.IGNORECASE,
         )
         deal_type_match = re.search(
-            r"\b(?:new|existing)\s*[- ]?business\b|\b(?:deal\s+type|type)\b.*?\b(?:new|existing)\s*[- ]?business\b",
+            r"\b(?:new|existing)\s*[- ]?business\b|\b(?:deal\s+type|type)\b.*?\b(?:new|existing)\s*[- ]?business\b",  # noqa: E501
             message,
             re.IGNORECASE,
         )
         pipeline_match = re.search(
-            r"\b(?:in|for|at|on|with)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+pipeline\b",
+            r"\b(?:in|for|at|on|with)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+pipeline\b",  # noqa: E501
             message,
             re.IGNORECASE,
         )
@@ -754,35 +781,35 @@ def detect_deal_filter(message: str) -> DealFilterSpec | None:
                 pipeline_match,
                 owner_match,
                 bool(stages),
-                re.search(r"\b(?:unassigned|no owner|owner is blank|no one assigned)\b", message, re.IGNORECASE),
+                re.search(r"\b(?:unassigned|no owner|owner is blank|no one assigned)\b", message, re.IGNORECASE),  # noqa: E501
             )
         ):
             return None
     priority_match = re.search(
-        r"\b(?:high|medium|low)\b.*\b(?:priority|priorit(?:y|ies))\b|\b(?:priority|priorit(?:y|ies))\b.*\b(?:high|medium|low)\b",
+        r"\b(?:high|medium|low)\b.*\b(?:priority|priorit(?:y|ies))\b|\b(?:priority|priorit(?:y|ies))\b.*\b(?:high|medium|low)\b",  # noqa: E501
         message,
         re.IGNORECASE,
     )
     deal_type_match = re.search(
-        r"\b(?:new|existing)\s*[- ]?business\b|\b(?:deal\s+type|type)\b.*?\b(?:new|existing)\s*[- ]?business\b",
+        r"\b(?:new|existing)\s*[- ]?business\b|\b(?:deal\s+type|type)\b.*?\b(?:new|existing)\s*[- ]?business\b",  # noqa: E501
         message,
         re.IGNORECASE,
     )
     pipeline_match = re.search(
-        r"\b(?:in|for|at|on|with)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+pipeline\b",
+        r"\b(?:in|for|at|on|with)\s+(?:the\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9&'./() -]{0,80}?)\s+pipeline\b",  # noqa: E501
         message,
         re.IGNORECASE,
     )
     pipeline_name = None
     if pipeline_match:
         pipeline_name = _strip_visualisation_noise((pipeline_match.group("name") or "").strip())
-        pipeline_name = re.sub(r"\s+\b(?:sales\s+pipeline|pipeline)\b\s*$", "", pipeline_name, flags=re.IGNORECASE).strip()
+        pipeline_name = re.sub(r"\s+\b(?:sales\s+pipeline|pipeline)\b\s*$", "", pipeline_name, flags=re.IGNORECASE).strip()  # noqa: E501
     owner_match = re.search(
         r"\b(?:owner|assigned\s+to|owned\s+by)\b\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z' .-]{1,80})",
         message,
         re.IGNORECASE,
     )
-    unassigned = bool(re.search(r"\b(?:unassigned|no owner|owner is blank|no one assigned)\b", message, re.IGNORECASE))
+    unassigned = bool(re.search(r"\b(?:unassigned|no owner|owner is blank|no one assigned)\b", message, re.IGNORECASE))  # noqa: E501
     unsupported: list[str] = []
     if len(conditions) > 1 and _OR_CONDITIONS.search(message):
         unsupported.append("conditions combined with OR (only AND is supported)")

@@ -3,16 +3,22 @@ import hmac
 import json
 import time
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode, unquote
+from types import SimpleNamespace
+from urllib.parse import unquote, urlencode
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from types import SimpleNamespace
 
+from app.agent.crm_query import DealFilterSpec, detect_deal_filter
 from app.agent.schemas import AgentResponse
 from app.api.app import create_app
-from app.api.slack import get_action_safety, get_agent, get_slack_client
+from app.api.slack import (
+    get_action_safety,
+    get_agent,
+    get_conversation_history,
+    get_slack_client,
+)
 from app.core.config import Settings
 from app.integrations.errors import IntegrationError
 from app.integrations.slack.events import parse_app_home_opened
@@ -21,13 +27,19 @@ from app.integrations.slack.home import (
     QUICK_ACTION_PREFIX,
     REQUEST_INPUT_ACTION,
     SUBMIT_ACTION,
+    VIEW_FULL_RESPONSE_ACTION,
     build_home_view,
     parse_home_interaction,
     render_response_blocks,
 )
 from app.integrations.slack.http_client import SlackWebApiClient
+from app.integrations.slack.welcome_banner import (
+    BANNER_ALT_TEXT,
+    BANNER_ASSET_PATH,
+    build_welcome_banner_block,
+    build_welcome_banner_url,
+)
 from app.services.action_safety import RecentAction
-from app.agent.crm_query import DealFilterSpec, detect_deal_filter
 from app.services.quickchart import QuickChartService
 
 ACTION_ID = "0123456789abcdef0123456789abcdef"
@@ -44,48 +56,87 @@ def blocks_of_type(view: dict, block_type: str) -> list[dict]:
 # --- Home view rendering -------------------------------------------------------------
 
 
-def test_home_view_has_branding_input_send_and_quick_actions():
+def test_home_view_has_compact_branding_input_send_and_quick_actions():
     view = build_home_view(recent=[])
-
+    blocks = view["blocks"]
     assert view["type"] == "home"
-    assert len(view["blocks"]) <= 100
-    headers = [block["text"]["text"] for block in blocks_of_type(view, "header")]
-    assert headers == ["HubSpot AI Agent"]
-    assert len(blocks_of_type(view, "divider")) == 3
-    text = all_text(view["blocks"])
-    assert "✦  Your AI assistant for HubSpot CRM" in text
-    assert "✦  *AI Assistant*" in text
-    assert "I can create and update contacts, companies and deals" in text
+    assert len(blocks) <= 100
+    assert blocks[0]["type"] == "header"
+    assert blocks[0]["text"]["text"] == "HubSpot AI Assistant"
+    assert not blocks_of_type(view, "card")
+    assert not blocks_of_type(view, "image")
+    text = all_text(blocks)
+    assert "Copilot" not in text
+    assert "Ask about deals and pipeline" in text
+    assert "Recent CRM Activity" in text
+    assert "No CRM actions yet" in text
 
     [request_input] = blocks_of_type(view, "input")
-    assert request_input["label"] == {
-        "type": "plain_text",
-        "text": "CRM request",
-        "emoji": True,
-    }
-    assert request_input["dispatch_action"] is True
+    assert request_input["label"]["text"] == "Message HubSpot AI"
     assert request_input["element"]["action_id"] == REQUEST_INPUT_ACTION
-    assert request_input["element"]["placeholder"]["text"] == "Ask your HubSpot AI Agent..."
-    assert "hint" not in request_input
-    assert "initial_value" not in request_input["element"]
-
-    action_ids = [
-        element["action_id"]
+    assert request_input["element"]["placeholder"]["text"] == (
+        "Ask about deals, contacts, companies, or your pipeline..."
+    )
+    quick_buttons = [
+        element
         for block in blocks_of_type(view, "actions")
         for element in block["elements"]
+        if element["action_id"].startswith(QUICK_ACTION_PREFIX)
     ]
-    assert action_ids[0] == SUBMIT_ACTION
-    quick_keys = (
-        "create_contact",
-        "find_contact",
-        "find_company",
-        "account_overview",
-        "search_crm",
-    )
-    assert action_ids[1:] == [f"{QUICK_ACTION_PREFIX}{key}" for key in quick_keys]
-    assert len(set(action_ids)) == len(action_ids)
-    assert "View Contact" not in text
+    assert [button["action_id"] for button in quick_buttons] == [
+        f"{QUICK_ACTION_PREFIX}{key}"
+        for key in ("create_contact", "find_contact", "find_company", "account_overview", "search_crm")
+    ]
+    assert [button["value"] for button in quick_buttons] == [
+        "Create a contact named ", "Find a contact named ", "Tell me about the company ",
+        "Give me an account overview of ", "Search HubSpot for ",
+    ]
+    assert [button["text"]["text"] for button in quick_buttons] == [
+        "Create contact", "Find contact", "Find company", "Account overview", "Search CRM"
+    ]
+    assert all(button["text"]["emoji"] is False for button in quick_buttons)
+    [send] = [
+        element for block in blocks_of_type(view, "actions") for element in block["elements"]
+        if element["action_id"] == SUBMIT_ACTION
+    ]
+    assert send["value"] == "send"
+    input_index = blocks.index(request_input)
+    activity_index = next(i for i, block in enumerate(blocks) if "Recent CRM Activity" in all_text([block]))
+    assert input_index < activity_index
 
+
+def test_welcome_banner_is_first_and_preserves_existing_home_blocks():
+    baseline = build_home_view(recent=[])["blocks"]
+    image_url = build_welcome_banner_url("https://assistant.example.test/")
+
+    view = build_home_view(recent=[], banner_image_url=image_url)
+
+    assert view["blocks"][0] == {
+        "type": "image",
+        "image_url": "https://assistant.example.test/assistant/static/hubspot-ai-welcome.png",
+        "alt_text": BANNER_ALT_TEXT,
+    }
+    def stable_block_ids(blocks):
+        return [
+            {**block, "block_id": "<generated>"}
+            if block.get("type") == "input"
+            else block
+            for block in blocks
+        ]
+
+    assert stable_block_ids(view["blocks"][1:]) == stable_block_ids(baseline)
+    assert view["blocks"][0]["alt_text"].startswith("Welcome to HubSpot AI Assistant")
+
+
+def test_welcome_banner_url_requires_an_absolute_https_base():
+    assert build_welcome_banner_url("http://localhost:8000") is None
+    assert build_welcome_banner_url("https://user:pass@example.test") is None
+    assert build_welcome_banner_block("/assistant/static/hubspot-ai-welcome.png") is None
+
+
+def test_welcome_banner_png_is_bundled_for_the_existing_static_route():
+    assert BANNER_ASSET_PATH.is_file()
+    assert BANNER_ASSET_PATH.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 def test_quick_action_draft_prefills_a_fresh_input_block():
     first = blocks_of_type(build_home_view(draft="Create a contact named "), "input")[0]
@@ -95,21 +146,21 @@ def test_quick_action_draft_prefills_a_fresh_input_block():
     assert first["block_id"] != second["block_id"]
 
 
-def test_working_state_shows_user_bubble_then_assistant_loading():
+def test_working_state_shows_user_and_assistant_together():
     blocks = build_home_view(request_text="Tell me about <ABC>", working=True)["blocks"]
-    types = [block["type"] for block in blocks]
-
-    user_label = next(i for i, b in enumerate(blocks) if all_text([b]).count("*You*"))
-    bubble = blocks[user_label + 1]
-    assert bubble["type"] == "rich_text"
-    quote = bubble["elements"][0]
+    user_index = next(
+        i for i, block in enumerate(blocks)
+        if block["type"] == "rich_text" and block["elements"][0]["type"] == "rich_text_quote"
+    )
+    quote = blocks[user_index]["elements"][0]
     assert quote["type"] == "rich_text_quote"
-    # Rich text is literal: user input is shown as typed and can't become a mention.
     assert quote["elements"] == [{"type": "text", "text": "Tell me about <ABC>"}]
-    assert blocks[user_label + 2]["elements"][0]["text"] == "✦  *AI Assistant*"
-    assert blocks[user_label + 3]["text"]["text"] == "⋯"
-    assert types.index("rich_text") < types.index("input")
-
+    assistant = blocks[user_index + 1]
+    assert assistant["type"] == "rich_text"
+    assert "HubSpot AI Assistant" in all_text([assistant])
+    assert blocks[user_index + 2]["text"]["text"] == "Working..."
+    input_index = next(i for i, block in enumerate(blocks) if block["type"] == "input")
+    assert user_index < input_index
 
 def test_contact_created_renders_professional_fields():
     blocks = render_response_blocks(
@@ -128,7 +179,7 @@ def test_contact_created_renders_professional_fields():
         )
     )
 
-    assert blocks[0]["text"]["text"] == "✓  *Contact created*"
+    assert blocks[0]["text"]["text"] == "*Contact created*"
     assert blocks[1]["text"]["text"] == (
         "Angel John was successfully added to HubSpot. Associated with ABC &lt;!channel&gt;."
     )
@@ -205,7 +256,7 @@ def test_deal_chart_result_renders_image_block():
         )
     )
 
-    assert blocks[0]["text"]["text"] == "✓  *Here's what I found*"
+    assert blocks[0]["text"]["text"] == "*Here's what I found*"
     assert blocks[1]["text"]["text"] == "Found 2 open deals."
     assert blocks[2]["type"] == "image"
     assert blocks[2]["image_url"] == chart_url
@@ -393,7 +444,7 @@ def test_pending_confirmation_renders_confirm_button_instead_of_typed_instructio
     )
 
     text = all_text(blocks)
-    assert "🛡  *Confirmation needed*" in text
+    assert "*Confirmation needed*" in text
     assert "Reply with" not in text
     [actions] = [block for block in blocks if block["type"] == "actions"]
     button = actions["elements"][0]
@@ -406,12 +457,12 @@ def test_pending_confirmation_renders_confirm_button_instead_of_typed_instructio
 @pytest.mark.parametrize(
     ("status", "title"),
     [
-        ("missing_fields", "ⓘ  *More information needed*"),
-        ("invalid_request", "ⓘ  *More information needed*"),
-        ("company_not_found", "⚠  *Unable to complete request*"),
-        ("duplicate", "⚠  *Unable to complete request*"),
-        ("hubspot_not_authorized", "⚠  *Unable to complete request*"),
-        ("unavailable", "⚠  *Unable to complete request*"),
+        ("missing_fields", "*More information needed*"),
+        ("invalid_request", "*More information needed*"),
+        ("company_not_found", "*Unable to complete request*"),
+        ("duplicate", "*Unable to complete request*"),
+        ("hubspot_not_authorized", "*Unable to complete request*"),
+        ("unavailable", "*Unable to complete request*"),
     ],
 )
 def test_non_success_states_are_clearly_labelled(status, title):
@@ -427,7 +478,7 @@ def test_summary_text_is_split_into_section_sized_chunks():
     long_text = "\n\n".join("• fact " + "x" * 1000 for _ in range(6))
     blocks = render_response_blocks(AgentResponse(status="ok", text=long_text, request_id="r"))
 
-    assert blocks[0]["text"]["text"] == "✓  *Here's what I found*"
+    assert blocks[0]["text"]["text"] == "*Here's what I found*"
     assert len(blocks) > 2
     assert all(len(block["text"]["text"]) <= 3000 for block in blocks)
 
@@ -575,6 +626,60 @@ def test_structured_table_without_view_url_renders_rows_without_links():
     assert "|View in HubSpot>" not in text
 
 
+@pytest.mark.parametrize(
+    ("object_type", "record_name", "record_url"),
+    [
+        ("contacts", "Ari Example", "https://app.hubspot.com/contacts/42/record/0-1/101"),
+        ("companies", "Northwind Ltd", "https://app.hubspot.com/contacts/42/record/0-2/202"),
+    ],
+)
+def test_batch2_app_home_displays_complete_crm_record_once_with_clickable_link(
+    object_type, record_name, record_url
+):
+    columns = [
+        {"key": "name", "label": "Name"},
+        {"key": "custom_value", "label": "Custom field"},
+        {"key": "missing_value", "label": "Optional field"},
+        {"key": "view_url", "label": "View in HubSpot"},
+    ]
+    rows = [
+        {
+            "name": record_name,
+            "custom_value": "Customer",
+            "missing_value": None,
+            "view_url": record_url,
+        }
+    ]
+    response = AgentResponse(
+        status="ok",
+        text=(
+            f"Found 1 {object_type}.\n"
+            f"*Name:* {record_name} | *Custom field:* Customer | "
+            "*Optional field:* Not available | "
+            f"*View in HubSpot:* <{record_url}|Open in HubSpot>"
+        ),
+        request_id="batch2-final-response",
+        result={
+            "kind": "crm_intelligence",
+            "table": {"columns": columns, "rows": rows},
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    rendered = all_text(blocks)
+
+    assert rendered.count(record_name) == 1
+    assert rendered.count("Customer") == 1
+    assert rendered.count("Not available") == 1
+    assert rendered.count(record_url) == 1
+    assert f"<{record_url}|View in HubSpot>" in rendered
+    assert all(
+        len(block.get("text", {}).get("text", "")) <= 3000
+        for block in blocks
+        if block["type"] == "section"
+    )
+
+
 def test_large_structured_table_stays_within_slack_home_block_limit():
     response = AgentResponse(
         status="ok",
@@ -609,39 +714,25 @@ def test_non_table_response_keeps_existing_text_fallback():
         )
     )
 
-    assert blocks[0]["text"]["text"] == "✓  *Here's what I found*"
+    assert blocks[0]["text"]["text"] == "*Here's what I found*"
     assert blocks[1]["text"]["text"] == "Closed-Won revenue: $12,000."
 
 
-def test_recent_activity_lines_reflect_real_action_state():
+def test_recent_activity_uses_compact_plain_rows_with_consistent_dates():
     now = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
     recent = [
-        RecentAction(
-            "create_contact",
-            "completed",
-            {"firstname": "Angel", "lastname": "John", "email": "angel@example.com"},
-            now - timedelta(minutes=3),
-            now,
-        ),
-        RecentAction(
-            "delete_contact", "pending", {"contact_id": "123"}, now, now + timedelta(minutes=4)
-        ),
-        RecentAction(
-            "update_contact",
-            "pending",
-            {"contact_id": "456"},
-            now - timedelta(hours=1),
-            now - timedelta(minutes=55),
-        ),
+        RecentAction("create_contact", "completed", {"firstname": "Angel", "lastname": "John"}, now, now),
+        RecentAction("delete_contact", "pending", {"contact_id": "123"}, now, now + timedelta(minutes=4)),
+        RecentAction("update_contact", "pending", {"contact_id": "456"}, now - timedelta(hours=1), now - timedelta(minutes=55)),
     ]
-
-    text = all_text(build_home_view(recent=recent, now=now)["blocks"])
-
-    assert "✅ Created contact *Angel John*" in text
-    assert "🛡️ Delete of contact `123` is awaiting your confirmation" in text
-    assert "⌛ Update of contact `456` expired before confirmation" in text
-    assert "<!date^" in text
-
+    blocks = build_home_view(recent=recent, now=now)["blocks"]
+    text = all_text(blocks)
+    assert "Completed: Created contact Angel John" in text
+    assert "Awaiting confirmation: Delete contact 123" in text
+    assert "Expired: Update contact 456" in text
+    assert text.count("<!date^") == 3
+    assert not blocks_of_type({"blocks": blocks}, "card")
+    assert not any(ord(char) in {0x2705, 0x1F6E1, 0x26A0, 0x2757} for char in text)
 
 def test_recent_activity_empty_and_unavailable_states():
     assert "No CRM actions yet" in all_text(build_home_view(recent=[])["blocks"])
@@ -826,6 +917,41 @@ class FakeSafety:
         return self.recent
 
 
+class FakeConversationHistory:
+    def __init__(self):
+        self.exchanges = []
+        self.saved = []
+        self.owned_lookups = []
+
+    async def latest(self, *, tenant_id, team_id, user_id, limit=5):
+        selected = [
+            row for row in self.exchanges
+            if (row.tenant_id, row.team_id, row.user_id) == (tenant_id, team_id, user_id)
+        ]
+        return selected[-limit:]
+
+    async def get_owned(self, *, tenant_id, team_id, user_id, delivery_id):
+        scope = (tenant_id, team_id, user_id, delivery_id)
+        self.owned_lookups.append(scope)
+        return next((
+            row for row in self.exchanges
+            if (row.tenant_id, row.team_id, row.user_id, row.delivery_id) == scope
+        ), None)
+
+    async def save_completed(
+        self, *, tenant_id, team_id, user_id, delivery_id, question, response
+    ):
+        self.saved.append((tenant_id, team_id, user_id, delivery_id, question, response.status))
+        if not delivery_id or any(row.delivery_id == delivery_id for row in self.exchanges):
+            return False
+        self.exchanges.append(SimpleNamespace(
+            tenant_id=tenant_id, team_id=team_id, user_id=user_id, delivery_id=delivery_id,
+            question=question, response_status=response.status, response_text=response.text,
+            render_data={"result": response.result or {}, "cards": response.cards},
+        ))
+        return True
+
+
 class RecordingAgent:
     def __init__(self, response: AgentResponse | None = None) -> None:
         self.requests = []
@@ -841,11 +967,27 @@ class RecordingAgent:
         )
 
 
-def app_with(agent, client, safety, team_map='{"T1":"tenant-a"}'):
-    app = create_app(Settings(slack_signing_secret="signing", slack_team_tenant_map=team_map))
+def app_with(
+    agent,
+    client,
+    safety,
+    team_map='{"T1":"tenant-a"}',
+    history=None,
+    web_app_base_url=None,
+):
+    app = create_app(
+        Settings(
+            slack_signing_secret="signing",
+            slack_team_tenant_map=team_map,
+            web_app_base_url=web_app_base_url,
+        )
+    )
     app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_slack_client] = lambda: client
     app.dependency_overrides[get_action_safety] = lambda: safety
+    app.dependency_overrides[get_conversation_history] = (
+        lambda: history if history is not None else FakeConversationHistory()
+    )
     return app
 
 
@@ -869,7 +1011,14 @@ def post_interaction(app, payload: dict, headers: dict[str, str] | None = None):
 
 def test_app_home_opened_publishes_home_for_mapped_workspace():
     client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
-    app = app_with(agent, client, safety)
+    history = FakeConversationHistory()
+    app = app_with(
+        agent,
+        client,
+        safety,
+        history=history,
+        web_app_base_url="https://assistant.example.test",
+    )
     body = json.dumps(
         {
             "type": "event_callback",
@@ -887,14 +1036,30 @@ def test_app_home_opened_publishes_home_for_mapped_workspace():
     assert response.status_code == 200
     assert [user for user, _ in client.views] == ["U1"]
     assert client.views[0][1]["type"] == "home"
+    assert client.views[0][1]["blocks"][0]["image_url"] == (
+        "https://assistant.example.test/assistant/static/hubspot-ai-welcome.png"
+    )
     assert safety.lookups == [("tenant-a", "U1")]
+    assert "Your questions and answers will appear here." in all_text(client.views[0][1]["blocks"])
     assert agent.requests == []
     assert client.messages == []
 
 
+def test_welcome_banner_png_is_served_from_the_existing_static_mount():
+    app = create_app(Settings())
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/assistant/static/hubspot-ai-welcome.png")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_home_request_goes_through_the_existing_agent_and_renders_result():
     client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
-    app = app_with(agent, client, safety)
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history)
 
     response = post_interaction(
         app,
@@ -912,9 +1077,42 @@ def test_home_request_goes_through_the_existing_agent_and_renders_result():
     assert request.channel_id == "apphome:U1"
     assert request.message_ts == "1712345678.000100"
     assert len(client.views) == 2
-    assert "⋯" in all_text(client.views[0][1]["blocks"])
-    assert "✓  *Contact created*" in all_text(client.views[1][1]["blocks"])
+    assert "Working..." in all_text(client.views[0][1]["blocks"])
+    assert "*Contact created*" in all_text(client.views[1][1]["blocks"])
+    assert history.saved[0][:5] == (
+        "tenant-a",
+        "T1",
+        "U1",
+        "1712345678.000100",
+        "Create a contact named Angel John, email angel@example.com",
+    )
     assert client.messages == []
+
+
+def test_home_submit_passes_same_user_workspace_history_as_follow_up_context():
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    history.exchanges.append(
+        SimpleNamespace(
+            tenant_id="tenant-a",
+            team_id="T1",
+            user_id="U1",
+            delivery_id="prior-delivery",
+            question="Show closed won deals",
+            response_status="ok",
+            response_text="There are 3 closed won deals.",
+            render_data={},
+        )
+    )
+    post_interaction(
+        app_with(agent, client, safety, history=history),
+        home_payload({"action_id": SUBMIT_ACTION}, request_text="what about last quarter?"),
+    )
+
+    [request] = agent.requests
+    assert request.conversation_context == (
+        "User: Show closed won deals\nAssistant: There are 3 closed won deals."
+    )
 
 
 def test_home_confirm_button_sends_confirmation_through_the_agent():
@@ -1079,7 +1277,7 @@ def test_titled_crm_results_render_their_title():
         )
     )
 
-    assert blocks[0]["text"]["text"] == "✓  *CRM Updated*"
+    assert blocks[0]["text"]["text"] == "*CRM Updated*"
     assert "Company created: TechNova" in blocks[1]["text"]["text"]
 
 
@@ -1088,7 +1286,7 @@ def test_partial_completion_is_labelled():
         AgentResponse(status="partial", text="✅ Company created\n❌ Link failed", request_id="r")
     )
 
-    assert blocks[0]["text"]["text"] == "⚠  *Partially completed*"
+    assert blocks[0]["text"]["text"] == "*Partially completed*"
 
 
 def test_ambiguous_records_ask_for_more_information():
@@ -1096,7 +1294,7 @@ def test_ambiguous_records_ask_for_more_information():
         AgentResponse(status="company_ambiguous", text="Which one?", request_id="r")
     )
 
-    assert blocks[0]["text"]["text"] == "ⓘ  *More information needed*"
+    assert blocks[0]["text"]["text"] == "*More information needed*"
 
 
 def test_company_update_confirmation_names_the_company():
@@ -1138,10 +1336,10 @@ def test_recent_activity_covers_plans_and_record_updates():
 
     text = all_text(build_home_view(recent=recent, now=now)["blocks"])
 
-    assert "✅ Completed *Create TechNova and add John*" in text
-    assert "❗ Partially completed *Big request*" in text
-    assert "🛡️ Update of deal *Renewal* is awaiting your confirmation" in text
-    assert "✅ Updated company *TechNova*" in text
+    assert "Completed: Create TechNova and add John" in text
+    assert "Partially completed: Big request" in text
+    assert "Awaiting confirmation: Update deal Renewal" in text
+    assert "Completed: Updated company TechNova" in text
 
 
 def test_existing_record_outcome_is_informational_not_an_error():
@@ -1157,7 +1355,7 @@ def test_existing_record_outcome_is_informational_not_an_error():
         )
     )
 
-    assert blocks[0]["text"]["text"] == "ⓘ  *Company already exists*"
+    assert blocks[0]["text"]["text"] == "*Company already exists*"
     assert "No duplicate was created." in blocks[1]["text"]["text"]
     assert "Unable to complete request" not in all_text(blocks)
 
@@ -1171,4 +1369,99 @@ def test_contact_flow_duplicate_error_is_still_an_error():
         )
     )
 
-    assert blocks[0]["text"]["text"] == "⚠  *Unable to complete request*"
+    assert blocks[0]["text"]["text"] == "*Unable to complete request*"
+
+
+def test_home_keeps_assistant_response_together_before_input_and_activity():
+    response = AgentResponse(
+        status="ok",
+        text="Found one deal.",
+        request_id="r",
+        result={
+            "kind": "deals",
+            "table": {
+                "columns": [{"key": "dealname", "label": "Deal name"}],
+                "rows": [{"dealname": "Northwind renewal", "view_url": "https://app.hubspot.com/deals/123"}],
+            },
+        },
+    )
+    activity = RecentAction(
+        "create_contact", "completed", {"firstname": "Ari"},
+        datetime(2026, 10, 18, tzinfo=UTC), datetime(2026, 10, 19, tzinfo=UTC),
+    )
+    blocks = build_home_view(request_text="Show me deals", response=response, recent=[activity])["blocks"]
+    user_index = next(
+        i for i, block in enumerate(blocks)
+        if block["type"] == "rich_text" and block["elements"][0]["type"] == "rich_text_quote"
+    )
+    assistant_index = next(
+        i for i, block in enumerate(blocks)
+        if block["type"] == "rich_text" and "HubSpot AI Assistant" in all_text([block])
+    )
+    input_index = next(i for i, block in enumerate(blocks) if block["type"] == "input")
+    send_index = next(
+        i for i, block in enumerate(blocks)
+        if block["type"] == "actions" and any(e["action_id"] == SUBMIT_ACTION for e in block["elements"])
+    )
+    activity_index = next(i for i, block in enumerate(blocks) if "Recent CRM Activity" in all_text([block]))
+    response_group = blocks[assistant_index:input_index]
+    assert user_index < assistant_index < input_index < send_index < activity_index
+    assert "Found one deal." in all_text(response_group)
+    assert "Northwind renewal" in all_text(response_group)
+    assert "View in HubSpot" in all_text(response_group)
+    assert all("Recent CRM Activity" not in all_text([block]) for block in response_group)
+
+
+def test_view_full_response_loads_only_the_authorized_saved_exchange():
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    answer = "Complete saved response " + ("details. " * 900)
+    history.exchanges.append(SimpleNamespace(
+        tenant_id="tenant-a", team_id="T1", user_id="U1",
+        delivery_id="1712345678.0001", question="List my companies",
+        response_status="ok", response_text=answer, render_data={"result": {}, "cards": []},
+    ))
+    app = app_with(agent, client, safety, history=history)
+
+    response = post_interaction(
+        app,
+        home_payload({
+            "action_id": VIEW_FULL_RESPONSE_ACTION,
+            "value": "1712345678.0001:0",
+        }),
+    )
+
+    assert response.status_code == 200
+    assert history.owned_lookups == [("tenant-a", "T1", "U1", "1712345678.0001")]
+    assert agent.requests == []
+    assert len(client.views) == 1
+    rendered = all_text(client.views[0][1]["blocks"])
+    assert "Full response" in rendered and "Complete saved response" in rendered
+    assert "Next" in rendered
+
+
+@pytest.mark.parametrize(
+    ("stored_tenant", "stored_user"),
+    [("tenant-a", "U2"), ("tenant-b", "U1")],
+)
+def test_view_full_response_rejects_other_user_or_tenant(stored_tenant, stored_user):
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    history.exchanges.append(SimpleNamespace(
+        tenant_id=stored_tenant, team_id="T1", user_id=stored_user,
+        delivery_id="1712345678.0001", question="Private question",
+        response_status="ok", response_text="Private full answer", render_data={},
+    ))
+    app = app_with(agent, client, safety, history=history)
+
+    response = post_interaction(
+        app,
+        home_payload({
+            "action_id": VIEW_FULL_RESPONSE_ACTION,
+            "value": "1712345678.0001:0",
+        }),
+    )
+
+    assert response.status_code == 200
+    assert client.views == []
+    assert agent.requests == []

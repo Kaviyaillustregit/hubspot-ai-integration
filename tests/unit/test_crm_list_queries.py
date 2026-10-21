@@ -1,11 +1,14 @@
 import asyncio
 
+import pytest
+
 from app.agent.extraction import validate_extraction
 from app.agent.operations import CRMOperations
 from app.agent.schemas import AgentRequest, CRMIntentExtraction
 from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
 from app.ai.service import AIService
+from app.integrations.errors import IntegrationError
 from app.integrations.hubspot.models import (
     HubSpotCompaniesPage,
     HubSpotCompany,
@@ -67,6 +70,27 @@ async def test_company_and_contact_registry_listing_follows_every_cursor():
     assert len(listed_companies) == len(listed_contacts) == 205
     assert company_source.cursors == [None, "100", "200"]
     assert contact_source.cursors == [None, "100", "200"]
+
+
+async def test_company_and_contact_listings_stop_at_configured_page_limit():
+    companies = [HubSpotCompany(id=str(i), properties={"name": f"Company {i}"}) for i in range(205)]
+    contacts = [
+        HubSpotContact(id=str(i), properties={"firstname": f"Contact {i}"})
+        for i in range(205)
+    ]
+    company_source = PagedCompanies(companies)
+    contact_source = PagedContacts(contacts)
+    registry = HubSpotToolRegistry(
+        company_source, contact_source, max_read_pages=2  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(IntegrationError, match="configured page limit"):
+        await registry.list_all_companies("tenant-a")
+    with pytest.raises(IntegrationError, match="configured page limit"):
+        await registry.list_all_contacts("tenant-a")
+
+    assert company_source.cursors == [None, "100"]
+    assert contact_source.cursors == [None, "100"]
 
 
 class ListingTools:
@@ -227,6 +251,10 @@ async def test_company_list_uses_table_fields_and_associated_deals():
             "lead_status": "IN_PROGRESS",
             "last_contacted": "2026-09-30",
             "associated_deals": "Renewal",
+            "associated_deals_links": [{
+                "name": "Renewal",
+                "url": "https://app.hubspot.com/contacts/42/record/0-3/deal-1",
+            }],
             "view_url": "https://app.hubspot.com/contacts/42/record/0-2/company-1",
         }
     ]

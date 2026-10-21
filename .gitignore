@@ -14,3 +14,6 @@ htmlcov/
 *.code-workspace
 .DS_Store
 Thumbs.db
+# Local database and application backups
+/backups/
+*.dump

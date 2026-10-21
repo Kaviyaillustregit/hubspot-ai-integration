@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
-from app.agent.schemas import DealAnalysis, DealFollowUpAssessment
+from app.agent.schemas import CRMIntentExtraction, DealAnalysis, DealFollowUpAssessment
 from app.ai.anthropic import AnthropicProvider
 from app.core.config import Settings
 from app.integrations.errors import IntegrationError
@@ -77,6 +77,37 @@ async def test_anthropic_provider_rejects_malformed_json():
             variables={},
             output_schema=Result,
         )
+
+
+async def test_crm_intent_retry_uses_higher_budget_for_truncated_json():
+    valid_json = (
+        '{"intent":"crm_question","confidence":1.0,'
+        '"question":"Show me all HubSpot deals closing in Q3 2026."}'
+    )
+    client = FakeClient(
+        responses=[
+            (
+                '{"intent":"crm_question","confidence":1.0,'
+                '"question":"Show me all HubSpot deals closing in Q3 2026"',
+                "max_tokens",
+            ),
+            (valid_json, "end_turn"),
+        ]
+    )
+    provider = AnthropicProvider(
+        Settings(anthropic_api_key="test-key"),
+        client=client,  # type: ignore[arg-type]
+    )
+
+    result = await provider.generate_structured(
+        prompt_name="crm-intent/v2",
+        variables={"message": "Show me all HubSpot deals closing in Q3 2026."},
+        output_schema=CRMIntentExtraction,
+    )
+
+    assert result.intent == "crm_question"
+    assert result.question == "Show me all HubSpot deals closing in Q3 2026."
+    assert [call["max_tokens"] for call in client.messages.calls] == [700, 1_400]
 
 
 async def test_deal_analysis_parses_valid_json_with_feature_specific_budget():

@@ -1,11 +1,16 @@
 import pytest
 
 from app.agent.extraction import validate_extraction
-from app.agent.operations import CRMOperations, _Plan
+from app.agent.operations import CRMOperations, _hubspot_failure, _Plan
 from app.agent.schemas import AgentRequest, CRMIntentExtraction
 from app.agent.service import AccountIntelligenceAgent
 from app.agent.tools import HubSpotToolRegistry
 from app.ai.service import AIService
+from app.integrations.errors import (
+    IntegrationError,
+    IntegrationRateLimitError,
+    IntegrationTimeoutError,
+)
 from app.integrations.hubspot.models import (
     HubSpotCompany,
     HubSpotDeal,
@@ -208,6 +213,34 @@ async def test_registry_follows_every_hubspot_deal_cursor():
 
     assert len(listed) == 205
     assert source.cursors == [None, "100", "200"]
+
+
+async def test_registry_fails_instead_of_silently_truncating_at_page_limit():
+    records = [deal(f"deal-{index}", f"Deal {index}", "open") for index in range(205)]
+    source = PagedDeals(records)
+    tools = HubSpotToolRegistry(None, None, source, max_read_pages=2)  # type: ignore[arg-type]
+
+    with pytest.raises(IntegrationError, match="configured page limit"):
+        await tools.list_all_deals("tenant-a")
+
+    assert source.cursors == [None, "100"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_text"),
+    [
+        (IntegrationRateLimitError("provider detail"), "hubspot_rate_limited", "rate limiting"),
+        (IntegrationTimeoutError("provider detail"), "hubspot_timeout", "did not respond"),
+    ],
+)
+def test_transient_hubspot_errors_return_actionable_non_sensitive_messages(
+    error, expected_status, expected_text
+):
+    status, message = _hubspot_failure(error)
+
+    assert status == expected_status
+    assert expected_text in message
+    assert "provider detail" not in message
 
 
 class MisclassifiedRevenueProvider:
