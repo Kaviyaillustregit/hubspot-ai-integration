@@ -16,10 +16,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.agent.schemas import AgentRequest, AgentResponse
 from app.agent.service import AccountIntelligenceAgent
 from app.api.errors import AppError
-from app.api.slack import get_action_safety, get_agent
+from app.api.slack import (
+    get_action_safety,
+    get_agent,
+    get_slack_authorization,
+)
 from app.db.session import UnitOfWork
+from app.integrations.slack.events import SlackTenantResolver
 from app.repositories.hubspot_oauth import HubSpotOAuthRepository
 from app.services.action_safety import ActionSafetyService, RecentAction
+from app.services.slack_authorized_users import SlackAuthorizationService
 from app.web.session import (
     SESSION_COOKIE,
     SESSION_TTL_SECONDS,
@@ -96,8 +102,63 @@ def get_web_identity(
     return identity
 
 
+async def _ensure_authorized_web_identity(
+    identity: WebIdentity,
+    authorization: SlackAuthorizationService,
+    *,
+    tenant_mapping: str | None,
+) -> None:
+    if (
+        not identity.team_id
+        or SlackTenantResolver(tenant_mapping).resolve(identity.team_id) != identity.tenant_id
+    ):
+        raise AppError(
+            "web_session_not_authorized",
+            "This Slack user is not authorized to access this HubSpot AI workspace.",
+            403,
+        )
+    try:
+        authorized = await authorization.is_authorized(
+            tenant_id=identity.tenant_id,
+            slack_team_id=identity.team_id,
+            slack_user_id=identity.user_id,
+        )
+    except Exception:
+        logger.warning(
+            "Web assistant authorization lookup failed; request denied",
+            extra={"tenant_id": identity.tenant_id},
+        )
+        raise AppError(
+            "authorization_unavailable",
+            "Authorization is temporarily unavailable.",
+            503,
+        ) from None
+    if not authorized:
+        raise AppError(
+            "web_session_not_authorized",
+            "This Slack user is not authorized to access this HubSpot AI workspace.",
+            403,
+        )
+
+
+async def get_authorized_web_identity(
+    request: Request,
+    identity: Annotated[WebIdentity, Depends(get_web_identity)],
+    authorization: Annotated[
+        SlackAuthorizationService, Depends(get_slack_authorization)
+    ],
+) -> WebIdentity:
+    await _ensure_authorized_web_identity(
+        identity,
+        authorization,
+        tenant_mapping=request.app.state.settings.slack_team_tenant_map,
+    )
+    return identity
+
+
 async def get_hubspot_connected(
-    request: Request, identity: Annotated[WebIdentity, Depends(get_web_identity)]
+    request: Request,
+    identity: Annotated[WebIdentity, Depends(get_authorized_web_identity)],
 ) -> bool:
     try:
         async with UnitOfWork(request.app.state.session_factory) as unit_of_work:
@@ -113,7 +174,13 @@ async def get_hubspot_connected(
 
 
 @page_router.get("/assistant", include_in_schema=False)
-async def assistant_page(request: Request, token: str | None = None) -> Response:
+async def assistant_page(
+    request: Request,
+    authorization: Annotated[
+        SlackAuthorizationService, Depends(get_slack_authorization)
+    ],
+    token: str | None = None,
+) -> Response:
     if token is None:
         return FileResponse(_INDEX, media_type="text/html", headers=_PAGE_HEADERS)
 
@@ -121,6 +188,18 @@ async def assistant_page(request: Request, token: str | None = None) -> Response
     secret = request.app.state.settings.slack_signing_secret
     signer = WebSessionSigner(secret) if secret else None
     identity = signer.verify(token, purpose="link") if signer else None
+    if identity is not None:
+        try:
+            await _ensure_authorized_web_identity(
+                identity,
+                authorization,
+                tenant_mapping=request.app.state.settings.slack_team_tenant_map,
+            )
+        except AppError as exc:
+            if exc.status_code == 403:
+                identity = None
+            else:
+                raise
     response = RedirectResponse(
         "/assistant" if identity else "/assistant?link=expired",
         status_code=303,
@@ -141,7 +220,7 @@ async def assistant_page(request: Request, token: str | None = None) -> Response
 
 @api_router.get("/session", response_model=AssistantSession)
 async def assistant_session(
-    identity: Annotated[WebIdentity, Depends(get_web_identity)],
+    identity: Annotated[WebIdentity, Depends(get_authorized_web_identity)],
     connected: Annotated[bool, Depends(get_hubspot_connected)],
     action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
 ) -> AssistantSession:
@@ -164,7 +243,7 @@ async def assistant_session(
 async def assistant_message(
     request: Request,
     body: AssistantMessage,
-    identity: Annotated[WebIdentity, Depends(get_web_identity)],
+    identity: Annotated[WebIdentity, Depends(get_authorized_web_identity)],
     agent: Annotated[AccountIntelligenceAgent, Depends(get_agent)],
 ) -> AssistantReply:
     # FastAPI only parses JSON bodies sent as application/json, so form posts from other

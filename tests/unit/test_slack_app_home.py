@@ -17,6 +17,7 @@ from app.api.slack import (
     get_action_safety,
     get_agent,
     get_conversation_history,
+    get_slack_authorization,
     get_slack_client,
 )
 from app.core.config import Settings
@@ -967,6 +968,11 @@ class RecordingAgent:
         )
 
 
+class AllowAuthorization:
+    async def is_authorized(self, **kwargs):
+        return True
+
+
 def app_with(
     agent,
     client,
@@ -984,6 +990,7 @@ def app_with(
     )
     app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_slack_client] = lambda: client
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
     app.dependency_overrides[get_action_safety] = lambda: safety
     app.dependency_overrides[get_conversation_history] = (
         lambda: history if history is not None else FakeConversationHistory()

@@ -47,6 +47,7 @@ from app.services.hubspot_contacts import HubSpotAccessTokenProvider
 from app.services.hubspot_deals import HubSpotDealsService
 from app.services.hubspot_owners import HubSpotOwnersService
 from app.services.hubspot_properties import HubSpotPropertiesService
+from app.services.slack_authorized_users import SlackAuthorizationService
 from app.services.slack_conversation import SlackConversationService
 
 logger = logging.getLogger(__name__)
@@ -115,15 +116,48 @@ def get_conversation_history(request: Request) -> SlackConversationService:
     return SlackConversationService(request.app.state.session_factory)
 
 
+def get_slack_authorization(request: Request) -> SlackAuthorizationService:
+    return SlackAuthorizationService(request.app.state.session_factory)
+
+
+async def _is_authorized_slack_user(
+    authorization: SlackAuthorizationService,
+    *,
+    tenant_id: str,
+    team_id: str,
+    user_id: str,
+) -> bool:
+    try:
+        return await authorization.is_authorized(
+            tenant_id=tenant_id,
+            slack_team_id=team_id,
+            slack_user_id=user_id,
+        )
+    except Exception:
+        logger.warning(
+            "Slack user authorization lookup failed; request denied",
+            extra={"tenant_id": tenant_id},
+        )
+        return False
+
+
 async def _respond(
     agent: AccountIntelligenceAgent,
     client: SlackClient,
+    authorization: SlackAuthorizationService,
     message: object,
     tenant_id: str,
     request_id: str,
 ) -> None:
     parsed = parse_message(message)
     if parsed is None:
+        return
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=parsed.team_id,
+        user_id=parsed.user_id,
+    ):
         return
 
     response = await agent.respond(
@@ -255,16 +289,53 @@ async def _publish_home(
             _log_timing(f"slack_home.{timing_label}_publish_total", started, tenant_id)
 
 
+async def _publish_authorized_home(
+    client: SlackClient,
+    action_safety: ActionSafetyService,
+    conversation_history: SlackConversationService,
+    authorization: SlackAuthorizationService,
+    *,
+    tenant_id: str,
+    team_id: str,
+    user_id: str,
+    banner_image_url: str | None = None,
+) -> None:
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=team_id,
+        user_id=user_id,
+    ):
+        return
+    await _publish_home(
+        client,
+        action_safety,
+        conversation_history,
+        tenant_id=tenant_id,
+        team_id=team_id,
+        user_id=user_id,
+        banner_image_url=banner_image_url,
+    )
+
+
 async def _handle_home_interaction(
     agent: AccountIntelligenceAgent,
     client: SlackClient,
     action_safety: ActionSafetyService,
     conversation_history: SlackConversationService,
+    authorization: SlackAuthorizationService,
     interaction: HomeInteraction,
     tenant_id: str,
     request_id: str,
     banner_image_url: str | None = None,
 ) -> None:
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=interaction.team_id,
+        user_id=interaction.user_id,
+    ):
+        return
     if interaction.kind == "view_full_response":
         try:
             exchange = await conversation_history.get_owned(
@@ -438,6 +509,9 @@ async def interactions(
     conversation_history: Annotated[
         SlackConversationService, Depends(get_conversation_history)
     ],
+    authorization: Annotated[
+        SlackAuthorizationService, Depends(get_slack_authorization)
+    ],
 ) -> Response:
     """Handle input and actions from the in-Slack App Home conversation."""
     settings = request.app.state.settings
@@ -476,12 +550,21 @@ async def interactions(
         logger.warning("Slack workspace is not mapped to a tenant")
         return Response(status_code=200)
 
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=interaction.team_id,
+        user_id=interaction.user_id,
+    ):
+        return Response(status_code=200)
+
     background_tasks.add_task(
         _handle_home_interaction,
         agent,
         client,
         action_safety,
         conversation_history,
+        authorization,
         interaction,
         tenant_id=tenant_id,
         request_id=request.state.request_id,
@@ -506,6 +589,9 @@ async def events(
     action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
     conversation_history: Annotated[
         SlackConversationService, Depends(get_conversation_history)
+    ],
+    authorization: Annotated[
+        SlackAuthorizationService, Depends(get_slack_authorization)
     ],
 ) -> Response:
     settings = request.app.state.settings
@@ -560,11 +646,20 @@ async def events(
             logger.warning("Slack workspace is not mapped to a tenant")
             return Response(status_code=200)
 
+        if not await _is_authorized_slack_user(
+            authorization,
+            tenant_id=home_tenant_id,
+            team_id=home_opened.team_id,
+            user_id=home_opened.user_id,
+        ):
+            return Response(status_code=200)
+
         background_tasks.add_task(
-            _publish_home,
+            _publish_authorized_home,
             client,
             action_safety,
             conversation_history,
+            authorization,
             tenant_id=home_tenant_id,
             team_id=home_opened.team_id,
             user_id=home_opened.user_id,
@@ -587,10 +682,19 @@ async def events(
         )
         return Response(status_code=200)
 
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=parsed.team_id,
+        user_id=parsed.user_id,
+    ):
+        return Response(status_code=200)
+
     background_tasks.add_task(
         _respond,
         agent,
         client,
+        authorization,
         payload,
         tenant_id,
         request.state.request_id,

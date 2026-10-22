@@ -15,6 +15,7 @@ from app.api.slack import (
     get_action_safety,
     get_agent,
     get_conversation_history,
+    get_slack_authorization,
     get_slack_client,
 )
 from app.core.config import Settings
@@ -60,6 +61,12 @@ def override_unused_event_dependencies(app) -> None:
         get_conversation_history,
     ):
         app.dependency_overrides[dependency] = lambda: None
+    app.dependency_overrides[get_slack_authorization] = lambda: None
+
+
+class AllowAuthorization:
+    async def is_authorized(self, **kwargs):
+        return True
 
 
 def test_valid_slack_message_routes_server_mapped_tenant_to_agent():
@@ -81,6 +88,7 @@ def test_valid_slack_message_routes_server_mapped_tenant_to_agent():
     )
     app.dependency_overrides[get_agent] = lambda: Agent()
     app.dependency_overrides[get_slack_client] = lambda: Client()
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
     body = json.dumps(event_payload()).encode()
     with TestClient(app) as client:
         response = client.post(
@@ -129,6 +137,7 @@ def test_slack_event_delivers_final_batch2_table_text_verbatim(text):
     )
     app.dependency_overrides[get_agent] = lambda: Agent()
     app.dependency_overrides[get_slack_client] = lambda: Client()
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
     body = json.dumps(event_payload()).encode()
     with TestClient(app) as client:
         response = client.post(
@@ -189,6 +198,7 @@ def test_app_mention_routes_to_agent():
     )
     app.dependency_overrides[get_agent] = lambda: Agent()
     app.dependency_overrides[get_slack_client] = lambda: Client()
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
     payload = event_payload()
     payload["event"] = {
         "type": "app_mention",
@@ -294,6 +304,7 @@ def test_slack_contact_create_request_creates_contact_directly():
     )
     app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_slack_client] = lambda: Client()
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
 
     payload = event_payload()
     payload["event"]["text"] = "Please add Arun Kumar, email arun@test.com, as a contact"
@@ -351,6 +362,9 @@ def test_duplicate_slack_delivery_is_not_replied_to_twice():
     )
     app.dependency_overrides[get_agent] = lambda: Agent()
     app.dependency_overrides[get_slack_client] = lambda: Client()
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
+    app.dependency_overrides[get_action_safety] = lambda: None
+    app.dependency_overrides[get_conversation_history] = lambda: None
     payload = event_payload()
     payload["event"]["ts"] = "1712345678.000100"
     body = json.dumps(payload).encode()
@@ -495,6 +509,7 @@ def test_slack_confirmation_creates_hubspot_contact_and_completes_action():
     )
     app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_slack_client] = lambda: Client()
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
 
     payload = event_payload()
     payload["event"]["text"] = (

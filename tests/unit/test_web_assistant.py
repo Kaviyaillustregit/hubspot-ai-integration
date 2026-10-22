@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from app.agent.schemas import AgentResponse
 from app.api.app import create_app
 from app.api.assistant import get_hubspot_connected, recent_item
-from app.api.slack import get_action_safety, get_agent, get_slack_client
+from app.api.slack import (
+    get_action_safety,
+    get_agent,
+    get_slack_authorization,
+    get_slack_client,
+)
 from app.core.config import Settings
 from app.integrations.slack.home import build_home_view
 from app.services.action_safety import RecentAction
@@ -23,7 +28,7 @@ from app.web.session import (
 )
 
 SECRET = "signing"
-IDENTITY = WebIdentity(tenant_id="tenant-a", user_id="U1")
+IDENTITY = WebIdentity(tenant_id="tenant-a", user_id="U1", team_id="T1")
 STATIC = Path(__file__).resolve().parents[2] / "src" / "app" / "web"
 
 
@@ -75,6 +80,11 @@ class FakeSafety:
         return self.recent
 
 
+class FakeAuthorization:
+    async def is_authorized(self, **kwargs):
+        return True
+
+
 def app_with(agent=None, safety=None, *, connected=True, **settings):
     app = create_app(
         Settings(
@@ -86,6 +96,7 @@ def app_with(agent=None, safety=None, *, connected=True, **settings):
     app.dependency_overrides[get_agent] = lambda: agent or RecordingAgent()
     app.dependency_overrides[get_action_safety] = lambda: safety or FakeSafety()
     app.dependency_overrides[get_hubspot_connected] = lambda: connected
+    app.dependency_overrides[get_slack_authorization] = lambda: FakeAuthorization()
     return app
 
 

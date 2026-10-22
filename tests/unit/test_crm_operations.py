@@ -506,10 +506,14 @@ async def test_find_company_returns_details_card(h, message):
     )
 
     assert result.status == "ok"
-    assert result.result == {"kind": "crm_records", "title": "Company Details"}
-    assert "*ABC Technologies*" in result.text
-    assert "Domain: abctech.com" in result.text
-    assert "HubSpot ID: `company-1`" in result.text
+    assert result.result["kind"] == "crm_records"
+    assert result.result["title"] == "Company Details"
+    assert result.result["message"] == "Company details from HubSpot."
+    [row] = result.result["table"]["rows"]
+    assert row["name"] == "ABC Technologies"
+    assert row["phone"] == "+1 555 0100"
+    assert row["view_url"].endswith("/record/0-2/company-1")
+    assert result.text == "Company details from HubSpot."
     assert h.safety.claimed == {}
 
 
@@ -681,8 +685,14 @@ async def test_company_contacts_query_uses_associations(h, message):
         message, "crm_question", query="company_contacts", company_name="ABC Technologies"
     )
 
-    assert result.result == {"kind": "crm_records", "title": "Contacts at ABC Technologies"}
-    assert result.text == "• Victor Hall — victor@abc.com"
+    assert result.result["kind"] == "crm_records"
+    assert result.result["title"] == "Contacts at ABC Technologies"
+    assert result.result["message"] == "Found 1 associated contacts."
+    [row] = result.result["table"]["rows"]
+    assert row["name"] == "Victor Hall"
+    assert row["email"] == "victor@abc.com"
+    assert row["view_url"].endswith(f"/record/0-1/{contact_id}")
+    assert result.text == "Found 1 associated contacts."
 
 
 async def test_which_company_is_contact_associated_with(h):
@@ -698,8 +708,14 @@ async def test_which_company_is_contact_associated_with(h):
         last_name="Hall",
     )
 
-    assert result.result == {"kind": "crm_records", "title": "Companies for Victor Hall"}
-    assert result.text == "• ABC Technologies"
+    assert result.result["kind"] == "crm_records"
+    assert result.result["title"] == "Companies for Victor Hall"
+    [row] = result.result["table"]["rows"]
+    assert row["name"] == "ABC Technologies"
+    assert row["view_url"].endswith(f"/record/0-2/{company_id}")
+    assert result.result["message"] == result.text
+    assert "Victor Hall works for " in result.text
+    assert "|ABC Technologies>" in result.text
 
 
 # ----------------------------------------------------------------------------- deals
@@ -1051,9 +1067,15 @@ async def test_find_deal_shows_stage_label(h):
         deal_name="ABC Enterprise Deal",
     )
 
-    assert result.result == {"kind": "crm_records", "title": "Deal Details"}
-    assert "• Amount: 75,000" in result.text
-    assert "• Stage: Contract Sent" in result.text
+    assert result.result["kind"] == "crm_records"
+    assert result.result["title"] == "Deal Details"
+    assert result.result["message"] == "Deal details from HubSpot."
+    [row] = result.result["table"]["rows"]
+    assert row["name"] == "ABC Enterprise Deal"
+    assert row["amount"] == "75,000"
+    assert row["stage"] == "Contract Sent"
+    assert row["view_url"].endswith("/record/0-3/deal-1")
+    assert result.text == "Deal details from HubSpot."
 
 
 async def test_update_deal_amount_requires_confirmation(h):
@@ -1118,7 +1140,15 @@ async def test_company_deals_query(h):
         company_name="ABC Technologies",
     )
 
-    assert result.text == "• ABC Enterprise Deal — 50,000 — Closed Won"
+    assert result.result["kind"] == "crm_records"
+    assert result.result["title"] == "Deals for ABC Technologies"
+    assert result.result["message"] == "Found 1 associated deals."
+    [row] = result.result["table"]["rows"]
+    assert row["name"] == "ABC Enterprise Deal"
+    assert row["amount"] == "50,000"
+    assert row["stage"] == "Closed Won"
+    assert row["view_url"].endswith(f"/record/0-3/{deal_id}")
+    assert result.text == "Found 1 associated deals."
 
 
 # ----------------------------------------------------------------- deal associations
@@ -1543,7 +1573,7 @@ async def test_regression_existing_test_ai_company_renders_as_information_in_app
     )
     blocks = render_response_blocks(result)
 
-    assert blocks[0]["text"]["text"] == "ⓘ  *Company already exists*"
+    assert blocks[0]["text"]["text"] == "*Company already exists*"
     assert blocks[1]["text"]["text"] == (
         "Test AI Company already exists in HubSpot, so I used the existing company record. "
         "No duplicate was created."
@@ -1586,9 +1616,7 @@ async def test_actual_failures_are_still_errors(h):
     )
 
     assert result.status == "insufficient_scope"
-    assert render_response_blocks(result)[0]["text"]["text"] == (
-        "⚠  *Unable to complete request*"
-    )
+    assert render_response_blocks(result)[0]["text"]["text"] == "*Unable to complete request*"
 
 
 async def test_company_created_renders_as_assistant_success_in_app_home(h):
@@ -1600,8 +1628,9 @@ async def test_company_created_renders_as_assistant_success_in_app_home(h):
     )
     blocks = render_response_blocks(result)
 
-    assert blocks[0]["text"]["text"] == "✓  *Company created*"
-    assert blocks[1]["text"]["text"] == "Demo AI Company 001 was successfully added to HubSpot."
+    assert blocks[0]["text"]["text"] == "*Company created*"
+    assert result.result["message"] == "Demo AI Company 001 was successfully added to HubSpot."
+    assert blocks[1]["text"]["text"] == result.text
     # The channel reply text is unchanged.
     assert result.text == "✅ Company created: Demo AI Company 001"
 
@@ -1618,7 +1647,7 @@ async def test_multi_step_success_keeps_the_step_list(h):
     )
     blocks = render_response_blocks(result)
 
-    assert blocks[0]["text"]["text"] == "✓  *CRM Updated*"
+    assert blocks[0]["text"]["text"] == "*CRM Updated*"
     assert "✅ Contact John Smith associated with TechNova" in blocks[1]["text"]["text"]
 
 
@@ -1640,6 +1669,7 @@ async def test_created_records_produce_result_cards(h):
             "title": "Company created",
             "name": "TechNova",
             "hubspot_id": "company-1",
+            "hubspot_url": "https://app.hubspot.com/contacts/42/record/0-2/company-1",
         },
         {
             "kind": "deal",
@@ -1647,6 +1677,7 @@ async def test_created_records_produce_result_cards(h):
             "name": "Enterprise AI Platform",
             "hubspot_id": "deal-2",
             "detail": "Amount 50,000 · Appointment Scheduled",
+            "hubspot_url": "https://app.hubspot.com/contacts/42/record/0-3/deal-2",
         },
         {"kind": "link", "title": "Linked", "name": "Deal Enterprise AI Platform ↔ TechNova"},
     ]

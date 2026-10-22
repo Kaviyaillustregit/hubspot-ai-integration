@@ -408,6 +408,11 @@ async def test_stage1_result_is_delivered_to_slack_with_tenant_scoping_and_real_
             calls["channel"] = channel
             calls["text"] = text
 
+    class AllowAuthorization:
+        async def is_authorized(self, *, tenant_id, slack_team_id, slack_user_id):
+            calls["authorized_scope"] = (tenant_id, slack_team_id, slack_user_id)
+            return True
+
     agent = AccountIntelligenceAgent(
         HubSpotToolRegistry(Companies(), Contacts(), ScopedDeals()),
         AIService(CRMRouteProvider(query="all_deals")),
@@ -417,6 +422,7 @@ async def test_stage1_result_is_delivered_to_slack_with_tenant_scoping_and_real_
     await _respond(
         agent,
         SlackClient(),
+        AllowAuthorization(),
         {
             "type": "event_callback",
             "team_id": "T1",
@@ -435,6 +441,7 @@ async def test_stage1_result_is_delivered_to_slack_with_tenant_scoping_and_real_
     assert calls["read"] == 1
     assert calls["mutations"] == 0
     assert calls["channel"] == "C1"
+    assert calls["authorized_scope"] == ("tenant-a", "T1", "U1")
     assert "Quarter End Renewal" in calls["text"]
     assert "October Expansion" not in calls["text"]
     assert "\\n" not in calls["text"]

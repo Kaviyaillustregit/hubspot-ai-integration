@@ -38,6 +38,10 @@ def test_channel_response_uses_panel_blocks_and_original_fallback_text():
         async def post_message(self, channel, message, blocks=None):
             sent.append((channel, message, blocks))
 
+    class AllowAuthorization:
+        async def is_authorized(self, *, tenant_id, slack_team_id, slack_user_id):
+            return (tenant_id, slack_team_id, slack_user_id) == ("tenant-1", "T1", "U1")
+
     payload = {
         "type": "event_callback",
         "team_id": "T1",
@@ -50,7 +54,9 @@ def test_channel_response_uses_panel_blocks_and_original_fallback_text():
         },
     }
 
-    asyncio.run(_respond(Agent(), Client(), payload, "tenant-1", "request-1"))
+    asyncio.run(
+        _respond(Agent(), Client(), AllowAuthorization(), payload, "tenant-1", "request-1")
+    )
 
     assert len(sent) == 1
     channel, fallback, blocks = sent[0]

@@ -26,6 +26,7 @@ _KEY_LABEL = b"hubspot-ai-web-session-v1"
 class WebIdentity:
     tenant_id: str
     user_id: str
+    team_id: str | None = None
 
 
 class WebSessionSigner:
@@ -41,11 +42,10 @@ class WebSessionSigner:
         now: float | None = None,
     ) -> str:
         expires = int((now if now is not None else time.time()) + ttl_seconds)
-        payload = json.dumps(
-            {"t": identity.tenant_id, "u": identity.user_id, "p": purpose, "e": expires},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
+        claims = {"t": identity.tenant_id, "u": identity.user_id, "p": purpose, "e": expires}
+        if identity.team_id:
+            claims["tm"] = identity.team_id
+        payload = json.dumps(claims, separators=(",", ":"), sort_keys=True).encode()
         return f"{_encode(payload)}.{_encode(self._sign(payload))}"
 
     def verify(
@@ -75,7 +75,10 @@ class WebSessionSigner:
             return None
         if not user_id:
             return None
-        return WebIdentity(tenant_id=tenant_id, user_id=user_id)
+        team_id = claims.get("tm")
+        if team_id is not None and (not isinstance(team_id, str) or not team_id):
+            return None
+        return WebIdentity(tenant_id=tenant_id, user_id=user_id, team_id=team_id)
 
     def _sign(self, payload: bytes) -> bytes:
         return hmac.new(self._key, payload, hashlib.sha256).digest()
