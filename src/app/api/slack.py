@@ -1,5 +1,6 @@
 import json
 import logging
+from asyncio import Lock
 from inspect import Parameter, signature
 from time import perf_counter
 from typing import Annotated
@@ -47,6 +48,7 @@ from app.services.hubspot_contacts import HubSpotAccessTokenProvider
 from app.services.hubspot_deals import HubSpotDealsService
 from app.services.hubspot_owners import HubSpotOwnersService
 from app.services.hubspot_properties import HubSpotPropertiesService
+from app.services.slack_authorized_users import SlackAuthorizationService
 from app.services.slack_conversation import SlackConversationService
 
 logger = logging.getLogger(__name__)
@@ -115,9 +117,123 @@ def get_conversation_history(request: Request) -> SlackConversationService:
     return SlackConversationService(request.app.state.session_factory)
 
 
+def get_slack_authorization(request: Request) -> SlackAuthorizationService:
+    return SlackAuthorizationService(request.app.state.session_factory)
+
+
+async def _is_authorized_slack_user(
+    authorization: SlackAuthorizationService,
+    *,
+    tenant_id: str,
+    team_id: str,
+    user_id: str,
+) -> bool:
+    try:
+        return await authorization.is_authorized(
+            tenant_id=tenant_id,
+            slack_team_id=team_id,
+            slack_user_id=user_id,
+        )
+    except Exception:
+        logger.warning(
+            "Slack user authorization lookup failed; request denied",
+            extra={"tenant_id": tenant_id},
+        )
+        return False
+
+
+def _client_supports_updating(client: object) -> bool:
+    try:
+        update_fn = getattr(client, "update_message", None)
+        if not callable(update_fn):
+            return False
+        if (
+            isinstance(client, SlackClient)
+            and type(client).update_message is SlackClient.update_message
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _update_message_accepts_blocks(client: object) -> bool:
+    try:
+        parameters = signature(client.update_message).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return True
+    return any(
+        parameter.name == "blocks" or parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+class _SlackProgressTracker:
+    def __init__(self, client: SlackClient, channel_id: str) -> None:
+        self._client = client
+        self._channel_id = channel_id
+        self._message_ts: str | None = None
+        self._last_status: str | None = None
+        self._failed: bool = False
+
+    @property
+    def message_ts(self) -> str | None:
+        return self._message_ts
+
+    async def update(self, status: str) -> None:
+        if self._failed or status == self._last_status:
+            return
+        self._last_status = status
+
+        if not _client_supports_updating(self._client):
+            return
+
+        try:
+            progress_text = f":hourglass_flowing_sand: {status}..."
+            has_blocks = _post_message_accepts_blocks(self._client)
+            blocks = (
+                [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f":hourglass_flowing_sand: *{status}...*",
+                        },
+                    }
+                ]
+                if has_blocks
+                else None
+            )
+
+            if self._message_ts is None:
+                if has_blocks:
+                    result = await self._client.post_message(
+                        self._channel_id, progress_text, blocks=blocks
+                    )
+                else:
+                    result = await self._client.post_message(
+                        self._channel_id, progress_text
+                    )
+                if isinstance(result, str) and result:
+                    self._message_ts = result
+            else:
+                if _update_message_accepts_blocks(self._client):
+                    await self._client.update_message(
+                        self._channel_id, self._message_ts, progress_text, blocks=blocks
+                    )
+                else:
+                    await self._client.update_message(
+                        self._channel_id, self._message_ts, progress_text
+                    )
+        except Exception:
+            logger.warning("Slack progress indicator update failed", exc_info=True)
+            self._failed = True
+
+
 async def _respond(
     agent: AccountIntelligenceAgent,
     client: SlackClient,
+    authorization: SlackAuthorizationService,
     message: object,
     tenant_id: str,
     request_id: str,
@@ -125,18 +241,28 @@ async def _respond(
     parsed = parse_message(message)
     if parsed is None:
         return
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=parsed.team_id,
+        user_id=parsed.user_id,
+    ):
+        return
 
-    response = await agent.respond(
-        AgentRequest(
-            tenant_id=tenant_id,
-            actor_id=parsed.user_id,
-            message=parsed.text,
-            request_id=request_id,
-            channel_id=parsed.channel_id,
-            message_ts=parsed.ts,
-            event_id=parsed.event_id,
-        )
+    progress_tracker = _SlackProgressTracker(client, parsed.channel_id)
+    agent_request = AgentRequest(
+        tenant_id=tenant_id,
+        actor_id=parsed.user_id,
+        message=parsed.text,
+        request_id=request_id,
+        channel_id=parsed.channel_id,
+        message_ts=parsed.ts,
+        event_id=parsed.event_id,
     )
+    if "on_progress" in signature(agent.respond).parameters:
+        response = await agent.respond(agent_request, on_progress=progress_tracker.update)
+    else:
+        response = await agent.respond(agent_request)
 
     if response.status == "duplicate_request":
         # Redelivery of a message that was already handled; the first delivery replied.
@@ -144,6 +270,14 @@ async def _respond(
             "Skipping reply for duplicate Slack delivery",
             extra={"tenant_id": tenant_id},
         )
+        if progress_tracker.message_ts is not None and hasattr(client, "delete_message"):
+            try:
+                await client.delete_message(parsed.channel_id, progress_tracker.message_ts)
+            except Exception:
+                logger.warning(
+                    "Failed to delete progress message for duplicate request",
+                    exc_info=True,
+                )
         return
 
     try:
@@ -154,6 +288,33 @@ async def _respond(
                 if index == 0
                 else "Continued response details."
             )
+            if (
+                index == 0
+                and progress_tracker.message_ts is not None
+                and _client_supports_updating(client)
+            ):
+                try:
+                    if _update_message_accepts_blocks(client):
+                        await client.update_message(
+                            parsed.channel_id,
+                            progress_tracker.message_ts,
+                            fallback_text,
+                            blocks=blocks,
+                        )
+                    else:
+                        await client.update_message(
+                            parsed.channel_id,
+                            progress_tracker.message_ts,
+                            fallback_text,
+                        )
+                    continue
+                except Exception:
+                    logger.warning(
+                        "Slack progress message update with final response failed; "
+                        "falling back to post_message",
+                        exc_info=True,
+                    )
+
             if _post_message_accepts_blocks(client):
                 await client.post_message(parsed.channel_id, fallback_text, blocks=blocks)
             else:
@@ -191,10 +352,11 @@ async def _publish_home(
     history_detail: object | None = None,
     history_page: int = 0,
     working: bool = False,
+    progress_status: str | None = None,
     draft: str | None = None,
     timing_label: str | None = None,
     banner_image_url: str | None = None,
-) -> None:
+) -> bool:
     started = perf_counter()
     activity_started = perf_counter()
     try:
@@ -227,6 +389,7 @@ async def _publish_home(
         request_text=request_text,
         response=response,
         working=working,
+        progress_status=progress_status,
         draft=draft,
         recent_unavailable=recent_unavailable,
         history=history,
@@ -249,10 +412,95 @@ async def _publish_home(
             "Slack App Home publish failed",
             extra={"tenant_id": tenant_id, "error": str(exc)},
         )
+        return False
     finally:
         _log_timing("slack_home.views_publish", publish_started, tenant_id)
         if timing_label is not None:
             _log_timing(f"slack_home.{timing_label}_publish_total", started, tenant_id)
+    return True
+
+
+class _SlackHomeProgressTracker:
+    def __init__(
+        self,
+        client: SlackClient,
+        action_safety: ActionSafetyService,
+        conversation_history: SlackConversationService,
+        *,
+        tenant_id: str,
+        team_id: str,
+        user_id: str,
+        request_text: str,
+        banner_image_url: str | None,
+    ) -> None:
+        self._client = client
+        self._action_safety = action_safety
+        self._conversation_history = conversation_history
+        self._tenant_id = tenant_id
+        self._team_id = team_id
+        self._user_id = user_id
+        self._request_text = request_text
+        self._banner_image_url = banner_image_url
+        self._last_status: str | None = None
+        self._failed = False
+        self._lock = Lock()
+
+    async def update(self, status: str) -> None:
+        async with self._lock:
+            if self._failed or not status or status == self._last_status:
+                return
+            self._last_status = status
+            try:
+                published = await _publish_home(
+                    self._client,
+                    self._action_safety,
+                    self._conversation_history,
+                    tenant_id=self._tenant_id,
+                    team_id=self._team_id,
+                    user_id=self._user_id,
+                    request_text=self._request_text,
+                    working=True,
+                    progress_status=status,
+                    banner_image_url=self._banner_image_url,
+                )
+                if not published:
+                    self._failed = True
+            except Exception:
+                self._failed = True
+                logger.warning(
+                    "Slack App Home progress update failed",
+                    extra={"tenant_id": self._tenant_id},
+                    exc_info=True,
+                )
+
+
+async def _publish_authorized_home(
+    client: SlackClient,
+    action_safety: ActionSafetyService,
+    conversation_history: SlackConversationService,
+    authorization: SlackAuthorizationService,
+    *,
+    tenant_id: str,
+    team_id: str,
+    user_id: str,
+    banner_image_url: str | None = None,
+) -> None:
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=team_id,
+        user_id=user_id,
+    ):
+        return
+    await _publish_home(
+        client,
+        action_safety,
+        conversation_history,
+        tenant_id=tenant_id,
+        team_id=team_id,
+        user_id=user_id,
+        banner_image_url=banner_image_url,
+    )
 
 
 async def _handle_home_interaction(
@@ -260,11 +508,19 @@ async def _handle_home_interaction(
     client: SlackClient,
     action_safety: ActionSafetyService,
     conversation_history: SlackConversationService,
+    authorization: SlackAuthorizationService,
     interaction: HomeInteraction,
     tenant_id: str,
     request_id: str,
     banner_image_url: str | None = None,
 ) -> None:
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=interaction.team_id,
+        user_id=interaction.user_id,
+    ):
+        return
     if interaction.kind == "view_full_response":
         try:
             exchange = await conversation_history.get_owned(
@@ -375,19 +631,31 @@ async def _handle_home_interaction(
                 "Slack Home conversation context lookup failed",
                 extra={"tenant_id": tenant_id},
             )
+    home_progress = _SlackHomeProgressTracker(
+        client,
+        action_safety,
+        conversation_history,
+        tenant_id=tenant_id,
+        team_id=interaction.team_id,
+        user_id=interaction.user_id,
+        request_text=message,
+        banner_image_url=banner_image_url,
+    )
+    agent_request = AgentRequest(
+        tenant_id=tenant_id,
+        actor_id=interaction.user_id,
+        message=message,
+        request_id=request_id or uuid4().hex,
+        channel_id=f"apphome:{interaction.user_id}",
+        message_ts=interaction.action_ts or None,
+        event_id=interaction.action_ts or None,
+        conversation_context=conversation_context,
+    )
     try:
-        response = await agent.respond(
-            AgentRequest(
-                tenant_id=tenant_id,
-                actor_id=interaction.user_id,
-                message=message,
-                request_id=request_id or uuid4().hex,
-                channel_id=f"apphome:{interaction.user_id}",
-                message_ts=interaction.action_ts or None,
-                event_id=interaction.action_ts or None,
-                conversation_context=conversation_context,
-            )
-        )
+        if "on_progress" in signature(agent.respond).parameters:
+            response = await agent.respond(agent_request, on_progress=home_progress.update)
+        else:
+            response = await agent.respond(agent_request)
     except Exception:
         logger.exception(
             "Slack App Home agent request failed",
@@ -438,6 +706,9 @@ async def interactions(
     conversation_history: Annotated[
         SlackConversationService, Depends(get_conversation_history)
     ],
+    authorization: Annotated[
+        SlackAuthorizationService, Depends(get_slack_authorization)
+    ],
 ) -> Response:
     """Handle input and actions from the in-Slack App Home conversation."""
     settings = request.app.state.settings
@@ -476,12 +747,21 @@ async def interactions(
         logger.warning("Slack workspace is not mapped to a tenant")
         return Response(status_code=200)
 
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=interaction.team_id,
+        user_id=interaction.user_id,
+    ):
+        return Response(status_code=200)
+
     background_tasks.add_task(
         _handle_home_interaction,
         agent,
         client,
         action_safety,
         conversation_history,
+        authorization,
         interaction,
         tenant_id=tenant_id,
         request_id=request.state.request_id,
@@ -506,6 +786,9 @@ async def events(
     action_safety: Annotated[ActionSafetyService, Depends(get_action_safety)],
     conversation_history: Annotated[
         SlackConversationService, Depends(get_conversation_history)
+    ],
+    authorization: Annotated[
+        SlackAuthorizationService, Depends(get_slack_authorization)
     ],
 ) -> Response:
     settings = request.app.state.settings
@@ -560,11 +843,20 @@ async def events(
             logger.warning("Slack workspace is not mapped to a tenant")
             return Response(status_code=200)
 
+        if not await _is_authorized_slack_user(
+            authorization,
+            tenant_id=home_tenant_id,
+            team_id=home_opened.team_id,
+            user_id=home_opened.user_id,
+        ):
+            return Response(status_code=200)
+
         background_tasks.add_task(
-            _publish_home,
+            _publish_authorized_home,
             client,
             action_safety,
             conversation_history,
+            authorization,
             tenant_id=home_tenant_id,
             team_id=home_opened.team_id,
             user_id=home_opened.user_id,
@@ -587,10 +879,19 @@ async def events(
         )
         return Response(status_code=200)
 
+    if not await _is_authorized_slack_user(
+        authorization,
+        tenant_id=tenant_id,
+        team_id=parsed.team_id,
+        user_id=parsed.user_id,
+    ):
+        return Response(status_code=200)
+
     background_tasks.add_task(
         _respond,
         agent,
         client,
+        authorization,
         payload,
         tenant_id,
         request.state.request_id,

@@ -11,7 +11,25 @@ class SlackClient(ABC):
         channel: str,
         text: str,
         blocks: list[dict[str, Any]] | None = None,
-    ) -> None: ...
+    ) -> str | None: ...
 
     @abstractmethod
     async def publish_home_view(self, user_id: str, view: dict[str, Any]) -> None: ...
+
+    async def update_message(
+        self,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Update an existing Slack message if supported by the client implementation."""
+        return None
+
+    async def delete_message(
+        self,
+        channel: str,
+        ts: str,
+    ) -> None:
+        """Delete an existing Slack message if supported by the client implementation."""
+        return None

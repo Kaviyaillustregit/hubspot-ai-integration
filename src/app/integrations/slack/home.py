@@ -171,6 +171,7 @@ def build_home_view(
     request_text: str | None = None,
     response: AgentResponse | None = None,
     working: bool = False,
+    progress_status: str | None = None,
     recent_unavailable: bool = False,
     history: list[Any] | None = None,
     history_detail: Any | None = None,
@@ -180,6 +181,11 @@ def build_home_view(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     blocks: list[Block] = []
+    working_status = (
+        f":hourglass_flowing_sand: *{escape_slack_text(progress_status)}...*"
+        if progress_status
+        else "Working..."
+    )
     banner = build_welcome_banner_block(banner_image_url)
     if banner is not None:
         blocks.append(banner)
@@ -230,7 +236,9 @@ def build_home_view(
         elif request_text is not None and (working or response is not None):
             blocks.extend(_user_request_blocks(request_text))
             if working:
-                blocks.extend([_rich_text_heading("HubSpot AI Assistant"), _section("Working...")])
+                blocks.extend(
+                    [_rich_text_heading("HubSpot AI Assistant"), _section(working_status)]
+                )
             elif response is not None:
                 blocks.extend(
                     [_rich_text_heading("HubSpot AI Assistant"), *render_response_blocks(response)]
@@ -250,7 +258,7 @@ def build_home_view(
             blocks.extend(
                 [
                     _rich_text_heading("HubSpot AI Assistant"),
-                    _section("Working..."),
+                    _section(working_status),
                 ]
             )
         elif response is not None:

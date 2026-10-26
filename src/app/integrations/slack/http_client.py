@@ -17,7 +17,7 @@ class SlackWebApiClient(SlackClient):
         channel: str,
         text: str,
         blocks: list[dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> str | None:
         if not self._settings.slack_bot_token:
             raise IntegrationError("Slack bot token is not configured")
         payload: dict[str, Any] = {"channel": channel, "text": text}
@@ -45,6 +45,73 @@ class SlackWebApiClient(SlackClient):
             raise IntegrationError("Slack message request failed") from exc
         if response.is_error or not response.json().get("ok", False):
             raise IntegrationError("Slack message request failed")
+        return response.json().get("ts")
+
+    async def update_message(
+        self,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if not self._settings.slack_bot_token:
+            raise IntegrationError("Slack bot token is not configured")
+        payload: dict[str, Any] = {"channel": channel, "ts": ts, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
+        try:
+            if self._client is not None:
+                response = await self._client.post(
+                    "https://slack.com/api/chat.update",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self._settings.slack_bot_token}"},
+                )
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.request_timeout_seconds
+                ) as client:
+                    response = await client.post(
+                        "https://slack.com/api/chat.update",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {self._settings.slack_bot_token}"},
+                    )
+        except httpx.TimeoutException as exc:
+            raise IntegrationTimeoutError("Slack message update timed out") from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationError("Slack message update failed") from exc
+        if response.is_error or not response.json().get("ok", False):
+            raise IntegrationError("Slack message update failed")
+
+    async def delete_message(
+        self,
+        channel: str,
+        ts: str,
+    ) -> None:
+        if not self._settings.slack_bot_token:
+            raise IntegrationError("Slack bot token is not configured")
+        payload: dict[str, Any] = {"channel": channel, "ts": ts}
+        try:
+            if self._client is not None:
+                response = await self._client.post(
+                    "https://slack.com/api/chat.delete",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self._settings.slack_bot_token}"},
+                )
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.request_timeout_seconds
+                ) as client:
+                    response = await client.post(
+                        "https://slack.com/api/chat.delete",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {self._settings.slack_bot_token}"},
+                    )
+        except httpx.TimeoutException as exc:
+            raise IntegrationTimeoutError("Slack message delete timed out") from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationError("Slack message delete failed") from exc
+        if response.is_error or not response.json().get("ok", False):
+            raise IntegrationError("Slack message delete failed")
 
     async def publish_home_view(self, user_id: str, view: dict[str, Any]) -> None:
         if not self._settings.slack_bot_token:

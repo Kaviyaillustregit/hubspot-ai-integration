@@ -17,6 +17,7 @@ from app.api.slack import (
     get_action_safety,
     get_agent,
     get_conversation_history,
+    get_slack_authorization,
     get_slack_client,
 )
 from app.core.config import Settings
@@ -967,6 +968,11 @@ class RecordingAgent:
         )
 
 
+class AllowAuthorization:
+    async def is_authorized(self, **kwargs):
+        return True
+
+
 def app_with(
     agent,
     client,
@@ -984,6 +990,7 @@ def app_with(
     )
     app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_slack_client] = lambda: client
+    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
     app.dependency_overrides[get_action_safety] = lambda: safety
     app.dependency_overrides[get_conversation_history] = (
         lambda: history if history is not None else FakeConversationHistory()
@@ -1087,6 +1094,93 @@ def test_home_request_goes_through_the_existing_agent_and_renders_result():
         "Create a contact named Angel John, email angel@example.com",
     )
     assert client.messages == []
+
+
+def test_home_submit_publishes_progress_stages_and_then_the_final_response():
+    class ProgressAgent(RecordingAgent):
+        async def respond(self, request, on_progress=None):
+            self.requests.append(request)
+            assert on_progress is not None
+            await on_progress("Understanding your request")
+            await on_progress("Understanding your request")
+            await on_progress("Retrieving CRM data")
+            return AgentResponse(
+                status="ok",
+                text="The requested CRM records are ready.",
+                request_id=request.request_id,
+            )
+
+    client, safety, agent = RecordingClient(), FakeSafety(), ProgressAgent()
+    history = FakeConversationHistory()
+
+    response = post_interaction(
+        app_with(agent, client, safety, history=history),
+        home_payload(
+            {"action_id": SUBMIT_ACTION},
+            request_text="Show the latest contacts",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert len(client.views) == 4  # initial, two distinct stages, final
+    initial_text = all_text(client.views[0][1]["blocks"])
+    understanding_text = all_text(client.views[1][1]["blocks"])
+    retrieving_text = all_text(client.views[2][1]["blocks"])
+    final_text = all_text(client.views[3][1]["blocks"])
+    assert "Working..." in initial_text
+    assert "Understanding your request..." in understanding_text
+    assert "Retrieving CRM data..." in retrieving_text
+    assert "The requested CRM records are ready." in final_text
+    assert "Retrieving CRM data..." not in final_text
+    for _, view in client.views[1:3]:
+        assert blocks_of_type(view, "input")
+        assert any(
+            element.get("action_id") == SUBMIT_ACTION
+            for block in blocks_of_type(view, "actions")
+            for element in block.get("elements", [])
+        )
+    assert len(history.saved) == 1
+
+
+def test_home_progress_publish_failure_does_not_block_final_response_or_retry_stages():
+    class FailingProgressClient(RecordingClient):
+        def __init__(self):
+            super().__init__()
+            self.publish_attempts = 0
+
+        async def publish_home_view(self, user_id, view):
+            self.publish_attempts += 1
+            if self.publish_attempts == 2:
+                raise IntegrationError("Slack view publish failed")
+            await super().publish_home_view(user_id, view)
+
+    class ProgressAgent(RecordingAgent):
+        async def respond(self, request, on_progress=None):
+            self.requests.append(request)
+            assert on_progress is not None
+            await on_progress("Understanding your request")
+            await on_progress("Understanding your request")
+            await on_progress("Retrieving CRM data")
+            return AgentResponse(
+                status="ok",
+                text="The final answer is still available.",
+                request_id=request.request_id,
+            )
+
+    client, agent = FailingProgressClient(), ProgressAgent()
+    response = post_interaction(
+        app_with(agent, client, FakeSafety()),
+        home_payload(
+            {"action_id": SUBMIT_ACTION},
+            request_text="Show the latest contacts",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert client.publish_attempts == 3  # initial, failed stage, final
+    assert len(client.views) == 2
+    assert "Working..." in all_text(client.views[0][1]["blocks"])
+    assert "The final answer is still available." in all_text(client.views[-1][1]["blocks"])
 
 
 def test_home_submit_passes_same_user_workspace_history_as_follow_up_context():

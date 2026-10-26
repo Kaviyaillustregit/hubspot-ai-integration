@@ -1,7 +1,9 @@
+import contextvars
 import hashlib
 import logging
 import re
 from asyncio import Semaphore, gather
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
@@ -68,6 +70,19 @@ from app.services.hubspot_contacts import HubSpotDuplicateContactError
 from app.services.quickchart import build_chart_config, generate_chart_url
 
 logger = logging.getLogger(__name__)
+
+_current_progress: contextvars.ContextVar[Callable[[str], Awaitable[None]] | None] = (
+    contextvars.ContextVar("current_progress", default=None)
+)
+
+
+async def _report_progress(status: str) -> None:
+    callback = _current_progress.get()
+    if callback is not None:
+        try:
+            await callback(status)
+        except Exception:
+            logger.warning("Progress callback failed", exc_info=True)
 
 _STAGE_ANALYTICS_QUERIES = frozenset(
     {"all_deals", "open_deals", "closed_deals", "closed_won_deals", "closed_lost_deals"}
@@ -559,10 +574,12 @@ class AccountIntelligenceAgent:
                 *(item.field for item in plan.sort),
                 *(item.field for item in plan.aggregations),
             )))
+            await _report_progress("Retrieving CRM data")
             all_deals = await self._tools.list_all_deals(
                 request.tenant_id, properties=deal_properties
             )
             pipelines = await self._tools.deal_pipelines(request.tenant_id)
+            await _report_progress("Analyzing results")
             analysis, text = analyze_deals(plan, list(all_deals), pipelines, request.message)
             rows = analysis["rows"]
             await self._resolve_owner_labels(request.tenant_id, rows)
@@ -754,6 +771,7 @@ class AccountIntelligenceAgent:
                     links_line = "\n*HubSpot records:* " + ", ".join(record_links)
                     if len(text) + len(links_line) <= _SLACK_MESSAGE_MAX_LENGTH:
                         text += links_line
+            await _report_progress("Preparing your response")
             if plan.chart_requested and rows and grouped:
                 chart = build_chart_payload(plan, rows)
                 payload.update(chart)
@@ -903,6 +921,7 @@ class AccountIntelligenceAgent:
             "lastname" if plan.object == "contact" else "name",
         ]))
         known = {item.name for item in catalog}
+        await _report_progress("Retrieving CRM data")
         records = await (
             self._tools.list_all_companies(
                 request.tenant_id, properties=[field for field in required if field in known]
@@ -912,6 +931,7 @@ class AccountIntelligenceAgent:
                 request.tenant_id, properties=[field for field in required if field in known]
             )
         )
+        await _report_progress("Analyzing results")
         result = execute_record_query(plan, records, catalog)
         rows = result["rows"]
         option_labels = {
@@ -987,6 +1007,7 @@ class AccountIntelligenceAgent:
             for row, url in zip(rows, urls, strict=False):
                 row["view_url"] = url
             result["columns"].append({"key": "view_url", "label": "View in HubSpot"})
+        await _report_progress("Preparing your response")
         text = (
             f"Found {result['matched_records']} {record_type}. "
             f"Showing {result['total']} records."
@@ -1085,7 +1106,18 @@ class AccountIntelligenceAgent:
                 row["hubspot_owner_id"] = names.get(str(owner_id), owner_id)
 
 
-    async def respond(self, request: AgentRequest) -> AgentResponse:
+    async def respond(
+        self,
+        request: AgentRequest,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AgentResponse:
+        token = _current_progress.set(on_progress)
+        try:
+            return await self._respond_internal(request)
+        finally:
+            _current_progress.reset(token)
+
+    async def _respond_internal(self, request: AgentRequest) -> AgentResponse:
         confirmation_action_id = self._confirmation_action_id(request.message)
 
         if confirmation_action_id is not None:
@@ -1326,6 +1358,8 @@ class AccountIntelligenceAgent:
                 "Did you mean to create a deal record? If so, what should it be called?",
                 request,
             )
+
+        await _report_progress("Understanding your request")
 
         if _DEAL_FOLLOW_UP_REQUEST_PATTERN.search(request.message):
             return await self._review_deals_for_follow_up(request)
@@ -1652,6 +1686,7 @@ class AccountIntelligenceAgent:
             )
 
         try:
+            await _report_progress("Retrieving CRM data")
             resolution = await self._tools.resolve_deal(request.tenant_id, deal_name)
             if resolution.status == "ambiguous":
                 return self._safe(
@@ -1695,6 +1730,7 @@ class AccountIntelligenceAgent:
                     request,
                     ["resolve_deal", "get_deal", "deal_pipelines"],
                 )
+            await _report_progress("Analyzing results")
             is_closed = stage.metadata.get("isClosed", "").casefold()
             if is_closed == "true":
                 return self._safe(
@@ -1752,6 +1788,7 @@ class AccountIntelligenceAgent:
                 "stage_is_closed": False,
             }
             request_email_draft = bool(_EMAIL_DRAFT_REQUEST_PATTERN.search(request.message))
+            await _report_progress("Preparing your response")
             analysis = await self._ai_service.generate(
                 prompt_name="deal-analysis/v1",
                 variables={
@@ -1812,6 +1849,7 @@ class AccountIntelligenceAgent:
 
     async def _review_deals_for_follow_up(self, request: AgentRequest) -> AgentResponse:
         try:
+            await _report_progress("Retrieving CRM data")
             all_deals, pipelines = await gather(
                 self._tools.list_all_deals(
                     request.tenant_id,
@@ -1819,6 +1857,7 @@ class AccountIntelligenceAgent:
                 ),
                 self._tools.deal_pipelines(request.tenant_id),
             )
+            await _report_progress("Analyzing results")
         except ValueError:
             return self._safe(
                 "hubspot_not_authorized",
@@ -1929,6 +1968,7 @@ class AccountIntelligenceAgent:
 
         selected_urls = record_urls[: len(selected)]
         unknown_urls = record_urls[len(selected):]
+        await _report_progress("Preparing your response")
         analysis_results: list[_DealFollowUpResult] = []
         ai_failures = 0
         for candidate, hubspot_url in zip(selected, selected_urls, strict=True):
@@ -2036,10 +2076,12 @@ class AccountIntelligenceAgent:
     async def _qualify_leads(self, request: AgentRequest) -> AgentResponse:
         tenant_id = request.tenant_id
         try:
+            await _report_progress("Retrieving CRM data")
             contacts, has_more = await self._tools.list_contacts_limited(
                 tenant_id, self._lead_analysis_limit
             )
             company_by_contact = await self._companies_for_contacts(tenant_id, contacts)
+            await _report_progress("Analyzing results")
         except ValueError:
             return self._safe(
                 "hubspot_not_authorized",
@@ -2091,6 +2133,7 @@ class AccountIntelligenceAgent:
                 ["hubspot_record_urls"],
             )
 
+        await _report_progress("Preparing your response")
         assessments = await gather(*(self._assess_lead(request, lead) for lead in selected))
         entries = [
             LeadReportEntry(lead, url, assessment)
@@ -2320,6 +2363,7 @@ class AccountIntelligenceAgent:
             )
 
         try:
+            await _report_progress("Retrieving CRM data")
             resolution = await self._tools.resolve_company(request.tenant_id, company_name)
 
             if resolution.status == "ambiguous":
@@ -2396,6 +2440,7 @@ class AccountIntelligenceAgent:
         if question is not None:
             variables["question"] = question
 
+        await _report_progress("Preparing your response")
         summary = await self._ai_service.generate(
             prompt_name="account-intelligence/v1",
             variables=variables,
