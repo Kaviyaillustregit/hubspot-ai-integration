@@ -228,6 +228,91 @@ def test_created_crm_record_cards_render_existing_hubspot_links(kind, title, rec
     assert blocks[-1]["text"]["text"] == f"<{record_url}|View in HubSpot>"
 
 
+def test_contact_detail_card_renders_field_emojis():
+    url = "https://app.hubspot.com/contacts/42/record/0-1/1"
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Contact details.",
+            request_id="contact-card-emojis",
+            result={
+                "kind": "crm_intelligence",
+                "title": "Contact details",
+                "hubspot_url": url,
+                "table": {
+                    "columns": [
+                        {"key": "name", "label": "Contact name"},
+                        {"key": "email", "label": "Email"},
+                        {"key": "phone", "label": "Phone"},
+                        {"key": "company", "label": "Company"},
+                        {"key": "owner", "label": "Owner"},
+                    ],
+                    "rows": [{
+                        "name": "Ava",
+                        "email": "ava@example.com",
+                        "phone": "555-000",
+                        "company": "Acme",
+                        "owner": "Pat",
+                        "view_url": url,
+                    }],
+                },
+            },
+        )
+    )
+
+    section_text = "\n".join(block["text"]["text"] for block in blocks if block.get("type") == "section")
+    assert "*\U0001F464 Contact name:* Ava" in section_text
+    assert "*\U0001F4E7 Email:* ava@example.com" in section_text
+    assert "*\U0001F4DE Phone:* 555-000" in section_text
+    assert "*\U0001F3E2 Company:* Acme" in section_text
+    assert "*\U0001F454 Owner:* Pat" in section_text
+
+
+def test_company_detail_card_renders_field_emojis():
+    url = "https://app.hubspot.com/contacts/42/record/0-2/company-1"
+    blocks = render_response_blocks(
+        AgentResponse(
+            status="ok",
+            text="Company details.",
+            request_id="company-card-emojis",
+            result={
+                "kind": "crm_intelligence",
+                "title": "Company details",
+                "hubspot_url": url,
+                "table": {
+                    "columns": [
+                        {"key": "name", "label": "Company name"},
+                        {"key": "domain", "label": "Domain"},
+                        {"key": "industry", "label": "Industry"},
+                        {"key": "city", "label": "City"},
+                        {"key": "employees", "label": "Employees"},
+                        {"key": "owner", "label": "Owner"},
+                    ],
+                    "rows": [{
+                        "name": "Acme",
+                        "domain": "acme.com",
+                        "industry": "Manufacturing",
+                        "city": "Boston",
+                        "employees": "100",
+                        "owner": "Alex",
+                        "view_url": url,
+                    }],
+                },
+            },
+        )
+    )
+
+    section_text = "\n".join(block["text"]["text"] for block in blocks if block.get("type") == "section")
+    assert "*\U0001F3E2 Company name:* Acme" in section_text
+    assert "*\U0001F310 Domain:* acme.com" in section_text
+    assert "*\U0001F3ED Industry:* Manufacturing" in section_text
+    assert "*\U0001F4CD City:* Boston" in section_text
+    assert "*\U0001F465 Employees:* 100" in section_text
+    assert "*\U0001F464 Owner:* Alex" in section_text
+
+
+
+
 def test_single_record_result_renders_existing_hubspot_link():
     record_url = "https://app.hubspot.com/contacts/42/record/0-2/company-1"
     blocks = render_response_blocks(

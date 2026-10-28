@@ -469,12 +469,7 @@ class AccountIntelligenceAgent:
             or re.search(r"\boverdue\b|\bactive\s+pipeline\b", request.message, re.I)
             or (
                 deterministic_plan.object == "deal"
-                and deterministic_plan.group_by is not None
-                and re.search(
-                    r"\b(?:group|summary|compare|chart|graph|visuali[sz]e?)\b",
-                    request.message,
-                    re.I,
-                )
+                and (deterministic_plan.group_by is not None or deterministic_plan.chart_requested)
             )
             or (
                 deterministic_plan.object in {"contact", "company"}
@@ -1016,8 +1011,17 @@ class AccountIntelligenceAgent:
             text += f" Use offset {result['offset'] + result['total']} to view the next page."
         text = _format_batch2_slack_table(text, result.get("columns", []), rows)
         chart_url = None
+        no_chart = bool(
+            re.search(
+                r"\b(?:no|without|don't\s+show|do\s+not\s+show|omit|skip|hide)\s+(?:a\s+)?(?:chart|charts|graph|graphs|plot|plots|visuali[sz]ation|visuali[sz]ations)\b|"
+                r"\b(?:chart|graph|plot|visuali[sz]ation)\s*:\s*none\b",
+                request.message,
+                re.IGNORECASE,
+            )
+        )
         should_chart = bool(
             result.get("rows")
+            and not no_chart
             and (
                 plan.chart_requested
                 or (plan.group_by is not None and plan.object in {"contact", "company"})

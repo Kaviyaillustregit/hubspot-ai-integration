@@ -358,7 +358,7 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
                         return field
                 return _normalise_field_name(candidate, object_name)
     if object_name in {"company", "contact"} and re.search(
-        r"\b(?:count|counts|number\s+of|group(?:ed)?|breakdown|chart|graph|visuali[sz])\b",
+        r"\b(?:count|counts|number\s+of|group(?:ed)?|breakdown|distribution|trend|compare|chart|graph|visuali[sz])\b",
         text,
     ):
         grouped_by = re.search(
@@ -900,14 +900,36 @@ def plan_crm_query(message: str) -> CRMQueryPlan:
             else 0
         ),
         chart_requested=bool(
-            re.search(r"\b(?:chart|graph|visuali[sz]e?)\b", _normalise_text(message))
-            or ("pipeline" in _normalise_text(message) and "summary" in _normalise_text(message))
-            or (object_name in {"contact", "company"} and group_field is not None)
+            (not re.search(
+                r"\b(?:no|without|don't\s+show|do\s+not\s+show|omit|skip|hide)\s+(?:a\s+)?(?:chart|charts|graph|graphs|plot|plots|visuali[sz]ation|visuali[sz]ations)\b|"
+                r"\b(?:chart|graph|plot|visuali[sz]ation)\s*:\s*none\b",
+                _normalise_text(message),
+            ))
+            and (
+                re.search(r"\b(?:chart|charts|graph|graphs|plot|plots|visuali[sz]e?|visuali[sz]ation)\b", _normalise_text(message))
+                or ("pipeline" in _normalise_text(message) and "summary" in _normalise_text(message))
+                or re.search(r"\b(?:compare|comparison|versus|vs)\b", _normalise_text(message))
+                or re.search(r"\b(?:distribution|breakdown|trend|performance|proportion|share)\b", _normalise_text(message))
+                or re.search(r"\b(?:monthly|by\s+month|by\s+quarter|by\s+year|over\s+time)\b", _normalise_text(message))
+                or (
+                    object_name == "deal"
+                    and re.search(
+                        r"\b(?:top|highest|largest|biggest|leading)\b",
+                        _normalise_text(message),
+                    )
+                )
+                or (object_name in {"contact", "company"} and group_field is not None)
+            )
         ),
         chart_type=_default_chart_type(message, group_field),
     )
-    if object_name == "deal" and plan.chart_requested and plan.chart_type is None:
-        plan.chart_type = "funnel"
+    if not plan.chart_requested:
+        plan.chart_type = None
+    elif plan.chart_type is None:
+        if object_name == "deal":
+            plan.chart_type = "bar" if plan.sort else "funnel"
+        else:
+            plan.chart_type = "bar"
     return plan
 
 
@@ -945,11 +967,16 @@ def _default_chart_type(message: str, group_field: str | None) -> str | None:
     explicit = re.search(r"\b(bar|line|pie|doughnut|donut|funnel)\s+chart\b", text)
     if explicit:
         return "doughnut" if explicit.group(1) == "donut" else explicit.group(1)
-    if "pipeline" in text or "funnel" in text:
+    if "pipeline" in text or "funnel" in text or group_field == "pipeline":
         return "funnel"
-    if "trend" in text or "month" in text or "quarter" in text:
+    if (
+        re.search(r"\b(?:trend|monthly|quarterly|by\s+month|per\s+month|by\s+quarter|per\s+quarter|by\s+year|over\s+time)\b", text)
+        or group_field in {"month", "quarter", "year"}
+    ):
         return "line"
-    if "distribution" in text or "breakdown" in text or group_field is not None:
+    if "distribution" in text or "share" in text or "proportion" in text:
+        return "doughnut"
+    if "breakdown" in text or "compare" in text or "comparison" in text or "versus" in text or "vs" in text or group_field is not None:
         return "bar"
     return None
 

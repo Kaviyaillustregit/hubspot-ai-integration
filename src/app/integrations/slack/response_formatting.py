@@ -238,7 +238,47 @@ def _clean_block(block: Block, seen_hubspot_urls: set[str]) -> Block:
     return cleaned
 
 
+
+_SLACK_EMOJI_NAME_MAP: dict[str, str] = {
+    ":large_yellow_circle:": "\U0001F7E1",
+    ":yellow_circle:": "\U0001F7E1",
+    ":large_green_circle:": "\U0001F7E2",
+    ":green_circle:": "\U0001F7E2",
+    ":large_red_circle:": "\U0001F534",
+    ":red_circle:": "\U0001F534",
+    ":large_blue_circle:": "\U0001F535",
+    ":blue_circle:": "\U0001F535",
+    ":large_blue_diamond:": "\U0001F7E6",
+    ":blue_diamond:": "\U0001F7E6",
+    ":white_circle:": "\u26AA",
+    ":purple_circle:": "\U0001F7E3",
+    ":brown_circle:": "\U0001F7E4",
+    ":large_orange_circle:": "\U0001F7E0",
+    ":orange_circle:": "\U0001F7E0",
+}
+_SLACK_EMOJI_IMAGE_LINK = re.compile(
+    r"\[(?P<label>[^\]]*)\]\(https?://[^\s)]*slack-edge\.com[^\s)]*\)\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_slack_emoji_links(text: str) -> str:
+    def replace_emoji(match: re.Match[str]) -> str:
+        label = match.group("label").strip()
+        emoji = _SLACK_EMOJI_NAME_MAP.get(label.casefold())
+        if emoji:
+            return f"{emoji} "
+        if label.startswith(":") and label.endswith(":"):
+            return f"{label} "
+        return ""
+
+    text = _SLACK_EMOJI_IMAGE_LINK.sub(replace_emoji, text)
+    text = re.sub(r"https?://[^\s<>|)]*slack-edge\.com[^\s<>|)]*", "", text)
+    return text
+
+
 def _clean_mrkdwn(text: str, seen_hubspot_urls: set[str]) -> str:
+    text = _clean_slack_emoji_links(text)
     text = _normalize_escaped_slack_links(text)
 
     def replace_link(match: re.Match[str]) -> str:
@@ -330,6 +370,7 @@ def normalize_slack_display_text(text: str) -> str:
 
 
 def _normalize_display_prose(text: str) -> str:
+    text = _clean_slack_emoji_links(text)
     text = _decode_safe_entities(text)
     text = _NESTED_MARKDOWN_LINK.sub(_restore_nested_markdown_link, text)
     text = _normalize_escaped_slack_links(text)

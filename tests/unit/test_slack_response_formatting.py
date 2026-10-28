@@ -50,7 +50,11 @@ def test_channel_response_uses_panel_blocks_and_original_fallback_text():
         },
     }
 
-    asyncio.run(_respond(Agent(), Client(), payload, "tenant-1", "request-1"))
+
+    class Authorization:
+        async def is_authorized(self, *, tenant_id, slack_team_id, slack_user_id):
+            return True
+    asyncio.run(_respond(Agent(), Client(), Authorization(), payload, "tenant-1", "request-1"))
 
     assert len(sent) == 1
     channel, fallback, blocks = sent[0]
@@ -384,11 +388,23 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
         for block in blocks
     )
     assert all("fields" not in block for block in sections)
-    assert "*Name:* Cloud Migration Project" in section_text
-    assert "*Owner ID:* 98711688" in section_text
-    assert "*Stage:* Qualified To Buy" in section_text
-    assert "*Amount:* 250,000" in section_text
-    assert "*Close Date:* Dec 10, 2026" in section_text
+    if kind == "deal":
+        assert "*💼 Name:* Cloud Migration Project" in section_text
+        assert "*👤 Owner ID:* 98711688" in section_text
+        assert "*🟡 Stage:* Qualified To Buy" in section_text
+        assert "*💰 Amount:* *250,000*" in section_text
+        assert "*📅 Close Date:* Dec 10, 2026" in section_text
+        assert "🔗 <https://app.hubspot.com/contacts/123/record/0-3/456|View in HubSpot>" in encoded
+    elif kind == "contact":
+        assert "*👤 Name:* Cloud Migration Project" in section_text
+        assert "*👤 Owner ID:* 98711688" in section_text
+        assert "*💰 Amount:* *250,000*" in section_text
+        assert "*📅 Close Date:* Dec 10, 2026" in section_text
+    else:  # company
+        assert "*🏢 Name:* Cloud Migration Project" in section_text
+        assert "*👤 Owner ID:* 98711688" in section_text
+        assert "*💰 Amount:* *250,000*" in section_text
+        assert "*📅 Close Date:* Dec 10, 2026" in section_text
     assert "Owner ID" in encoded
     assert "Ada" not in encoded
     assert "Dec 10, 2026" in encoded
@@ -433,7 +449,7 @@ def test_grouped_analytics_render_structured_metrics_without_recalculating():
             "chart_title": "Deals by stage",
             "summary": {"matched_records": 5},
             "rows": [
-                {"group": "Qualified", "count": 3, "sum_amount": "125000"},
+                {"group": "Qualified To Buy", "count": 3, "sum_amount": "125000"},
                 {"group": "Closed Won", "count": 2, "sum_amount": "80000"},
             ],
         },
@@ -448,9 +464,9 @@ def test_grouped_analytics_render_structured_metrics_without_recalculating():
     )
 
     assert formatted.response_type == "chart"
-    assert "*Qualified*" in section_text
-    assert "*Qualified*: 3 deals" in section_text
-    assert "*Total amount:* 125,000" in section_text
+    assert "*\U0001F7E1 Qualified To Buy*" in section_text
+    assert "*\U0001F7E1 Qualified To Buy*: *3* deals" in section_text
+    assert "*Total amount:* *125,000*" in section_text
     assert not any("fields" in block for block in blocks)
     assert sum(block.get("type") == "divider" for block in blocks) == 1
     assert any(block.get("type") == "image" for block in blocks)
@@ -483,8 +499,8 @@ def test_grouped_summary_removes_only_duplicate_group_and_metric_aliases():
     )
 
     assert rendered.count("Qualified") == 1
-    assert rendered.count("*Total amount:* 125,000") == 1
-    assert "*Maximum amount:* 125,000" in rendered
+    assert rendered.count("*Total amount:* *125,000*") == 1
+    assert "*Maximum amount:* *125,000*" in rendered
 
 
 def test_grouped_summary_deduplicates_legacy_total_amount_alias():
@@ -505,6 +521,183 @@ def test_grouped_summary_deduplicates_legacy_total_amount_alias():
     rendered = json.dumps(render_response_blocks(response), ensure_ascii=False)
     assert rendered.count("Total amount:") == 1
 
+
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_dot"),
+    [
+        ("Appointment Scheduled", "\U0001F7E1"),
+        ("Qualified To Buy", "\U0001F7E1"),
+        ("Presentation Scheduled", "\U0001F535"),
+        ("Decision Maker Bought-In", "\U0001F535"),
+        ("Contract Sent", "\U0001F7E1"),
+        ("Closed Won", "\U0001F7E2"),
+        ("Closed Lost", "\U0001F534"),
+        ("Prospecting", "\u26AA"),
+        ("Qualification", "\U0001F535"),
+        ("Needs Analysis", "\U0001F7E1"),
+        ("Value Proposition", "\U0001F7E3"),
+        ("Id. Decision Makers", "\U0001F7E4"),
+        ("Proposal/Price Quote", "\U0001F7E0"),
+        ("Negotiation/Review", "\U0001F7E0"),
+    ],
+)
+def test_deal_stage_indicator_mapping_is_explicit_and_conservative(stage, expected_dot):
+    response = AgentResponse(
+        status="ok",
+        text="Found one deal.",
+        request_id=f"stage-dot-{stage}",
+        result={
+            "kind": "crm_intelligence",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "stage", "label": "Deal stage"},
+                ],
+                "rows": [{"dealname": "Deal 1", "stage": stage}],
+            },
+        },
+    )
+
+    rendered = json.dumps(render_response_blocks(response), ensure_ascii=False)
+    assert f"*{expected_dot} Deal stage:* {stage}" in rendered
+
+
+def test_deal_stage_indicator_is_case_insensitive_without_partial_matching():
+    response = AgentResponse(
+        status="ok",
+        text="Found one deal.",
+        request_id="stage-dot-case",
+        result={
+            "kind": "crm_intelligence",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "stage", "label": "Deal stage"},
+                ],
+                "rows": [{"dealname": "Deal 1", "stage": "cLoSeD wOn"}],
+            },
+        },
+    )
+
+    rendered = json.dumps(render_response_blocks(response), ensure_ascii=False)
+    assert "*\U0001F7E2 Deal stage:* cLoSeD wOn" in rendered
+
+    injection = AgentResponse(
+        status="ok",
+        text="Found one deal.",
+        request_id="stage-dot-injection",
+        result={
+            "kind": "crm_intelligence",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "stage", "label": "Deal stage"},
+                ],
+                "rows": [{"dealname": "Deal 1", "stage": "Closed Won*"}],
+            },
+        },
+    )
+
+    injected = json.dumps(render_response_blocks(injection), ensure_ascii=False)
+    assert "\U0001F7E2 Closed Won" not in injected
+
+
+def test_deal_stage_indicator_does_not_apply_to_non_deal_records_or_grouped_values():
+    contact = AgentResponse(
+        status="ok",
+        text="Found one contact.",
+        request_id="stage-dot-contact",
+        result={
+            "kind": "crm_intelligence",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Contact name"},
+                    {"key": "stage", "label": "Lifecycle stage"},
+                ],
+                "rows": [{"name": "Ava", "stage": "Closed Won"}],
+            },
+        },
+    )
+    rendered = json.dumps(render_response_blocks(contact), ensure_ascii=False)
+    assert "\U0001F7E2 Closed Won" not in rendered
+
+    grouped = AgentResponse(
+        status="ok",
+        text="Deals grouped by stage.",
+        request_id="stage-dot-grouped",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "deal", "group_by": "dealstage"},
+            "rows": [{"group": "Closed Won", "count": 1}],
+        },
+    )
+    grouped_rendered = json.dumps(render_response_blocks(grouped), ensure_ascii=False)
+    assert "*\U0001F7E2 Closed Won*" in grouped_rendered
+    assert "\U0001F534 Closed Won" not in grouped_rendered
+
+
+def test_grouped_deal_stage_summary_only_decorates_exact_known_stages():
+    response = AgentResponse(
+        status="ok",
+        text="Deals grouped by stage.",
+        request_id="grouped-stage-exact",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "deal", "group_by": "dealstage"},
+            "rows": [{"group": "Qualified", "count": 2}],
+        },
+    )
+
+    rendered = json.dumps(render_response_blocks(response), ensure_ascii=False)
+    assert "*Qualified*" in rendered
+    assert "\U0001F7E1 Qualified" not in rendered
+    assert "\U0001F535 Qualified" not in rendered
+
+
+def test_deal_stage_indicator_is_not_duplicated_when_already_decorated():
+    response = AgentResponse(
+        status="ok",
+        text="Found one deal.",
+        request_id="stage-dot-dup",
+        result={
+            "kind": "crm_intelligence",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "stage", "label": "Deal stage"},
+                ],
+                "rows": [{"dealname": "Deal 1", "stage": "\U0001F535 Qualified To Buy"}],
+            },
+        },
+    )
+
+    rendered = json.dumps(render_response_blocks(response), ensure_ascii=False)
+    assert "*\U0001F535 Deal stage:* Qualified To Buy" in rendered
+    assert "\U0001F535 \U0001F535" not in rendered
+
+
+def test_amount_emphasis_does_not_double_bold_existing_bold_values():
+    response = AgentResponse(
+        status="ok",
+        text="Found one deal.",
+        request_id="amount-double-bold",
+        result={
+            "kind": "crm_intelligence",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "amount", "label": "Amount"},
+                ],
+                "rows": [{"dealname": "Deal 1", "amount": "*250000*"}],
+            },
+        },
+    )
+
+    rendered = json.dumps(render_response_blocks(response), ensure_ascii=False)
+    assert "*\U0001F4B0 Amount:* *250000*" in rendered
+    assert "**250000**" not in rendered
 
 def test_grouped_details_table_renders_requested_fields_and_record_links():
     url = "https://app.hubspot.com/contacts/42/record/0-3/17"
@@ -672,3 +865,203 @@ def test_oversized_sections_are_split_without_losing_text():
     chunks = [block["text"]["text"] for block in formatted.messages[0]]
     assert all(len(chunk) <= 3000 for chunk in chunks)
     assert "".join(chunks) == body
+
+
+def test_grouped_dealstage_summary_renders_stage_emojis_regression():
+    """Regression: _grouped_result_table NameError for `plan` prevented
+    grouped dealstage summaries from rendering their stage emojis at all."""
+    import json
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    response = AgentResponse(
+        status="ok",
+        text="Deals grouped by stage.",
+        request_id="regression-grouped-stage",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "deal", "group_by": "dealstage"},
+            "rows": [
+                {"group": "Closed Won", "count": 2, "sum_amount": "80000"},
+                {"group": "Qualified To Buy", "count": 3, "sum_amount": "125000"},
+            ],
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    rendered = json.dumps(blocks, ensure_ascii=False)
+
+    # Grouped dealstage summaries must show the stage emoji as the row heading.
+    assert "*\U0001F7E2 Closed Won*" in rendered  # green dot for Closed Won
+    assert "*\U0001F7E1 Qualified To Buy*" in rendered  # yellow dot for Qualified To Buy
+    # No stage should appear without its decorator when it is a known stage.
+    assert "* Closed Won*" not in rendered.replace("*\U0001F7E2 Closed Won*", "")
+
+
+def test_contact_and_company_field_labels_have_emoji_prefixes_regression():
+    """Regression: contact and company field labels must carry their emoji
+    prefixes (e.g. \U0001F464 for name on a contact record)."""
+    import json
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    contact_response = AgentResponse(
+        status="ok",
+        text="Contact details.",
+        request_id="regression-contact-emoji",
+        result={
+            "kind": "crm_records",
+            "title": "Contact Details",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "phone", "label": "Phone"},
+                ],
+                "rows": [{"name": "Ava Kumar", "email": "ava@example.com", "phone": "+1 555 0100"}],
+            },
+        },
+    )
+
+    contact_blocks = render_response_blocks(contact_response)
+    contact_text = "\n".join(
+        block["text"]["text"]
+        for block in contact_blocks
+        if block.get("type") == "section"
+    )
+    # Name field on a contact card must carry the person emoji.
+    assert "*\U0001F464 Name:* Ava Kumar" in contact_text
+    # Email field on a contact card must carry the envelope emoji.
+    assert "*\U0001F4E7 Email:* ava@example.com" in contact_text
+    # Phone field on a contact card must carry the phone emoji.
+    assert "*\U0001F4DE Phone:* +1 555 0100" in contact_text
+
+    company_response = AgentResponse(
+        status="ok",
+        text="Company details.",
+        request_id="regression-company-emoji",
+        result={
+            "kind": "crm_records",
+            "title": "Company Details",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Name"},
+                    {"key": "domain", "label": "Domain"},
+                    {"key": "industry", "label": "Industry"},
+                    {"key": "city", "label": "City"},
+                ],
+                "rows": [
+                    {
+                        "name": "Northwind",
+                        "domain": "northwind.com",
+                        "industry": "Software",
+                        "city": "Seattle",
+                    }
+                ],
+            },
+        },
+    )
+
+    company_blocks = render_response_blocks(company_response)
+    company_text = "\n".join(
+        block["text"]["text"]
+        for block in company_blocks
+        if block.get("type") == "section"
+    )
+    # Company name field must carry the office building emoji.
+    assert "*\U0001F3E2 Name:* Northwind" in company_text
+    # Domain field must carry the globe emoji.
+    assert "*\U0001F310 Domain:* northwind.com" in company_text
+    # Industry field must carry the factory emoji.
+    assert "*\U0001F3ED Industry:* Software" in company_text
+    # City field must carry the pin emoji.
+    assert "*\U0001F4CD City:* Seattle" in company_text
+
+
+def test_slack_edge_emoji_image_links_do_not_leak_into_deal_stage_text_regression():
+    """Regression: leaked slack-edge emoji links such as [:large_yellow_circle:](url)
+    must render as native unicode emojis and not leak image URLs."""
+    import json
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    leaked_stage = "[:large_yellow_circle:](https://a.slack-edge.com/production-standard-emoji-assets/14.0/google-large/1f7e1.png) Qualified To Buy"
+    response = AgentResponse(
+        status="ok",
+        text=f"Deal stage: {leaked_stage}",
+        request_id="regression-slack-edge-link",
+        result={
+            "kind": "crm_records",
+            "title": "Deal Details",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Deal name"},
+                    {"key": "stage", "label": "Deal stage"},
+                    {"key": "amount", "label": "Amount"},
+                ],
+                "rows": [
+                    {
+                        "name": "Acme expansion",
+                        "stage": leaked_stage,
+                        "amount": "850000",
+                        "view_url": "https://app.hubspot.com/deals/123",
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    rendered = json.dumps(blocks, ensure_ascii=False)
+    assert "slack-edge.com" not in rendered
+    assert "\U0001F7E1" in rendered
+    assert "*\U0001F7E1 Deal stage:* Qualified To Buy" in rendered
+    assert "*💼 Deal name:* Acme expansion" in rendered
+    assert "*💰 Amount:* *850,000*" in rendered
+    assert "🔗 <https://app.hubspot.com/deals/123|View in HubSpot>" in rendered
+
+
+def test_grouped_deal_stage_summary_all_expected_colors_regression():
+    """Regression: all 7 standard pipeline stages must render with their exact expected emoji dot:
+    🟡 Appointment Scheduled
+    🟡 Qualified To Buy
+    🔵 Presentation Scheduled
+    🔵 Decision Maker Bought-In
+    🟡 Contract Sent
+    🟢 Closed Won
+    🔴 Closed Lost
+    """
+    import json
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    rows = [
+        {"group": "Appointment Scheduled", "count": 5, "sum_amount": "819000"},
+        {"group": "Qualified To Buy", "count": 4, "sum_amount": "1707000"},
+        {"group": "Presentation Scheduled", "count": 3, "sum_amount": "146000"},
+        {"group": "Decision Maker Bought-In", "count": 3, "sum_amount": "430000"},
+        {"group": "Contract Sent", "count": 4, "sum_amount": "1300000"},
+        {"group": "Closed Won", "count": 4, "sum_amount": "477000"},
+        {"group": "Closed Lost", "count": 4, "sum_amount": "980000"},
+    ]
+    response = AgentResponse(
+        status="ok",
+        text="Pipeline breakdown",
+        request_id="regression-all-stages",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "deal", "group_by": "dealstage"},
+            "rows": rows,
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    rendered = json.dumps(blocks, ensure_ascii=False)
+
+    assert "*\U0001F7E1 Appointment Scheduled*: *5* deals | *Total amount:* *819,000*" in rendered
+    assert "*\U0001F7E1 Qualified To Buy*: *4* deals | *Total amount:* *1,707,000*" in rendered
+    assert "*\U0001F535 Presentation Scheduled*: *3* deals | *Total amount:* *146,000*" in rendered
+    assert "*\U0001F535 Decision Maker Bought-In*: *3* deals | *Total amount:* *430,000*" in rendered
+    assert "*\U0001F7E1 Contract Sent*: *4* deals | *Total amount:* *1,300,000*" in rendered
+    assert "*\U0001F7E2 Closed Won*: *4* deals | *Total amount:* *477,000*" in rendered
+    assert "*\U0001F534 Closed Lost*: *4* deals | *Total amount:* *980,000*" in rendered

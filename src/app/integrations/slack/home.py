@@ -36,6 +36,329 @@ _HISTORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _HISTORY_TOKEN_PATTERN = re.compile(r"<[^<>\n]*>|https?://[^\s<>]+|\s+|[^\s]+", re.IGNORECASE)
 _HISTORY_PAGE_BLOCK_CHARS = 3000
 
+_RECENT_CRM_ACTIVITY_HEADING = "\U0001F552 *Recent CRM Activity*"
+_DEAL_RECORDS_HEADING = "\U0001F4BC *Deal records*"
+
+_DOT_GREEN = "\U0001F7E2"
+_DOT_YELLOW = "\U0001F7E1"
+_DOT_RED = "\U0001F534"
+_DOT_BLUE = "\U0001F535"
+_DOT_SQUARE_BLUE = "\U0001F7E6"
+_DOT_WHITE = "\u26AA"
+_DOT_PURPLE = "\U0001F7E3"
+_DOT_BROWN = "\U0001F7E4"
+_DOT_ORANGE = "\U0001F7E0"
+
+# Some upstream content may contain UTF-8 em-dash bytes decoded as latin-1.
+_MOJIBAKE_EM_DASH = "—".encode("utf-8").decode("latin-1")
+
+_STAGE_DOTS: dict[str, str] = {
+    "appointment scheduled": _DOT_YELLOW,
+    "qualified to buy": _DOT_YELLOW,
+    "presentation scheduled": _DOT_BLUE,
+    "decision maker bought-in": _DOT_BLUE,
+    "contract sent": _DOT_YELLOW,
+    "closed won": _DOT_GREEN,
+    "closed lost": _DOT_RED,
+    "prospecting": _DOT_WHITE,
+    "qualification": _DOT_BLUE,
+    "needs analysis": _DOT_YELLOW,
+    "value proposition": _DOT_PURPLE,
+    "id. decision makers": _DOT_BROWN,
+    "id decision makers": _DOT_BROWN,
+    "perception analysis": _DOT_SQUARE_BLUE,
+    "proposal/price quote": _DOT_ORANGE,
+    "negotiation/review": _DOT_ORANGE,
+}
+
+_SLACK_EMOJI_NAME_MAP: dict[str, str] = {
+    ":large_yellow_circle:": _DOT_YELLOW,
+    ":yellow_circle:": _DOT_YELLOW,
+    ":large_green_circle:": _DOT_GREEN,
+    ":green_circle:": _DOT_GREEN,
+    ":large_red_circle:": _DOT_RED,
+    ":red_circle:": _DOT_RED,
+    ":large_blue_circle:": _DOT_BLUE,
+    ":blue_circle:": _DOT_BLUE,
+    ":large_blue_diamond:": _DOT_SQUARE_BLUE,
+    ":blue_diamond:": _DOT_SQUARE_BLUE,
+    ":white_circle:": _DOT_WHITE,
+    ":purple_circle:": _DOT_PURPLE,
+    ":brown_circle:": _DOT_BROWN,
+    ":large_orange_circle:": _DOT_ORANGE,
+    ":orange_circle:": _DOT_ORANGE,
+}
+
+_SLACK_EMOJI_IMAGE_LINK = re.compile(
+    r"\[(?P<label>[^\]]*)\]\(https?://[^\s)]*slack-edge\.com[^\s)]*\)\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_slack_emoji_links(text: str) -> str:
+    def replace_emoji(match: re.Match[str]) -> str:
+        label = match.group("label").strip()
+        emoji = _SLACK_EMOJI_NAME_MAP.get(label.casefold())
+        if emoji:
+            return f"{emoji} "
+        if label.startswith(":") and label.endswith(":"):
+            return f"{label} "
+        return ""
+
+    text = _SLACK_EMOJI_IMAGE_LINK.sub(replace_emoji, text)
+    text = re.sub(r"https?://[^\s<>|)]*slack-edge\.com[^\s<>|)]*", "", text)
+    return text
+
+
+def _stage_dot(value: str) -> str | None:
+    cleaned = _clean_slack_emoji_links(value)
+    stripped = cleaned.strip()
+    if not stripped:
+        return None
+    for dot in (
+        _DOT_GREEN,
+        _DOT_YELLOW,
+        _DOT_RED,
+        _DOT_BLUE,
+        _DOT_SQUARE_BLUE,
+        _DOT_WHITE,
+        _DOT_PURPLE,
+        _DOT_BROWN,
+        _DOT_ORANGE,
+    ):
+        if stripped.startswith(f"{dot} "):
+            return dot
+
+    normalized = " ".join(stripped.casefold().split())
+    return _STAGE_DOTS.get(normalized)
+
+
+def _clean_deal_stage_value(value: str) -> str:
+    cleaned = _clean_slack_emoji_links(value)
+    stripped = cleaned.strip()
+    for dot in (
+        _DOT_GREEN,
+        _DOT_YELLOW,
+        _DOT_RED,
+        _DOT_BLUE,
+        _DOT_SQUARE_BLUE,
+        _DOT_WHITE,
+        _DOT_PURPLE,
+        _DOT_BROWN,
+        _DOT_ORANGE,
+    ):
+        if stripped.startswith(f"{dot} "):
+            return stripped.removeprefix(f"{dot} ").strip()
+    return stripped
+
+
+def _decorate_deal_stage(value: str) -> str:
+    cleaned = _clean_slack_emoji_links(value)
+    stripped = cleaned.strip()
+    if not stripped:
+        return value
+    for dot in (
+        _DOT_GREEN,
+        _DOT_YELLOW,
+        _DOT_RED,
+        _DOT_BLUE,
+        _DOT_SQUARE_BLUE,
+        _DOT_WHITE,
+        _DOT_PURPLE,
+        _DOT_BROWN,
+        _DOT_ORANGE,
+    ):
+        if stripped.startswith(f"{dot} "):
+            return stripped
+    dot = _stage_dot(stripped)
+    if dot:
+        return f"{dot} {stripped}"
+    return stripped
+
+
+def _decorate_deal_stage_or_status(key: str, label: str, value: str, *, is_deal_row: bool) -> str:
+    if not is_deal_row:
+        return value
+    normalized_key = key.casefold()
+    if normalized_key in {"stage", "dealstage", "status", "dealstatus"}:
+        return _decorate_deal_stage(value)
+    return value
+
+
+_FIELD_EMOJI_PREFIXES = {
+    _DOT_GREEN,
+    _DOT_YELLOW,
+    _DOT_RED,
+    _DOT_BLUE,
+    _DOT_SQUARE_BLUE,
+    _DOT_WHITE,
+    _DOT_PURPLE,
+    _DOT_BROWN,
+    _DOT_ORANGE,
+    "\U0001F464",  # 👤
+    "\U0001F4E7",  # 📧
+    "\U0001F4DE",  # 📞
+    "\U0001F3E2",  # 🏢
+    "\U0001F454",  # 👔
+    "\U0001F310",  # 🌐
+    "\U0001F3ED",  # 🏭
+    "\U0001F4CD",  # 📍
+    "\U0001F465",  # 👥
+    "\U0001F4BC",  # 💼
+    "\U0001F4B0",  # 💰
+    "\U0001F4C5",  # 📅
+    "\U0001F517",  # 🔗
+}
+
+
+def _prefix_field_emoji(label: str, emoji: str) -> str:
+    stripped = label.lstrip()
+    if any(stripped.startswith(f"{prefix} ") for prefix in _FIELD_EMOJI_PREFIXES):
+        return label
+    return f"{emoji} {label}"
+
+
+def _decorate_field_label(
+    record_type: str | None,
+    key: str,
+    label: str,
+    *,
+    stage_value: str | None = None,
+) -> str:
+    normalized_key = key.casefold()
+    normalized_label = " ".join(label.casefold().split())
+
+    # Global amount and revenue fields
+    if (
+        normalized_key in {"amount", "total_amount", "sum_amount"}
+        or "amount" in normalized_label
+        or "revenue" in normalized_label
+    ):
+        return _prefix_field_emoji(label, "\U0001F4B0")  # 💰
+
+    # Global date fields
+    if (
+        normalized_key in {"closedate", "close_date", "createdate", "create_date"}
+        or "close date" in normalized_label
+        or "closing date" in normalized_label
+        or "create date" in normalized_label
+        or "creation date" in normalized_label
+        or normalized_label.endswith(" date")
+    ):
+        return _prefix_field_emoji(label, "\U0001F4C5")  # 📅
+
+    # Link / URL fields
+    if (
+        normalized_key in {"view_url", "hubspot_url"}
+        or "hubspot record" in normalized_label
+        or "view in hubspot" in normalized_label
+    ):
+        return _prefix_field_emoji(label, "\U0001F517")  # 🔗
+
+    if record_type == "contact":
+        if (
+            normalized_key in {"name", "contactname", "firstname", "lastname"}
+            or normalized_label in {"name", "contact name", "first name", "last name"}
+        ):
+            return _prefix_field_emoji(label, "\U0001F464")  # 👤
+        if normalized_key == "email" or "email" in normalized_label:
+            return _prefix_field_emoji(label, "\U0001F4E7")  # 📧
+        if normalized_key in {"phone", "mobilephone"} or "phone" in normalized_label:
+            return _prefix_field_emoji(label, "\U0001F4DE")  # 📞
+        if (
+            normalized_key in {"company", "company_name", "companyname"}
+            or normalized_label == "company"
+            or "company" in normalized_label
+        ):
+            return _prefix_field_emoji(label, "\U0001F3E2")  # 🏢
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return _prefix_field_emoji(label, "\U0001F454")  # 👔
+        return label
+
+    if record_type == "company":
+        if (
+            normalized_key in {"name", "companyname", "company_name"}
+            or normalized_label in {"name", "company name"}
+        ):
+            return _prefix_field_emoji(label, "\U0001F3E2")  # 🏢
+        if normalized_key in {"domain", "website"} or "domain" in normalized_label or "website" in normalized_label:
+            return _prefix_field_emoji(label, "\U0001F310")  # 🌐
+        if normalized_key == "industry" or "industry" in normalized_label:
+            return _prefix_field_emoji(label, "\U0001F3ED")  # 🏭
+        if normalized_key in {"city", "location"} or "city" in normalized_label or "location" in normalized_label:
+            return _prefix_field_emoji(label, "\U0001F4CD")  # 📍
+        if (
+            normalized_key in {"employees", "numemployees", "employee_count"}
+            or "employee" in normalized_label
+        ):
+            return _prefix_field_emoji(label, "\U0001F465")  # 👥
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return _prefix_field_emoji(label, "\U0001F464")  # 👤
+        return label
+
+    if record_type == "deal":
+        if (
+            normalized_key in {"name", "dealname", "deal_name"}
+            or normalized_label in {"name", "deal name"}
+        ):
+            return _prefix_field_emoji(label, "\U0001F4BC")  # 💼
+        if (
+            normalized_key in {"stage", "dealstage", "deal_stage", "status", "dealstatus"}
+            or "stage" in normalized_label
+        ):
+            dot = _stage_dot(stage_value or label) or _DOT_YELLOW
+            return _prefix_field_emoji(label, dot)
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return _prefix_field_emoji(label, "\U0001F464")  # 👤
+        return label
+
+    return label
+
+
+def _infer_record_type_for_columns(columns: list[dict[str, str]]) -> str | None:
+    keys = {column.get("key", "").casefold() for column in columns}
+    labels = {column.get("label", "").casefold() for column in columns}
+
+    is_deal_row = bool(
+        keys.intersection({"dealname", "dealstage", "closedate"})
+        or any("deal" in label for label in labels)
+    )
+    if is_deal_row:
+        return "deal"
+
+    is_contact = bool(
+        keys.intersection({"email", "phone", "mobilephone", "firstname", "lastname", "contactname", "contact_name", "jobtitle"})
+        or any("contact" in label or "email" in label or "phone" in label for label in labels)
+    )
+    is_company = bool(
+        keys.intersection({"domain", "website", "industry", "city", "numemployees", "employees", "employee_count", "companyname", "company_name"})
+        or any("company" in label or "domain" in label or "industry" in label or "employee" in label for label in labels)
+    )
+
+    if is_contact and not is_company:
+        return "contact"
+    if is_company and not is_contact:
+        return "company"
+    if is_company and is_contact:
+        if any("company" in label for label in labels) or keys.intersection({"domain", "companyname", "company_name"}):
+            return "company"
+        return "contact"
+    return None
+
+
+def _bold_metric_value(key: str, value: str) -> str:
+    normalized_key = key.casefold()
+    if normalized_key in {
+        "amount", "sum_amount", "sum_amount_value", "total_amount", "total_amount_value",
+        "avg_amount", "avg_amount_value", "min_amount", "min_amount_value",
+        "max_amount", "max_amount_value", "count",
+    }:
+        stripped = value.strip()
+        if stripped and not (stripped.startswith("*") and stripped.endswith("*")):
+            return f"*{stripped}*"
+    return value
+
+
 Block = dict[str, Any]
 
 
@@ -819,6 +1142,19 @@ def _grouped_result_table(result: dict[str, Any]) -> dict[str, Any] | None:
         "dealstage": "Deal stage",
         "pipeline": "Pipeline",
     }
+    plan = result.get("plan")
+    group_by = plan.get("group_by") if isinstance(plan, dict) else None
+    if isinstance(group_by, str):
+        normalized_group_by = " ".join(group_by.casefold().split())
+        if normalized_group_by in {"dealstage", "stage"}:
+            labels["group"] = "Deal stage"
+            labels["label"] = "Deal stage"
+            labels["stage"] = "Deal stage"
+        elif normalized_group_by == "pipeline":
+            labels["group"] = "Pipeline"
+            labels["label"] = "Pipeline"
+            labels["pipeline"] = "Pipeline"
+
     return {
         "columns": [
             {"key": key, "label": labels.get(key, key.replace("_", " ").title())}
@@ -928,21 +1264,36 @@ def _render_table_row(
     show_missing: bool = False,
     structured: bool = False,
 ) -> list[Block]:
+    is_deal_row = any(column.get("key") in {"dealname", "dealstage", "closedate"} for column in columns) or any(
+        "deal" in column.get("label", "").casefold() for column in columns
+    )
+    record_type = _infer_record_type_for_columns(columns)
+    if record_type == "deal":
+        is_deal_row = True
     lines: list[str] = []
     grouped_fields: list[tuple[str, str, str]] = []
     for column in columns:
         key = column["key"]
-        label = html.escape(column["label"], quote=False)
+        raw_label = column["label"]
         raw_value = row.get(key)
+        is_stage_key = (
+            key.casefold() in {"stage", "dealstage", "deal_stage", "status", "dealstatus"}
+            or "stage" in str(raw_label).casefold()
+        )
+        stage_val = str(raw_value or "") if is_stage_key and is_deal_row else None
+        label = html.escape(_decorate_field_label(record_type, key, raw_label, stage_value=stage_val), quote=False)
+
         if key == "view_url":
             value = _slack_hubspot_link(raw_value)
             if value == "—":
                 if show_missing:
-                    lines.append("*HubSpot record:* Not available")
+                    lines.append("*\U0001F517 HubSpot record:* Not available")
             else:
-                lines.append(value)
-                grouped_fields.append((key, "HubSpot record", value))
+                link_text = f"\U0001F517 {value}"
+                lines.append(link_text)
+                grouped_fields.append((key, "HubSpot record", link_text))
             continue
+
         if key.endswith("_links") and isinstance(raw_value, list):
             links = []
             for association in raw_value:
@@ -964,26 +1315,43 @@ def _render_table_row(
                 and isinstance(raw_value, str)
                 and raw_value.isdigit()
             ):
-                label = "Owner ID"
-            value = html.escape(
+                label = html.escape(_prefix_field_emoji("Owner ID", "\U0001F464"), quote=False)
+
+            displayed = (
                 "Unassigned"
                 if key in {"owner", "hubspot_owner_id"} and raw_value in (None, "")
                 else "Not available"
                 if show_missing and (
-                    raw_value is None or raw_value == "" or raw_value == "—" or raw_value == "â€”"
+                    raw_value is None or raw_value == "" or raw_value == "—" or raw_value == _MOJIBAKE_EM_DASH
                 )
-                else format_property_value(key, raw_value),
-                quote=False,
+                else format_property_value(key, raw_value)
             )
+
+            if is_deal_row and is_stage_key and stage_val:
+                displayed = _clean_deal_stage_value(displayed)
+            else:
+                displayed = _decorate_deal_stage_or_status(
+                    key,
+                    raw_label,
+                    displayed,
+                    is_deal_row=is_deal_row,
+                )
+
+            displayed = _bold_metric_value(key, displayed)
+            value = html.escape(displayed, quote=False)
+
         if not value:
             continue
+
         lines.append(f"*{label}:* {value}")
         grouped_fields.append((key, html.unescape(label), value))
 
     if not lines:
         return [_section("No record details available.")]
+
     if structured:
         return _render_grouped_row(grouped_fields)
+
     content: list[str] = []
     current = ""
     for line in lines:
@@ -994,6 +1362,7 @@ def _render_table_row(
             current = f"{current}\n{part}" if current else part
     if current:
         content.append(current)
+
     return [_section(chunk) for chunk in content]
 
 
@@ -1003,21 +1372,29 @@ def _render_record_card(
     row: dict[str, Any],
     *,
     record_url: object = None,
+    status_dot: str = "",
 ) -> list[Block]:
     headings = {
         "deal": "\U0001F4BC Deal details",
         "contact": "\U0001F464 Contact details",
         "company": "\U0001F3E2 Company details",
     }
-    blocks: list[Block] = [_header(headings[record_type]), {"type": "divider"}]
+    heading = headings[record_type]
+    if status_dot:
+        heading = f"{status_dot} {heading}"
+
+    blocks: list[Block] = [_header(heading), {"type": "divider"}]
     rendered_row = dict(row)
     if not rendered_row.get("view_url") and isinstance(record_url, str):
         rendered_row["view_url"] = record_url
+
     row_columns = list(columns)
     if not any(column.get("key") == "view_url" for column in row_columns):
         url = rendered_row.get("view_url")
         if isinstance(url, str) and url:
             row_columns.append({"key": "view_url", "label": "HubSpot record"})
+
+    is_deal_row = record_type == "deal"
     lines: list[str] = []
     for column in row_columns:
         key = column.get("key", "")
@@ -1026,25 +1403,45 @@ def _render_record_card(
             link = _slack_hubspot_link(raw_value)
             if link == "—":
                 continue
-            lines.append(link)
+            lines.append(f"\U0001F517 {link}")
             continue
         else:
+            is_stage_key = (
+                key.casefold() in {"stage", "dealstage", "deal_stage", "status", "dealstatus"}
+                or "stage" in str(column.get("label", "")).casefold()
+            )
+            stage_val = str(raw_value or "") if is_stage_key and is_deal_row else None
             label = column.get("label", key.replace("_", " ").title())
+            label = _decorate_field_label(record_type, key, str(label), stage_value=stage_val)
+
             if (
                 key in {"owner", "hubspot_owner_id"}
                 and isinstance(raw_value, str)
                 and raw_value.isdigit()
             ):
-                label = "Owner ID"
+                label = _prefix_field_emoji("Owner ID", "\U0001F464")
+
             if key in {"owner", "hubspot_owner_id"} and raw_value in (None, ""):
                 displayed = "Unassigned"
-            elif raw_value is None or raw_value == "" or raw_value == "—" or raw_value == "â€”":
+            elif raw_value is None or raw_value == "" or raw_value == "—" or raw_value == _MOJIBAKE_EM_DASH:
                 displayed = "Not available"
             else:
                 displayed = format_property_value(key, raw_value)
+
+            if is_deal_row and is_stage_key and stage_val:
+                displayed = _clean_deal_stage_value(displayed)
+            else:
+                displayed = _decorate_deal_stage_or_status(
+                    key,
+                    str(label),
+                    displayed,
+                    is_deal_row=is_deal_row,
+                )
+            displayed = _bold_metric_value(key, displayed)
             value = html.escape(displayed, quote=False)
 
         lines.append(f"*{html.escape(label, quote=False)}:* {value}")
+
     if lines:
         blocks.extend(
             _section(chunk)
@@ -1071,17 +1468,31 @@ def _render_grouped_row(fields: list[tuple[str, str, str]]) -> list[Block]:
         "max_amount_value": "Maximum amount",
     }
     group_items = [item for item in fields if item[0].casefold() in group_keys]
+    deal_stage_summary = any(
+        "deal stage" in item[1].casefold()
+        or item[1].casefold().endswith("stage")
+        or item[0].casefold() in {"dealstage", "stage"}
+        for item in group_items
+    )
     group_lines: list[str] = []
     group_values: set[str] = set()
     for _key, label, value in group_items:
+        rendered_value = value
+        cleaned_val = _clean_slack_emoji_links(html.unescape(value)).strip()
+        if deal_stage_summary or _key.casefold() in {"dealstage", "stage"} or "stage" in label.casefold():
+            dot = _stage_dot(cleaned_val)
+            if dot:
+                rendered_value = html.escape(f"{dot} {cleaned_val}", quote=False)
+            else:
+                rendered_value = html.escape(cleaned_val, quote=False)
         normalized = value.strip().casefold()
         if normalized in group_values:
             continue
         group_values.add(normalized)
         if not group_lines:
-            group_lines.append(f"*{value}*")
+            group_lines.append(f"*{rendered_value}*")
         else:
-            group_lines.append(f"*{html.escape(label, quote=False)}:* {value}")
+            group_lines.append(f"*{html.escape(label, quote=False)}:* {rendered_value}")
 
     metrics: list[str] = []
     seen_metrics: set[tuple[str, str]] = set()
@@ -1090,8 +1501,9 @@ def _render_grouped_row(fields: list[tuple[str, str, str]]) -> list[Block]:
         if normalized_key in group_keys:
             continue
         if normalized_key == "count":
-            count = int(value) if value.isdigit() else None
-            metrics.append(f"{value} {'deal' if count == 1 else 'deals'}")
+            stripped_val = value.strip("*").strip()
+            count = int(stripped_val) if stripped_val.isdigit() else None
+            metrics.append(f"*{stripped_val}* {'deal' if count == 1 else 'deals'}")
             continue
         display_label = metric_labels.get(normalized_key, label)
         if normalized_key in metric_labels:
@@ -1099,15 +1511,18 @@ def _render_grouped_row(fields: list[tuple[str, str, str]]) -> list[Block]:
             if dedupe_key in seen_metrics:
                 continue
             seen_metrics.add(dedupe_key)
-        metrics.append(f"*{html.escape(display_label, quote=False)}:* {value}")
+        emphasized = _bold_metric_value(normalized_key, html.escape(value, quote=False))
+        metrics.append(f"*{html.escape(display_label, quote=False)}:* {emphasized}")
 
     if group_lines and metrics:
         group_lines[0] += ": " + " | ".join(metrics)
         lines = group_lines
     else:
         lines = group_lines + ([" | ".join(metrics)] if metrics else [])
+
     if not lines:
         return [_section("No record details available.")]
+
     return [
         _section(chunk)
         for chunk in _split_escaped_text("\n".join(lines), _MAX_SECTION_TEXT)
