@@ -443,6 +443,36 @@ def parse_home_interaction(payload: object) -> HomeInteraction | None:
             action_id=confirmation_id,
             action_ts=action_ts,
         )
+    if action_id == "select_field":
+        selected = action.get("selected_option")
+        val = selected.get("value") if isinstance(selected, dict) else action.get("value")
+        return HomeInteraction(
+            team_id,
+            user_id,
+            "select_field",
+            text=str(val or ""),
+            action_ts=action_ts,
+        )
+    if action_id == "select_value":
+        selected = action.get("selected_option")
+        val = selected.get("value") if isinstance(selected, dict) else action.get("value")
+        return HomeInteraction(
+            team_id,
+            user_id,
+            "select_value",
+            text=str(val or ""),
+            action_ts=action_ts,
+        )
+    if action_id == "select_contact":
+        val = action.get("value")
+        return HomeInteraction(
+            team_id,
+            user_id,
+            "select_contact",
+            text=str(val or ""),
+            action_id=str(val or ""),
+            action_ts=action_ts,
+        )
     if action_id == VIEW_FULL_RESPONSE_ACTION:
         value = action.get("value")
         if not isinstance(value, str) or ":" not in value:
@@ -921,6 +951,138 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
                 *_record_link_blocks(response),
             ]
 
+    if response.status == "needs_field" or kind == "interactive_field_selection":
+        contact_id = result.get("contact_id", "")
+        contact_name = result.get("contact_name", "Contact")
+        email = result.get("email")
+        fields = result.get("fields", [])
+
+        detail_lines = [f"👤 *{html.escape(str(contact_name), quote=False)}*"]
+        if email:
+            detail_lines.append(f"• Email: {html.escape(str(email), quote=False)}")
+        if contact_id:
+            detail_lines.append(f"• HubSpot ID: `{html.escape(str(contact_id), quote=False)}`")
+
+        options = [
+            {
+                "text": _plain(f["label"]),
+                "value": f"{contact_id}:{f['value']}",
+            }
+            for f in fields
+        ]
+
+        blocks = [
+            _section("*Select a field to update*"),
+            _section("\n".join(detail_lines)),
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "static_select",
+                        "action_id": "select_field",
+                        "placeholder": _plain("Choose a field..."),
+                        "options": options,
+                    }
+                ],
+            },
+            *_record_link_blocks(response),
+        ]
+        return blocks
+
+    if response.status == "needs_field_value" or kind == "interactive_field_value_prompt":
+        contact_id = result.get("contact_id", "")
+        contact_name = result.get("contact_name", "Contact")
+        field_label = result.get("field_label", "Field")
+        current_value = result.get("current_value", "Not set")
+
+        return [
+            _section(f"🟡 ❓ *Update {field_label}*"),
+            _section(
+                f"👤 *Contact:* {html.escape(str(contact_name), quote=False)}\n"
+                f"Current {field_label}: {html.escape(str(current_value), quote=False)}\n\n"
+                f"What should {html.escape(str(contact_name), quote=False)}'s new {field_label} be?"
+            ),
+            *_record_link_blocks(response),
+        ]
+
+    if response.status == "needs_value" or kind == "interactive_value_selection":
+        contact_id = result.get("contact_id", "")
+        contact_name = result.get("contact_name", "Contact")
+        field_label = result.get("field_label", "Field")
+        field_name = result.get("field", "lifecyclestage")
+        stage_options = result.get("options", [])
+
+        options = [
+            {
+                "text": _plain(opt["label"]),
+                "value": f"{contact_id}:{field_name}:{opt['value']}",
+            }
+            for opt in stage_options
+        ]
+
+        detail_text = f"Choose a new {html.escape(field_label.lower(), quote=False)} for *{html.escape(str(contact_name), quote=False)}*:"
+        if result.get("current_value"):
+            detail_text = f"Current {field_label}: *{html.escape(str(result.get('current_value')), quote=False)}*\n{detail_text}"
+
+        blocks = [
+            _section(f"*Select {field_label}*"),
+            _section(detail_text),
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "static_select",
+                        "action_id": "select_value",
+                        "placeholder": _plain(f"Choose {field_label.lower()}..."),
+                        "options": options,
+                    }
+                ],
+            },
+            *_record_link_blocks(response),
+        ]
+        return blocks
+
+
+
+    if response.status == "contact_ambiguous" or kind == "interactive_contact_selection":
+        search_name = result.get("search_name", "contact")
+        candidates = result.get("candidates", [])
+
+        blocks = [
+            _section("*Multiple matching contacts*"),
+            _section(f"I found multiple contacts matching *{html.escape(str(search_name), quote=False)}*. Please select one:"),
+        ]
+
+        for cand in candidates[:5]:
+            c_id = cand.get("id", "")
+            c_name = cand.get("name", "Unknown")
+            c_email = cand.get("email") or "No email"
+            c_company = cand.get("company")
+            c_url = cand.get("hubspot_url")
+
+            lines = [f"👤 *{html.escape(str(c_name), quote=False)}*"]
+            lines.append(f"• Email: {html.escape(str(c_email), quote=False)}")
+            if c_company:
+                lines.append(f"• Company: {html.escape(str(c_company), quote=False)}")
+            lines.append(f"• HubSpot ID: `{html.escape(str(c_id), quote=False)}`")
+            if c_url:
+                lines.append(f"• <{c_url}|View in HubSpot>")
+
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(lines)},
+                "accessory": {
+                    "type": "button",
+                    "action_id": "select_contact",
+                    "text": _plain("Select"),
+                    "value": str(c_id),
+                },
+            })
+
+        return blocks
+
+
+
     if response.status in {"missing_fields", "invalid_request", "company_ambiguous"}:
         heading = "*More information needed*"
     elif response.status == "already_exists":
@@ -990,6 +1152,8 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
         blocks.extend(_record_link_blocks(response))
         return blocks
 
+
+
     if table is not None:
         if detail_type and len(table["rows"]) == 1:
             return _render_record_card(
@@ -1017,6 +1181,8 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
             if notice:
                 blocks.append(_context(notice))
             return blocks
+
+
         return _render_table_response(
             heading, response.text, table, structured_rows=grouped
         )
@@ -1226,6 +1392,8 @@ def _render_table_response(
     if not rows:
         blocks.append(_context("No records to display."))
         return blocks
+
+
 
     rendered_rows = 0
     limit_reached = False

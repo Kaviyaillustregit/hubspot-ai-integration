@@ -18,7 +18,76 @@ CONTACT_PROPERTY_FIELDS: dict[str, str] = {
     "email": "email",
     "phone": "phone",
     "job_title": "jobtitle",
+    "lead_status": "hs_lead_status",
+    "mobile_phone": "mobilephone",
+    "website": "website",
+    "address": "address",
+    "city": "city",
+    "state": "state",
+    "country": "country",
+    "description": "description",
+    "contact_owner": "hubspot_owner_id",
 }
+
+CONTACT_PROPERTY_ALIASES: dict[str, str] = {
+    "first name": "firstname", "firstname": "firstname", "first": "firstname", "fname": "firstname",
+    "last name": "lastname", "lastname": "lastname", "last": "lastname", "lname": "lastname", "surname": "lastname",
+    "email": "email", "email address": "email", "emaid": "email", "emai": "email", "e-mail": "email",
+    "phone": "phone", "phone number": "phone", "phonenumber": "phone", "telephone": "phone", "tel": "phone",
+    "mobile": "mobilephone", "mobile phone": "mobilephone", "mobilephone": "mobilephone", "cell": "mobilephone", "cell phone": "mobilephone",
+    "job title": "jobtitle", "jobtitle": "jobtitle", "title": "jobtitle", "role": "jobtitle", "position": "jobtitle",
+    "lifecycle stage": "lifecyclestage", "lifecyclestage": "lifecyclestage", "lifecycle": "lifecyclestage", "stage": "lifecyclestage",
+    "lead status": "hs_lead_status", "leadstatus": "hs_lead_status", "status": "hs_lead_status",
+    "hs_lead_status": "hs_lead_status", "hs lead status": "hs_lead_status", "lead_status": "hs_lead_status",
+    "owner": "hubspot_owner_id", "contact owner": "hubspot_owner_id", "rep": "hubspot_owner_id",
+    "website": "website", "url": "website",
+    "address": "address", "city": "city", "state": "state", "country": "country",
+    "company": "company", "company name": "company",
+    "description": "description", "notes": "description",
+}
+
+VALID_LIFECYCLE_STAGES: dict[str, str] = {
+    "subscriber": "subscriber",
+    "lead": "lead",
+    "marketingqualifiedlead": "marketingqualifiedlead",
+    "marketing qualified lead": "marketingqualifiedlead",
+    "mql": "marketingqualifiedlead",
+    "salesqualifiedlead": "salesqualifiedlead",
+    "sales qualified lead": "salesqualifiedlead",
+    "sql": "salesqualifiedlead",
+    "opportunity": "opportunity",
+    "customer": "customer",
+    "evangelist": "evangelist",
+    "other": "other",
+}
+
+VALID_LEAD_STATUSES: dict[str, str] = {
+    "new": "NEW",
+    "open": "OPEN",
+    "in progress": "IN_PROGRESS",
+    "in_progress": "IN_PROGRESS",
+    "open deal": "OPEN_DEAL",
+    "open_deal": "OPEN_DEAL",
+    "unqualified": "UNQUALIFIED",
+    "attempted to contact": "ATTEMPTED_TO_CONTACT",
+    "attempted_to_contact": "ATTEMPTED_TO_CONTACT",
+    "connected": "CONNECTED",
+    "bad timing": "BAD_TIMING",
+    "bad_timing": "BAD_TIMING",
+}
+
+def resolve_contact_property_name(name_or_alias: str) -> str | None:
+    if not name_or_alias:
+        return None
+    cleaned = " ".join(name_or_alias.strip().casefold().replace("_", " ").replace("-", " ").split())
+    if cleaned in CONTACT_PROPERTY_ALIASES:
+        return CONTACT_PROPERTY_ALIASES[cleaned]
+    # Check close match / typo (e.g. emaid -> email)
+    for alias, prop in CONTACT_PROPERTY_ALIASES.items():
+        if len(cleaned) >= 4 and len(alias) >= 4:
+            if sum(c1 != c2 for c1, c2 in zip(cleaned, alias)) <= 1 and abs(len(cleaned) - len(alias)) <= 1:
+                return prop
+    return None
 
 # Extraction field -> HubSpot company property (besides the name).
 COMPANY_PROPERTY_FIELDS: dict[str, str] = {
@@ -165,6 +234,23 @@ def validate_extraction(
         value = _grounded(source, name, getattr(extraction, name))
         if value is not None:
             properties[property_name] = value
+
+    if hasattr(extraction, "properties") and isinstance(extraction.properties, dict):
+        for raw_k, raw_v in extraction.properties.items():
+            resolved_key = resolve_contact_property_name(raw_k)
+            if resolved_key and raw_v is not None and resolved_key not in properties:
+                val_str = str(raw_v).strip()
+                if resolved_key == "lifecyclestage":
+                    norm_s = " ".join(val_str.casefold().replace("_", " ").replace("-", " ").split())
+                    properties["lifecyclestage"] = VALID_LIFECYCLE_STAGES.get(norm_s, val_str)
+                else:
+                    properties[resolved_key] = val_str
+
+    raw_stage = getattr(extraction, "lifecycle_stage", None) or properties.get("lifecyclestage")
+    if raw_stage is not None:
+        norm_stage = " ".join(str(raw_stage).strip().casefold().replace("_", " ").replace("-", " ").split())
+        canonical = VALID_LIFECYCLE_STAGES.get(norm_stage, norm_stage)
+        properties["lifecyclestage"] = canonical
 
     email = properties.get("email")
     if email is not None and not _EMAIL.fullmatch(email):

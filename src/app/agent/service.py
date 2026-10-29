@@ -26,7 +26,10 @@ from app.agent.crm_query_intelligence import (
 )
 from app.agent.extraction import (
     ExtractionValidationError,
+    VALID_LIFECYCLE_STAGES,
+    VALID_LEAD_STATUSES,
     ValidatedExtraction,
+    resolve_contact_property_name,
     validate_extraction,
 )
 from app.agent.leads import (
@@ -276,7 +279,7 @@ _CONTACT_DELETE_PATTERN = re.compile(
 )
 
 _CONFIRM_ACTION_PATTERN = re.compile(
-    r"^\s*(?:<@[^>]+>\s*)?confirm\s+`?([a-f0-9]{32})`?\s*$",
+    r"^\s*(?:<@[^>]+>\s*)?(?:confirm\s+|approve\s+|yes\s+)?`?([a-f0-9]{32})`?\s*$",
     re.IGNORECASE,
 )
 
@@ -286,7 +289,7 @@ _EMAIL_PATTERN = re.compile(
 )
 
 _CONTACT_ID_PATTERN = re.compile(
-    r"\b(?:contact[_\s-]?id|id)\s*[:=]?\s*([A-Za-z0-9_-]+)",
+    r"(?<!action\s)(?<!action_)(?<!action-)(?<!action)\b(?:contact[_\s-]?id|contact\s+id)\s*[:=]?\s*([A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
 
@@ -352,6 +355,8 @@ _SLACK_MESSAGE_MAX_LENGTH = 39_000
 
 
 class AccountIntelligenceAgent:
+    _shared_recent_contacts: dict[tuple[str, str], dict[str, object]] = {}
+    _shared_pending_interactive_updates: dict[tuple[str, str, str | None], dict[str, object]] = {}
     def __init__(
         self,
         tools: HubSpotToolRegistry,
@@ -370,6 +375,329 @@ class AccountIntelligenceAgent:
         self._deal_follow_up_batch_size = deal_follow_up_batch_size
         self._lead_analysis_limit = lead_analysis_limit
         self._lead_ai_batch_size = lead_ai_batch_size
+        self._recent_contacts = AccountIntelligenceAgent._shared_recent_contacts
+        self._pending_interactive_updates = AccountIntelligenceAgent._shared_pending_interactive_updates
+
+
+    def _record_recent_contact(
+        self,
+        request: AgentRequest,
+        contact_id: str,
+        name: str | None = None,
+        email: str | None = None,
+        properties: dict[str, object] | None = None,
+        hubspot_url: str | None = None,
+    ) -> None:
+        info: dict[str, object] = {
+            "id": contact_id,
+            "name": name,
+            "email": email,
+            "properties": properties or {},
+            "hubspot_url": hubspot_url,
+        }
+        if request.actor_id:
+            self._recent_contacts[(request.tenant_id, request.actor_id)] = info
+
+    def _get_recent_contact(self, request: AgentRequest) -> dict[str, object] | None:
+        if request.actor_id and (request.tenant_id, request.actor_id) in self._recent_contacts:
+            return self._recent_contacts[(request.tenant_id, request.actor_id)]
+        return None
+
+    @staticmethod
+    def _extract_contact_id_from_context(conversation_context: str | None) -> str | None:
+        if not conversation_context:
+            return None
+        matches = re.findall(
+            r"(?<!action\s)(?<!action_)(?<!action-)(?:contact[_\s-]?id|contact\s+#?|contact)\s*[:=]?\s*[`'\"\s]?(\d{5,})\b|/contacts?/(?:\d+/)?(?:contact/)?(\d{5,})\b|(?<!action\s)(?<!action_)(?<!action-)(?<!action)\bid\s*[:=]\s*[`'\"\s]?(\d{5,})\b",
+            conversation_context,
+            re.IGNORECASE,
+        )
+        if not matches:
+            return None
+        for last in reversed(matches):
+            for g in last:
+                if g:
+                    return g
+        return None
+
+    @staticmethod
+    def _is_email_update_target(message: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:with|to|set|change|update)\s+(?:email|emaid|emai|e-mail)\b|\b(?:email|emaid|emai|e-mail)\s*(?:to|as|[:=])\b",
+                message,
+                re.IGNORECASE,
+            )
+        )
+
+    async def _get_property_options(
+        self, tenant_id: str, object_type: str, property_name: str
+    ) -> list[dict[str, str]]:
+        try:
+            if getattr(self._tools, "property_discovery_available", False):
+                defs = await self._tools.discover_properties(tenant_id, object_type)
+                for prop_def in defs:
+                    if getattr(prop_def, "name", None) == property_name and getattr(prop_def, "options", None):
+                        opts = [
+                            {"label": opt.get("label", opt.get("value", "")), "value": opt.get("value", "")}
+                            for opt in prop_def.options
+                            if isinstance(opt, dict) and opt.get("value")
+                        ]
+                        if opts:
+                            return opts
+        except Exception:
+            logger.warning("HubSpot property option discovery failed; using fallback options", extra={"tenant_id": tenant_id})
+
+        if property_name == "lifecyclestage":
+            return [
+                {"label": "Subscriber", "value": "subscriber"},
+                {"label": "Lead", "value": "lead"},
+                {"label": "Marketing Qualified Lead (MQL)", "value": "marketingqualifiedlead"},
+                {"label": "Sales Qualified Lead (SQL)", "value": "salesqualifiedlead"},
+                {"label": "Opportunity", "value": "opportunity"},
+                {"label": "Customer", "value": "customer"},
+                {"label": "Evangelist", "value": "evangelist"},
+                {"label": "Other", "value": "other"},
+            ]
+        if property_name == "hs_lead_status":
+            return [
+                {"label": "New", "value": "NEW"},
+                {"label": "Open", "value": "OPEN"},
+                {"label": "In Progress", "value": "IN_PROGRESS"},
+                {"label": "Open Deal", "value": "OPEN_DEAL"},
+                {"label": "Unqualified", "value": "UNQUALIFIED"},
+                {"label": "Attempted to Contact", "value": "ATTEMPTED_TO_CONTACT"},
+                {"label": "Connected", "value": "CONNECTED"},
+                {"label": "Bad Timing", "value": "BAD_TIMING"},
+            ]
+        return []
+
+    def _parse_natural_contact_update(self, request: AgentRequest) -> CRMIntentExtraction | None:
+        message = request.message
+        if not re.search(r"\b(?:update|change|set|modify|edit|put|assign)\b", message, re.IGNORECASE):
+            return None
+
+        if re.search(
+            r"\b(?:deal|pipeline|website|domain|annual\s+revenue|dealname|dealstage|closedate)\b",
+            message,
+            re.IGNORECASE,
+        ) and not re.search(r"\bcontact\b", message, re.IGNORECASE):
+            return None
+        if re.search(r"\b(?:update|change|set|modify)\s+(?:the\s+)?company\b", message, re.IGNORECASE):
+            return None
+        if re.search(r"\b(?:technologies|tech|inc|corp|corporation|llc|ltd|systems|solutions|enterprises|holdings)(?:['’]s|['’])\b", message, re.IGNORECASE) and not re.search(r"\bcontact\b", message, re.IGNORECASE):
+            return None
+
+        contact_id_match = re.search(
+            r"(?<!action\s)(?<!action_)(?<!action-)(?<!action)\b(?:contact[_\s-]?id|contact\s+id)\s*[:=]?\s*[`'\"\s]?([A-Za-z0-9_-]+)[`'\"\s]?",
+            message,
+            re.IGNORECASE,
+        )
+        if not contact_id_match:
+            contact_id_match = re.search(
+                r"\bcontact\s+(?:#\s*)?(\d+)\b",
+                message,
+                re.IGNORECASE,
+            )
+        if not contact_id_match:
+            contact_id_match = re.search(
+                r"(?<!action\s)(?<!action_)(?<!action-)(?<!action)\bid\s*[:=]\s*[`'\"\s]?(\d{5,})\b",
+                message,
+                re.IGNORECASE,
+            )
+        contact_id = contact_id_match.group(1) if contact_id_match else None
+
+        is_contextual = bool(
+            re.search(
+                r"\b(this\s+contact|the\s+contact|that\s+contact|the\s+same\s+(?:contact|record)|this\s+record|that\s+record|the\s+record|same\s+record|this\s+status|this\s+stage|the\s+status|the\s+stage|them|their|his|her|it)\b",
+                message,
+                re.IGNORECASE,
+            )
+            or re.search(r"^(?:update|change|set|modify)\s+(?:the\s+)?(?:status|stage|record)\b", message, re.IGNORECASE)
+        )
+
+        first_name = None
+        last_name = None
+        fn_match = _FIRSTNAME_PATTERN.search(message)
+        ln_match = _LASTNAME_PATTERN.search(message)
+        if fn_match:
+            first_name = fn_match.group(1)
+        if ln_match:
+            last_name = ln_match.group(1)
+
+        name_match = re.search(
+            r"\b(?:update|change|set|modify)\s+(?:contact\s+)?(?P<name>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,2}?)(?:['’]s|\s+with|\s+to|\s+company|\s+as|\s+phone|\s+title|\s+lifecycle|\s+email|\s+emaid|\s*$)",
+            message,
+            re.IGNORECASE,
+        )
+        if name_match and not first_name:
+            cand_name = name_match.group("name").strip()
+            cand_name = re.sub(r"['’]s$", "", cand_name).strip()
+            non_names = {
+                "this", "the", "that", "this contact", "the contact", "this record", "the record",
+                "a", "an", "their", "his", "her", "contact", "company", "deal", "record",
+                "this record status", "this contact stage", "this contact's lead status",
+                "the status", "the stage", "status", "stage", "lead status", "lifecycle", "lifecycle stage",
+            }
+            if not is_contextual and cand_name.casefold() not in non_names and not re.search(r"^(?:this|that|the|same)\b", cand_name, re.IGNORECASE):
+                parts = cand_name.split()
+                first_name = parts[0]
+                if len(parts) > 1:
+                    last_name = " ".join(parts[1:])
+
+        properties: dict[str, str] = {}
+        if first_name and fn_match:
+            properties["firstname"] = first_name
+        if last_name and ln_match:
+            properties["lastname"] = last_name
+        requested_fields: list[str] = []
+
+        # 1. Email / emaid / e-mail
+        email_match = re.search(
+            r"\b(?:email|emaid|emai|e-mail)(?:\s+address)?(?:\s+(?:to|with|as|is|:=|:)\s*|\s+)?\s*(?:<mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?:\|[^>]*)?>?",
+            message,
+            re.IGNORECASE,
+        )
+        if not email_match:
+            email_match = re.search(r"<mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", message, re.IGNORECASE)
+        if not email_match and ("with" in message.casefold() or "to" in message.casefold()):
+            email_match = re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", message)
+        if email_match:
+            properties["email"] = email_match.group(1)
+        elif re.search(r"\b(?:email|emaid|emai|e-mail)(?:\s+address)?\b", message, re.IGNORECASE):
+            requested_fields.append("email")
+
+        # 2. Job title / title / role / position
+        title_match = re.search(
+            r"\b(?:job\s*title|title|role|position)(?:\s+(?:to|with|as|is|of|:=|:)\s*|\s+)(?P<val>[A-Za-z0-9 .,&'/-]+?)(?:\s+(?:for|at|with)\b|\s*$)",
+            message,
+            re.IGNORECASE,
+        )
+        if title_match:
+            val = title_match.group("val").strip()
+            if val.casefold() not in {"title", "job", "job title", "role", "position", "to", "with", "as", "is", "of", "a", "an", "the", "for", "at", "contact", "company", "deal"}:
+                properties["jobtitle"] = val
+            else:
+                requested_fields.append("jobtitle")
+        elif re.search(r"\b(?:job\s*title|title|role|position)\b", message, re.IGNORECASE):
+            requested_fields.append("jobtitle")
+
+        # 3. Phone
+        phone_match = re.search(
+            r"\b(?:phone|phone\s*number|work\s*phone|telephone)(?:\s+(?:to|with|as|is|:=|:)\s*|\s+)([+0-9()\-.\s]{7,25})",
+            message,
+            re.IGNORECASE,
+        )
+        if phone_match:
+            properties["phone"] = phone_match.group(1).strip()
+        elif re.search(r"\b(?:phone|phone\s*number|work\s*phone|telephone)\b", message, re.IGNORECASE):
+            requested_fields.append("phone")
+
+        # 4. Mobile / cell
+        mobile_match = re.search(
+            r"\b(?:mobile(?:\s*phone)?|cell(?:\s*phone)?)(?:\s+(?:to|with|as|is|:=|:)\s*|\s+)([+0-9()\-.\s]{7,25})",
+            message,
+            re.IGNORECASE,
+        )
+        if mobile_match:
+            properties["mobilephone"] = mobile_match.group(1).strip()
+        elif re.search(r"\b(?:mobile(?:\s*phone)?|cell(?:\s*phone)?)\b", message, re.IGNORECASE):
+            requested_fields.append("mobilephone")
+
+        # 5. Lifecycle stage
+        stage_match = re.search(
+            r"\b(?:lifecycle\s*stage|lifecycle|stage)(?:\s+(?:to|with|as|is|:=|:)\s*|\s+)([A-Za-z\s]+?)(?:\s+(?:for|at|with)\b|\s*$)",
+            message,
+            re.IGNORECASE,
+        )
+        if stage_match:
+            stage_raw = stage_match.group(1).strip().casefold()
+            stage_norm = VALID_LIFECYCLE_STAGES.get(stage_raw, stage_raw)
+            if stage_norm in VALID_LIFECYCLE_STAGES.values() and stage_raw not in {"stage", "lifecycle", "lifecycle stage"}:
+                properties["lifecyclestage"] = stage_norm
+            else:
+                requested_fields.append("lifecyclestage")
+        elif re.search(r"\b(?:lifecycle(?:\s*stage)?|stage)\b", message, re.IGNORECASE):
+            found_stage = None
+            msg_lower = message.casefold()
+            for k, canonical in VALID_LIFECYCLE_STAGES.items():
+                if re.search(rf"\b{re.escape(k)}\b", msg_lower):
+                    found_stage = canonical
+                    break
+            if found_stage:
+                properties["lifecyclestage"] = found_stage
+            else:
+                requested_fields.append("lifecyclestage")
+
+        # 6. Lead status
+        status_match = re.search(
+            r"\b(?:(?:hs[_\s-]?)?lead[_\s-]?status|status)(?:\s+(?:to|with|as|is|:=|:)\s*|\s+)([A-Za-z_\s]+?)(?:\s+(?:for|at|with)\b|\s*$)",
+            message,
+            re.IGNORECASE,
+        )
+        if status_match:
+            status_val = status_match.group(1).strip()
+            if status_val.casefold() not in {"status", "lead status", "to", "with", "as", "is", "a", "an", "the", "hs_lead_status", "lead_status"}:
+                canon_ls = VALID_LEAD_STATUSES.get(status_val.casefold())
+                if canon_ls:
+                    properties["hs_lead_status"] = canon_ls
+                else:
+                    canon_lcs = VALID_LIFECYCLE_STAGES.get(status_val.casefold())
+                    if canon_lcs:
+                        properties["lifecyclestage"] = canon_lcs
+                    else:
+                        requested_fields.append("hs_lead_status")
+            elif status_val.casefold() == "lead":
+                properties["lifecyclestage"] = "lead"
+            else:
+                requested_fields.append("hs_lead_status")
+        elif re.search(r"\b(?:hs[_\s-]?)?lead[_\s-]?status\b", message, re.IGNORECASE):
+            requested_fields.append("hs_lead_status")
+        elif is_contextual and re.search(r"\bstatus\b", message, re.IGNORECASE):
+            requested_fields.append("hs_lead_status")
+
+        # 7. Company association
+        company_name = None
+        company_match = re.search(
+            r"\b(?:company|associated\s+company)(?:\s+to|\s+as|\s+with|\s*[:=])\s+([A-Za-z0-9 .,&'-]+?)(?:\s*$)",
+            message,
+            re.IGNORECASE,
+        )
+        if not company_match:
+            company_match = re.search(
+                r"\bchange\s+.*?\s+company\s+to\s+([A-Za-z0-9 .,&'-]+?)(?:\s*$)",
+                message,
+                re.IGNORECASE,
+            )
+        if company_match:
+            company_name = company_match.group(1).strip()
+
+        if (
+            contact_id
+            or is_contextual
+            or first_name
+            or properties
+            or requested_fields
+            or company_name
+            or re.search(r"\bupdate\s+(?:contact|a\s+contact|[A-Z][a-z]+)\b", message, re.IGNORECASE)
+        ):
+            return CRMIntentExtraction(
+                intent="update_contact",
+                confidence=0.95,
+                contact_id=contact_id,
+                first_name=first_name,
+                last_name=last_name,
+                company_name=company_name,
+                email=properties.get("email"),
+                phone=properties.get("phone"),
+                job_title=properties.get("jobtitle"),
+                mobile_phone=properties.get("mobilephone"),
+                lifecycle_stage=properties.get("lifecyclestage"),
+                lead_status=properties.get("hs_lead_status"),
+                properties=properties,
+                requested_fields=requested_fields,
+            )
+        return None
 
     @staticmethod
     def _supports_read_only_crm_intelligence(plan: CRMQueryPlan, message: str) -> bool:
@@ -1143,13 +1471,42 @@ class AccountIntelligenceAgent:
                 )
             if confirmed_action.action_type == "update_contact":
                 try:
-                    contact_id = str(confirmed_action.payload["contact_id"])
+                    contact_id = str(confirmed_action.payload["contact_id"]).strip()
 
-                    properties = {
-                        key: value
-                        for key, value in confirmed_action.payload.items()
-                        if key != "contact_id"
-                    }
+                    properties = {}
+                    for key, value in confirmed_action.payload.items():
+                        if key == "contact_id":
+                            continue
+                        canon_key = resolve_contact_property_name(key) or key
+                        canon_key = canon_key.strip().lower().replace(" ", "_").replace("-", "_")
+                        if canon_key in {"lifecyclestage", "lifecycle_stage", "lifecycle"}:
+                            canon_key = "lifecyclestage"
+                            raw_s = str(value).strip().casefold()
+                            canon_val = VALID_LIFECYCLE_STAGES.get(raw_s)
+                            if not canon_val:
+                                for k, c in VALID_LIFECYCLE_STAGES.items():
+                                    if re.search(rf"\b{re.escape(k)}\b", raw_s):
+                                        canon_val = c
+                                        break
+                            if not canon_val:
+                                canon_val = "lead"
+                        elif canon_key in {"hs_lead_status", "lead_status"}:
+                            canon_key = "hs_lead_status"
+                            raw_s = str(value).strip().casefold()
+                            canon_val = VALID_LEAD_STATUSES.get(raw_s)
+                            if not canon_val:
+                                for k, c in VALID_LEAD_STATUSES.items():
+                                    if re.search(rf"\b{re.escape(k)}\b", raw_s):
+                                        canon_val = c
+                                        break
+                            if not canon_val:
+                                canon_val = "OPEN"
+                        elif canon_key in {"job_title", "title"}:
+                            canon_key = "jobtitle"
+                            canon_val = value
+                        else:
+                            canon_val = value
+                        properties[canon_key] = canon_val
 
                     contact = await self._tools.update_contact(
                         request.tenant_id,
@@ -1169,10 +1526,16 @@ class AccountIntelligenceAgent:
                         },
                     )
 
+                    self._record_recent_contact(
+                        request,
+                        contact_id=contact.id,
+                        properties=dict(contact.properties),
+                    )
+
                     return AgentResponse(
                         status="ok",
                         text=(
-                            "Contact updated successfully in HubSpot.\n"
+                            "🟢 ✅ Contact updated successfully in HubSpot.\n"
                             f"• Contact ID: `{contact.id}`"
                         ),
                         request_id=request.request_id,
@@ -1306,6 +1669,14 @@ class AccountIntelligenceAgent:
                     },
                 )
 
+                self._record_recent_contact(
+                    request,
+                    contact_id=contact.id,
+                    name=f"{contact.properties.get('firstname', '')} {contact.properties.get('lastname', '')}".strip() or None,
+                    email=contact.properties.get("email"),
+                    properties=dict(contact.properties),
+                )
+
                 return AgentResponse(
                     status="ok",
                     text=(
@@ -1356,6 +1727,117 @@ class AccountIntelligenceAgent:
                     ["create_contact"],
                 )
 
+        # Check for pending interactive update (e.g. user is replying with the new value for a field)
+        pending_key = (request.tenant_id, request.actor_id, request.channel_id) if request.actor_id else None
+        pending = self._pending_interactive_updates.get(pending_key) if pending_key else None
+        if not pending and request.actor_id and (request.tenant_id, request.actor_id, None) in self._pending_interactive_updates:
+            pending_key = (request.tenant_id, request.actor_id, None)
+            pending = self._pending_interactive_updates.get(pending_key)
+
+        if pending and self._confirmation_action_id(request.message) is None:
+            natural = self._parse_natural_contact_update(request)
+            if natural and (
+                natural.properties
+                or natural.requested_fields
+                or natural.first_name
+                or natural.last_name
+                or (natural.contact_id and natural.contact_id != pending.get("contact_id"))
+            ):
+                if pending_key:
+                    self._pending_interactive_updates.pop(pending_key, None)
+                pending = None
+
+        if pending and self._confirmation_action_id(request.message) is None:
+            msg = request.message.strip()
+            if re.search(r"\b(?:cancel|stop|abort|never\s*mind)\b", msg, re.IGNORECASE):
+                if pending_key:
+                    self._pending_interactive_updates.pop(pending_key, None)
+
+                return AgentResponse(
+                    status="ok",
+                    text="Update cancelled.",
+                    request_id=request.request_id,
+                    tools_used=[],
+                )
+
+            val = re.sub(r"^(?:(?:update|change|set|make|it|to|as|value|is)\s+)+", "", msg, flags=re.IGNORECASE).strip()
+            val = val.strip("\"'`.").strip()
+            field = str(pending.get("field", ""))
+            if field == "email" or "@" in val:
+                email_m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", val)
+                if email_m:
+                    val = email_m.group(1)
+            elif field == "lifecyclestage":
+                stage_val = None
+                for k, canonical in VALID_LIFECYCLE_STAGES.items():
+                    if re.search(rf"\b{re.escape(k)}\b", val, re.IGNORECASE):
+                        stage_val = canonical
+                        break
+                val = stage_val
+            elif field == "hs_lead_status":
+                status_val = None
+                for k, canonical in VALID_LEAD_STATUSES.items():
+                    if re.search(rf"\b{re.escape(k)}\b", val, re.IGNORECASE):
+                        status_val = canonical
+                        break
+                val = status_val
+
+            if val and not re.search(r"\b(?:show|list|find|search|delete|create)\b", val, re.IGNORECASE):
+                if pending_key:
+                    self._pending_interactive_updates.pop(pending_key, None)
+
+
+                curr_val = pending.get("current_value")
+                field_label = pending.get("field_label", "Field")
+                contact_name = pending.get("contact_name", "Contact")
+                contact_id = pending.get("contact_id")
+
+                if curr_val and str(curr_val).strip().casefold() == val.casefold():
+                    return AgentResponse(
+                        status="ok",
+                        text=f"🔵 ℹ️ The {field_label} for {contact_name} is already set to {curr_val}. No change was made.",
+                        request_id=request.request_id,
+                        tools_used=["resolve_contact"],
+                        result={
+                            "kind": "crm_records",
+                            "title": "No Change Needed",
+                            "contact_id": contact_id,
+                        },
+                    )
+
+                return await self._propose_contact_update(
+                    request,
+                    ContactUpdateIntent(contact_id=contact_id, properties={field: val}),
+                )
+
+        if not pending and request.conversation_context and self._confirmation_action_id(request.message) is None and self._parse_natural_contact_update(request) is None and not _CONTACT_UPDATE_PATTERN.search(request.message):
+            ctx = request.conversation_context
+            prompt_m = re.search(r"\bUpdate\s+(Email|Job Title|Phone Number|Mobile Phone|Lifecycle Stage|Lead Status)\b", ctx, re.I)
+            if prompt_m:
+                prompt_field_label = prompt_m.group(1)
+                field_canonical = resolve_contact_property_name(prompt_field_label)
+                ctx_contact_id = self._extract_contact_id_from_context(ctx)
+                if field_canonical and ctx_contact_id:
+                    msg_text = request.message.strip()
+                    val = re.sub(r"^(?:(?:update|change|set|make|it|to|as|value|is)\s+)+", "", msg_text, flags=re.IGNORECASE).strip()
+                    val = val.strip("\"'`.").strip()
+                    if field_canonical == "email" or "@" in val:
+                        email_m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", val)
+                        if email_m:
+                            val = email_m.group(1)
+                    elif field_canonical == "lifecyclestage":
+                        stage_val = VALID_LIFECYCLE_STAGES.get(val.casefold())
+                        val = stage_val if stage_val else None
+                    elif field_canonical == "hs_lead_status":
+                        lead_status_val = VALID_LEAD_STATUSES.get(val.casefold())
+                        val = lead_status_val if lead_status_val else None
+                    if val and not re.search(r"\b(?:show|list|find|search|delete|create)\b", val, re.IGNORECASE):
+                        if field_canonical != "email" or "@" in val:
+                            return await self._propose_contact_update(
+                                request,
+                                ContactUpdateIntent(contact_id=ctx_contact_id, properties={field_canonical: val}),
+                            )
+
         if _AMBIGUOUS_DEAL_TYPE_CREATE_PATTERN.search(request.message):
             return self._safe(
                 "needs_clarification",
@@ -1368,10 +1850,14 @@ class AccountIntelligenceAgent:
         if _DEAL_FOLLOW_UP_REQUEST_PATTERN.search(request.message):
             return await self._review_deals_for_follow_up(request)
 
-        if _LEAD_QUALIFICATION_REQUEST_PATTERN.search(request.message) and not (
-            _CONTACT_CREATE_PATTERN.search(request.message)
-            or _CONTACT_UPDATE_PATTERN.search(request.message)
-            or _CONTACT_DELETE_PATTERN.search(request.message)
+        if (
+            _LEAD_QUALIFICATION_REQUEST_PATTERN.search(request.message)
+            and self._parse_natural_contact_update(request) is None
+            and not (
+                _CONTACT_CREATE_PATTERN.search(request.message)
+                or _CONTACT_UPDATE_PATTERN.search(request.message)
+                or _CONTACT_DELETE_PATTERN.search(request.message)
+            )
         ):
             return await self._qualify_leads(request)
 
@@ -1430,6 +1916,24 @@ class AccountIntelligenceAgent:
             )
 
         extraction = await self._extract_intent(request)
+
+        natural_update = self._parse_natural_contact_update(request)
+        if natural_update is not None:
+            if extraction is None or extraction.intent in {"unsupported", "invalid_request"}:
+                extraction = natural_update
+            elif extraction.intent == "update_contact":
+                merged_props = {**natural_update.properties, **(extraction.properties or {})}
+                merged_fields = list(dict.fromkeys(natural_update.requested_fields + (extraction.requested_fields or [])))
+                extraction = extraction.model_copy(
+                    update={
+                        "contact_id": extraction.contact_id or natural_update.contact_id,
+                        "first_name": extraction.first_name or natural_update.first_name,
+                        "last_name": extraction.last_name or natural_update.last_name,
+                        "email": extraction.email or natural_update.email,
+                        "properties": merged_props,
+                        "requested_fields": merged_fields,
+                    }
+                )
 
         if extraction is None:
             explicit_create = self._explicit_create_extraction(request.message)
@@ -1640,25 +2144,241 @@ class AccountIntelligenceAgent:
             contact_id = await self._resolve_contact_id(request, validated)
             if isinstance(contact_id, AgentResponse):
                 return contact_id
-            if validated.company_name is not None:
-                return self._safe(
-                    "unsupported",
-                    "Changing a contact's company isn't supported yet.",
+
+            contact_name = contact_id
+            contact_email = None
+            rec = None
+            try:
+                rec = await self._tools.get_contact(request.tenant_id, contact_id)
+                fname = rec.properties.get("firstname") or ""
+                lname = rec.properties.get("lastname") or ""
+                cname = f"{fname} {lname}".strip()
+                if cname:
+                    contact_name = cname
+                contact_email = rec.properties.get("email")
+            except Exception:
+                pass
+
+            urls = await self._tools.hubspot_record_urls(request.tenant_id, [("contacts", contact_id)])
+            hubspot_url = urls[0] if urls else f"https://app.hubspot.com/contacts/{request.tenant_id}/contact/{contact_id}"
+
+            if contact_id:
+                self._record_recent_contact(
                     request,
+                    contact_id=contact_id,
+                    properties=dict(rec.properties) if rec else {},
                 )
+
+            if validated.company_name is not None:
+                company_res = await self._tools.resolve_company(request.tenant_id, validated.company_name)
+                if company_res.status == "ambiguous":
+                    return self._safe(
+                        "company_ambiguous",
+                        f"I found multiple companies matching {validated.company_name}.",
+                        request,
+                        ["resolve_company"],
+                    )
+                if company_res.company is None:
+                    return self._safe(
+                        "company_not_found",
+                        f"I couldn't find a company named {validated.company_name} in HubSpot.",
+                        request,
+                        ["resolve_company"],
+                    )
+                try:
+                    await self._tools.associate(
+                        request.tenant_id,
+                        from_type="contacts",
+                        from_id=contact_id,
+                        to_type="companies",
+                        to_id=company_res.company.id,
+                    )
+                except Exception:
+                    logger.exception("Failed to associate contact with company", extra={"tenant_id": request.tenant_id})
+                    return self._safe(
+                        "unavailable",
+                        "I couldn't associate the contact with that company right now.",
+                        request,
+                    )
+                comp_display = company_res.company.properties.get("name") or validated.company_name
+                return AgentResponse(
+                    status="ok",
+                    text=f"Contact {contact_name} was successfully associated with {comp_display}.",
+                    request_id=request.request_id,
+                    tools_used=["resolve_contact", "resolve_company", "associate"],
+                    result={
+                        "kind": "crm_records",
+                        "title": "Contact Associated",
+                        "contact_id": contact_id,
+                        "company_id": company_res.company.id,
+                        "hubspot_url": hubspot_url,
+                    },
+                )
+
             properties: dict[str, str | None] = dict(validated.properties)
-            if validated.contact_id is None:
-                has_name = bool(properties.get("firstname") or properties.get("lastname"))
+            has_name_update = bool(
+                re.search(
+                    r"\b(?:first\s*name|firstname|last\s*name|lastname)\b",
+                    request.message,
+                    re.IGNORECASE,
+                )
+                or re.search(
+                    r"\b(?:name)\s*(?:to|as|[:=])\b",
+                    request.message,
+                    re.IGNORECASE,
+                )
+            )
+            if not has_name_update:
                 properties.pop("firstname", None)
                 properties.pop("lastname", None)
-                if not has_name:
-                    properties.pop("email", None)
+
+            # Check if all proposed properties are already set to the proposed value
+            if rec and properties:
+                unchanged_fields = []
+                for prop_k, prop_v in list(properties.items()):
+                    curr = rec.properties.get(prop_k)
+                    if curr and str(curr).strip().casefold() == str(prop_v).strip().casefold():
+                        unchanged_fields.append((prop_k, curr))
+                if len(unchanged_fields) == len(properties):
+                    prop_k, curr = unchanged_fields[0]
+                    label_map = {
+                        "jobtitle": "Job Title",
+                        "email": "Email",
+                        "phone": "Phone Number",
+                        "mobilephone": "Mobile Phone",
+                        "lifecyclestage": "Lifecycle Stage",
+                        "hs_lead_status": "Lead Status",
+                    }
+                    lbl = label_map.get(prop_k, prop_k.replace("_", " ").title())
+                    return AgentResponse(
+                        status="ok",
+                        text=f"🔵 ℹ️ The {lbl} for {contact_name} is already set to {curr}. No change was made.",
+                        request_id=request.request_id,
+                        tools_used=["resolve_contact"],
+                        result={
+                            "kind": "crm_records",
+                            "title": "No Change Needed",
+                            "contact_id": contact_id,
+                            "hubspot_url": hubspot_url,
+                        },
+                    )
+
             if not properties:
-                return self._safe(
-                    "missing_fields",
-                    "Tell me which contact fields to update and their new values.",
-                    request,
+                requested_field = None
+                if getattr(validated, "requested_fields", None):
+                    requested_field = validated.requested_fields[0]
+                elif getattr(extraction, "requested_fields", None):
+                    requested_field = extraction.requested_fields[0]
+                else:
+                    if re.search(r"\b(?:job\s*title|title|role|position)\b", request.message, re.IGNORECASE):
+                        requested_field = "jobtitle"
+                    elif re.search(r"\b(?:email|emaid|emai|e-mail)\b", request.message, re.IGNORECASE):
+                        requested_field = "email"
+                    elif re.search(r"\b(?:phone|phone\s*number|work\s*phone|telephone)\b", request.message, re.IGNORECASE):
+                        requested_field = "phone"
+                    elif re.search(r"\b(?:mobile(?:\s*phone)?|cell(?:\s*phone)?)\b", request.message, re.IGNORECASE):
+                        requested_field = "mobilephone"
+                    elif re.search(r"\b(?:lifecycle(?:\s*stage)?|stage)\b", request.message, re.IGNORECASE):
+                        requested_field = "lifecyclestage"
+                    elif re.search(r"\b(?:(?:hs[_\s-]?)?lead[_\s-]?status|status)\b", request.message, re.IGNORECASE):
+                        requested_field = "hs_lead_status"
+
+                if requested_field:
+                    field_canonical = resolve_contact_property_name(requested_field) or requested_field
+                    current_val = (rec.properties.get(field_canonical) if rec else None) or "Not set"
+                    field_label_map = {
+                        "jobtitle": ("Job Title", "💼"),
+                        "email": ("Email", "📧"),
+                        "phone": ("Phone Number", "📞"),
+                        "mobilephone": ("Mobile Phone", "📱"),
+                        "lifecyclestage": ("Lifecycle Stage", "🔄"),
+                        "hs_lead_status": ("Lead Status", "📊"),
+                    }
+                    field_label, field_emoji = field_label_map.get(
+                        field_canonical, (field_canonical.replace("_", " ").title(), "✏️")
+                    )
+
+                    info = {
+                        "contact_id": contact_id,
+                        "contact_name": contact_name,
+                        "field": field_canonical,
+                        "field_label": field_label,
+                        "current_value": current_val,
+                        "hubspot_url": hubspot_url,
+                    }
+                    if request.actor_id:
+                        self._pending_interactive_updates[(request.tenant_id, request.actor_id, request.channel_id)] = info
+
+                    if field_canonical in {"lifecyclestage", "hs_lead_status"}:
+                        options = await self._get_property_options(request.tenant_id, "contacts", field_canonical)
+                        return AgentResponse(
+                            status="needs_value",
+                            text=(
+                                f"🟡 ❓ *Update {field_label}*\n"
+                                f"👤 Contact: {contact_name}\n"
+                                f"{field_emoji} Current {field_label}: {current_val}\n"
+                                f"Please select a new {field_label.lower()} for {contact_name}:"
+                            ),
+                            request_id=request.request_id,
+                            tools_used=["resolve_contact"],
+                            result={
+                                "kind": "interactive_value_selection",
+                                "contact_id": contact_id,
+                                "contact_name": contact_name,
+                                "field": field_canonical,
+                                "field_label": field_label,
+                                "current_value": current_val,
+                                "hubspot_url": hubspot_url,
+                                "options": options,
+                            },
+                        )
+                    else:
+                        return AgentResponse(
+                            status="needs_field_value",
+                            text=(
+                                f"🟡 ❓ *Update {field_label}*\n"
+                                f"👤 Contact: {contact_name}\n"
+                                f"{field_emoji} Current {field_label}: {current_val}\n"
+                                f"What should {contact_name}'s new {field_label} be?"
+                            ),
+                            request_id=request.request_id,
+                            tools_used=["resolve_contact"],
+                            result={
+                                "kind": "interactive_field_value_prompt",
+                                "contact_id": contact_id,
+                                "contact_name": contact_name,
+                                "field": field_canonical,
+                                "field_label": field_label,
+                                "current_value": current_val,
+                                "hubspot_url": hubspot_url,
+                            },
+                        )
+
+                return AgentResponse(
+                    status="needs_field",
+                    text=(
+                        f"🔵 ✏️ Which field would you like to update for {contact_name}?\n"
+                        "• 📧 Email\n• 💼 Job Title\n• 📞 Phone Number\n• 🔄 Lifecycle Stage\n• 📊 Lead Status\n• ✏️ Another Available Field\n• ❌ Cancel"
+                    ),
+                    request_id=request.request_id,
+                    tools_used=["resolve_contact"],
+                    result={
+                        "kind": "interactive_field_selection",
+                        "contact_id": contact_id,
+                        "contact_name": contact_name,
+                        "email": contact_email,
+                        "hubspot_url": hubspot_url,
+                        "fields": [
+                            {"label": "Email", "value": "email"},
+                            {"label": "Job Title", "value": "jobtitle"},
+                            {"label": "Phone Number", "value": "phone"},
+                            {"label": "Mobile Phone", "value": "mobilephone"},
+                            {"label": "Lifecycle Stage", "value": "lifecyclestage"},
+                            {"label": "Lead Status", "value": "hs_lead_status"},
+                        ],
+                    },
                 )
+
             return await self._propose_contact_update(
                 request,
                 ContactUpdateIntent(
@@ -2234,9 +2954,41 @@ class AccountIntelligenceAgent:
         if validated.contact_id:
             return validated.contact_id
 
+        msg_id_match = re.search(
+            r"(?<!action\s)(?<!action_)(?<!action-)(?<!action)\b(?:contact[_\s-]?id|id|contact)\s*[:=]?\s*[`'\"\s]?(\d{5,})\b",
+            request.message,
+            re.IGNORECASE,
+        )
+        if msg_id_match:
+            return msg_id_match.group(1)
+
         first_name = validated.properties.get("firstname")
         last_name = validated.properties.get("lastname")
         email = validated.properties.get("email")
+
+        is_contextual = bool(
+            re.search(
+                r"\b(this\s+contact|that\s+contact|the\s+same\s+(?:contact|record)|this\s+record|that\s+record|the\s+record|same\s+record|this\s+status|this\s+stage|the\s+status|the\s+stage|them|their|his|her|it)\b",
+                request.message,
+                re.IGNORECASE,
+            )
+            or (re.search(r"\bthe\s+contact\b", request.message, re.IGNORECASE) and not re.search(r"\bnamed\b", request.message, re.IGNORECASE))
+            or re.search(r"^(?:update|change|set|modify)\s+(?:the\s+)?(?:status|stage|record)\b", request.message, re.IGNORECASE)
+        )
+        is_email_update = self._is_email_update_target(request.message)
+
+        if (not first_name and not last_name) and (is_contextual or not email or is_email_update):
+            recent = self._get_recent_contact(request)
+            if recent and recent.get("id"):
+                return str(recent["id"])
+            context_id = self._extract_contact_id_from_context(request.conversation_context)
+            if context_id:
+                return context_id
+            pending_key = (request.tenant_id, request.actor_id, request.channel_id) if request.actor_id else None
+            pending = self._pending_interactive_updates.get(pending_key) if pending_key else None
+            if pending and pending.get("contact_id"):
+                return str(pending["contact_id"])
+
         if not first_name and not last_name and not email:
             return self._safe(
                 "missing_fields",
@@ -2245,13 +2997,14 @@ class AccountIntelligenceAgent:
             )
 
         try:
+            search_email = None if is_email_update else email
             resolution = await self._tools.resolve_contact(
                 request.tenant_id,
                 first_name=first_name,
                 last_name=last_name,
             )
-            if resolution.contact is None and email:
-                resolution = await self._tools.resolve_contact(request.tenant_id, email=email)
+            if resolution.contact is None and search_email:
+                resolution = await self._tools.resolve_contact(request.tenant_id, email=search_email)
         except ValueError:
             return self._safe(
                 "hubspot_not_authorized",
@@ -2265,16 +3018,49 @@ class AccountIntelligenceAgent:
             )
 
         if resolution.status == "ambiguous":
-            return self._safe(
-                "contact_ambiguous",
-                "I found multiple matching contacts. Please include the contact's email address.",
-                request,
-                ["resolve_contact"],
+            candidates_data = []
+            records = [("contacts", c.id) for c in resolution.candidates]
+            try:
+                urls = await self._tools.hubspot_record_urls(request.tenant_id, records)
+            except Exception:
+                urls = []
+            for i, c in enumerate(resolution.candidates):
+                c_fname = c.properties.get("firstname", "")
+                c_lname = c.properties.get("lastname", "")
+                c_name = f"{c_fname} {c_lname}".strip() or c.id
+                c_url = urls[i] if i < len(urls) else f"https://app.hubspot.com/contacts/{request.tenant_id}/contact/{c.id}"
+                candidates_data.append({
+                    "id": c.id,
+                    "name": c_name,
+                    "email": c.properties.get("email"),
+                    "company": c.properties.get("company"),
+                    "hubspot_url": c_url,
+                })
+            search_query = f"{first_name or ''} {last_name or ''}".strip() or email or "contact"
+            return AgentResponse(
+                status="contact_ambiguous",
+                text=f"I found multiple contacts matching '{search_query}'. Please choose which contact you'd like to update:",
+                request_id=request.request_id,
+                tools_used=["resolve_contact"],
+                result={
+                    "kind": "interactive_contact_selection",
+                    "search_name": search_query,
+                    "candidates": candidates_data,
+                },
             )
         if resolution.contact is None:
             return self._safe(
                 "contact_not_found",
-                "I couldn't find that contact in HubSpot.",
+                (
+                    "🔵 ℹ️ **I couldn't find an exact contact match.**\n"
+                    "How would you like to proceed?\n"
+                    "• 🔍 Search by email address\n"
+                    "• 👥 Show all contacts\n"
+                    "• 🔎 Search contacts by name\n"
+                    "• ✏️ Enter another contact name\n"
+                    "• ➕ Ask me to create a new contact\n"
+                    "• ❌ Cancel"
+                ),
                 request,
                 ["resolve_contact"],
             )
@@ -2303,6 +3089,10 @@ class AccountIntelligenceAgent:
 
         if contact_update_intent is not None:
             return await self._propose_contact_update(request, contact_update_intent)
+
+        natural_update = self._parse_natural_contact_update(request)
+        if natural_update is not None:
+            return await self._respond_to_extraction(request, natural_update)
 
         contact_delete_intent = self._contact_delete_intent(request.message)
 
@@ -2599,6 +3389,15 @@ class AccountIntelligenceAgent:
         if draft.properties.get("email"):
             result["email"] = draft.properties["email"]
 
+        self._record_recent_contact(
+            request,
+            contact_id=contact.id,
+            name=display_name,
+            email=draft.properties.get("email"),
+            properties=dict(contact.properties),
+            hubspot_url=str(result["hubspot_url"]),
+        )
+
         if company is not None:
             company_label = company.properties.get("name") or draft.company_name
             result["company_name"] = company_label or company.id
@@ -2648,13 +3447,50 @@ class AccountIntelligenceAgent:
             },
         )
 
+        contact_id = contact_update_intent.contact_id
+        contact_name = contact_id
+        current_vals: dict[str, str] = {}
+        try:
+            rec = await self._tools.get_contact(request.tenant_id, contact_id)
+            fname = rec.properties.get("firstname") or ""
+            lname = rec.properties.get("lastname") or ""
+            cname = f"{fname} {lname}".strip()
+            if cname:
+                contact_name = cname
+            for k in contact_update_intent.properties:
+                current_vals[k] = rec.properties.get(k) or "Not set"
+        except Exception:
+            pass
+
+        label_map = {
+            "jobtitle": "Job Title",
+            "email": "Email",
+            "phone": "Phone Number",
+            "mobilephone": "Mobile Phone",
+            "lifecyclestage": "Lifecycle Stage",
+            "hs_lead_status": "Lead Status",
+        }
+        prop_lines = []
+        for k, v in contact_update_intent.properties.items():
+            lbl = label_map.get(k, k.replace("_", " ").title())
+            cur = current_vals.get(k, "Not set")
+            prop_lines.append(f"• Property: *{lbl}*\n  Current: {cur}\n  Proposed: *{v}*")
+
+        props_display = "\n".join(prop_lines) if prop_lines else f"• Fields: {', '.join(contact_update_intent.properties.keys())}"
+
+        urls = []
+        try:
+            urls = await self._tools.hubspot_record_urls(request.tenant_id, [("contacts", contact_id)])
+        except Exception:
+            pass
+        hubspot_url = urls[0] if urls else None
+
         return AgentResponse(
             status="pending_confirmation",
             text=(
-                "I found a request to update this HubSpot contact:\n"
-                f"• Contact ID: {contact_update_intent.contact_id}\n"
-                f"• Fields: "
-                f"{', '.join(contact_update_intent.properties.keys())}\n\n"
+                "🟡 🔄 *Confirmation needed*\n"
+                f"👤 Contact: *{contact_name}* (ID: `{contact_id}`)\n"
+                f"{props_display}\n\n"
                 f"Action ID: `{action_id}`\n"
                 f"Reply with `confirm {action_id}` to update this contact."
             ),
@@ -2665,6 +3501,10 @@ class AccountIntelligenceAgent:
                 "action_id": action_id,
                 "action_type": "update_contact",
                 "contact_id": contact_update_intent.contact_id,
+                "record_label": contact_name,
+                "contact_name": contact_name,
+                "properties": contact_update_intent.properties,
+                "hubspot_url": hubspot_url,
             },
         )
 

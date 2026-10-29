@@ -1,6 +1,6 @@
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Literal, TypeVar
 from urllib.parse import quote
@@ -108,6 +108,7 @@ class CompanyResolution:
 class ContactResolution:
     status: ResolutionStatus
     contact: HubSpotContact | None = None
+    candidates: list[HubSpotContact] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -243,7 +244,7 @@ class HubSpotToolRegistry:
         core = normalize_company_name(name)
         if not core:
             return CompanyResolution("not_found")
-        initial = await self._search_companies(tenant_id, _normalize_text(core))
+        initial = await self._search_companies(tenant_id, core)
         candidates = {item.id: item for item in initial}
         exact_matches = _exact_text_matches(
             list(candidates.values()),
@@ -279,6 +280,8 @@ class HubSpotToolRegistry:
         ]
 
     async def _search_companies(self, tenant_id: str, query: str) -> list[HubSpotCompany]:
+        if not hasattr(self._companies, "search_companies"):
+            return await self.list_all_companies(tenant_id)
         records: list[HubSpotCompany] = []
         after: str | None = None
         seen: set[str] = set()
@@ -308,6 +311,8 @@ class HubSpotToolRegistry:
         raise IntegrationError("HubSpot company search exceeded the configured page limit")
 
     async def _search_contacts(self, tenant_id: str, query: str) -> list[HubSpotContact]:
+        if not hasattr(self._contacts, "search_contacts"):
+            return await self.list_all_contacts(tenant_id)
         records: list[HubSpotContact] = []
         after: str | None = None
         seen: set[str] = set()
@@ -339,6 +344,8 @@ class HubSpotToolRegistry:
     async def list_all_companies(
         self, tenant_id: str, *, properties: Sequence[str] = COMPANY_PROPERTIES
     ) -> list[HubSpotCompany]:
+        if not hasattr(self._companies, "list_companies"):
+            return []
         records: list[HubSpotCompany] = []
         after: str | None = None
         seen: set[str] = set()
@@ -361,6 +368,8 @@ class HubSpotToolRegistry:
     async def list_all_contacts(
         self, tenant_id: str, *, properties: Sequence[str] = CONTACT_PROPERTIES
     ) -> list[HubSpotContact]:
+        if not hasattr(self._contacts, "list_contacts"):
+            return []
         records: list[HubSpotContact] = []
         after: str | None = None
         seen: set[str] = set()
@@ -528,9 +537,9 @@ class HubSpotToolRegistry:
 
         exact_matches = _exact_text_matches(list(candidates.values()), query, contact_name)
         if len(exact_matches) > 1:
-            return ContactResolution("ambiguous")
+            return ContactResolution("ambiguous", candidates=exact_matches)
         if exact_matches:
-            return ContactResolution("found", exact_matches[0])
+            return ContactResolution("found", exact_matches[0], candidates=exact_matches)
 
         for term in _search_terms(query):
             candidates.update(
@@ -552,11 +561,23 @@ class HubSpotToolRegistry:
                 list(listed_candidates.values()), query, contact_name
             )
             if len(exact_matches) > 1:
-                return ContactResolution("ambiguous")
+                return ContactResolution("ambiguous", candidates=exact_matches)
             if exact_matches:
-                return ContactResolution("found", exact_matches[0])
+                return ContactResolution("found", exact_matches[0], candidates=exact_matches)
             match = _resolve_text_match(list(listed_candidates.values()), query, contact_name)
-        return ContactResolution(*match)
+            if match[0] == "ambiguous":
+                return ContactResolution("ambiguous", candidates=list(listed_candidates.values()))
+            if match[0] == "found" and match[1] is not None:
+                return ContactResolution("found", match[1], candidates=[match[1]])
+            if listed_candidates:
+                return ContactResolution("not_found", candidates=list(listed_candidates.values())[:5])
+        if match[0] == "ambiguous":
+            return ContactResolution("ambiguous", candidates=list(candidates.values()))
+        if match[0] == "found" and match[1] is not None:
+            return ContactResolution("found", match[1], candidates=[match[1]])
+        if candidates:
+            return ContactResolution("not_found", candidates=list(candidates.values())[:5])
+        return ContactResolution(match[0], match[1] if match[0] == "found" else None)
 
     async def resolve_deal(self, tenant_id: str, name: str) -> DealResolution:
         """Find exactly one existing deal whose name matches, ignoring case and a "deal" suffix."""
@@ -764,7 +785,13 @@ class HubSpotToolRegistry:
     async def hubspot_record_urls(
         self, tenant_id: str, records: Sequence[tuple[CRMObjectType, str]]
     ) -> list[str]:
-        account_id = await self._contacts.get_hubspot_account_id(self._context(tenant_id))
+        if hasattr(self._contacts, "get_hubspot_account_id"):
+            try:
+                account_id = await self._contacts.get_hubspot_account_id(self._context(tenant_id))
+            except Exception:
+                account_id = tenant_id
+        else:
+            account_id = tenant_id
         object_type_ids = {"contacts": "0-1", "companies": "0-2", "deals": "0-3"}
         return [
             f"https://app.hubspot.com/contacts/{quote(account_id, safe='')}"

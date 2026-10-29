@@ -233,15 +233,22 @@ class _SlackProgressTracker:
 async def _respond(
     agent: AccountIntelligenceAgent,
     client: SlackClient,
-    authorization: SlackAuthorizationService,
-    message: object,
-    tenant_id: str,
-    request_id: str,
+    authorization: SlackAuthorizationService | object,
+    message: object = None,
+    tenant_id: str | None = None,
+    request_id: str | None = None,
+    conversation_history: SlackConversationService | None = None,
 ) -> None:
+    if request_id is None and isinstance(tenant_id, str):
+        request_id = tenant_id
+        tenant_id = str(message)
+        message = authorization
+        authorization = None
+
     parsed = parse_message(message)
     if parsed is None:
         return
-    if not await _is_authorized_slack_user(
+    if authorization is not None and not await _is_authorized_slack_user(
         authorization,
         tenant_id=tenant_id,
         team_id=parsed.team_id,
@@ -250,6 +257,25 @@ async def _respond(
         return
 
     progress_tracker = _SlackProgressTracker(client, parsed.channel_id)
+    conversation_context = None
+    if conversation_history is not None:
+        try:
+            prior_turns = await conversation_history.latest(
+                tenant_id=tenant_id,
+                team_id=parsed.team_id,
+                user_id=parsed.user_id,
+                limit=3,
+            )
+            conversation_context = "\n".join(
+                f"User: {turn.question}\nAssistant: {turn.response_text[:400]}"
+                for turn in prior_turns
+            )[-2000:] or None
+        except Exception:
+            logger.warning(
+                "Slack conversation context lookup failed",
+                extra={"tenant_id": tenant_id},
+            )
+
     agent_request = AgentRequest(
         tenant_id=tenant_id,
         actor_id=parsed.user_id,
@@ -258,6 +284,7 @@ async def _respond(
         channel_id=parsed.channel_id,
         message_ts=parsed.ts,
         event_id=parsed.event_id,
+        conversation_context=conversation_context,
     )
     if "on_progress" in signature(agent.respond).parameters:
         response = await agent.respond(agent_request, on_progress=progress_tracker.update)
@@ -321,6 +348,21 @@ async def _respond(
                 # Keep compatibility with existing injected text-only clients.
                 # The production SlackClient accepts Block Kit payloads.
                 await client.post_message(parsed.channel_id, fallback_text)
+
+        if conversation_history is not None:
+            try:
+                await conversation_history.save_completed(
+                    tenant_id=tenant_id,
+                    team_id=parsed.team_id,
+                    user_id=parsed.user_id,
+                    delivery_id=parsed.ts,
+                    question=parsed.text,
+                    response=response,
+                )
+            except Exception:
+                logger.exception(
+                    "Slack channel conversation history save failed", extra={"tenant_id": tenant_id}
+                )
     except IntegrationError:
         logger.error(
             "Slack response delivery failed",
@@ -577,11 +619,29 @@ async def _handle_home_interaction(
             )
         return
 
-    message = (
-        f"confirm {interaction.action_id}"
-        if interaction.kind == "confirm"
-        else interaction.text
-    )
+    if interaction.kind == "select_contact":
+        message = f"Update contact {interaction.action_id}"
+    elif interaction.kind == "select_field":
+        contact_id, _, field = interaction.text.partition(":")
+        if field == "lifecyclestage":
+            message = f"Update contact {contact_id}'s lifecycle stage"
+        elif field in {"hs_lead_status", "lead_status"}:
+            message = f"Update contact {contact_id}'s lead status"
+        else:
+            message = f"Update contact {contact_id}'s {field}"
+    elif interaction.kind == "select_value":
+        parts = interaction.text.split(":")
+        if len(parts) >= 3:
+            contact_id, field, value = parts[0], parts[1], parts[2]
+            message = f"Update contact {contact_id} with {field} {value}"
+        else:
+            message = interaction.text
+    else:
+        message = (
+            f"confirm {interaction.action_id}"
+            if interaction.kind == "confirm"
+            else interaction.text
+        )
     if not message.strip():
         response = AgentResponse(
             status="missing_fields",
@@ -614,7 +674,7 @@ async def _handle_home_interaction(
     )
     agent_started = perf_counter()
     conversation_context = None
-    if interaction.kind == "submit":
+    if interaction.kind in {"submit", "select_contact", "select_field", "select_value", "confirm"}:
         try:
             prior_turns = await conversation_history.latest(
                 tenant_id=tenant_id,
@@ -668,7 +728,7 @@ async def _handle_home_interaction(
         )
     finally:
         _log_timing("agent.respond", agent_started, tenant_id)
-    if interaction.kind == "submit":
+    if interaction.kind in {"submit", "select_contact", "select_field", "select_value", "confirm"}:
         try:
             await conversation_history.save_completed(
                 tenant_id=tenant_id,
@@ -895,6 +955,7 @@ async def events(
         payload,
         tenant_id,
         request.state.request_id,
+        conversation_history,
     )
 
     return Response(status_code=200)
