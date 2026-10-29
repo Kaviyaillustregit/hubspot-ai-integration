@@ -551,7 +551,7 @@ async def _publish_authorized_home(
     )
 
 
-async def _handle_home_interaction(
+async def _process_home_interaction(
     agent: AccountIntelligenceAgent,
     client: SlackClient,
     action_safety: ActionSafetyService,
@@ -762,6 +762,36 @@ async def _handle_home_interaction(
     )
 
 
+async def _handle_home_interaction(
+    agent: AccountIntelligenceAgent,
+    client: SlackClient,
+    action_safety: ActionSafetyService,
+    conversation_history: SlackConversationService,
+    authorization: SlackAuthorizationService,
+    interaction: HomeInteraction,
+    tenant_id: str,
+    request_id: str,
+    banner_image_url: str | None = None,
+) -> None:
+    try:
+        await _process_home_interaction(
+            agent,
+            client,
+            action_safety,
+            conversation_history,
+            authorization,
+            interaction,
+            tenant_id,
+            request_id,
+            banner_image_url,
+        )
+    except Exception:
+        logger.exception(
+            "Slack App Home interaction handling failed",
+            extra={"tenant_id": tenant_id},
+        )
+
+
 @router.post("/interactions")
 async def interactions(
     request: Request,
@@ -811,14 +841,6 @@ async def interactions(
 
     if tenant_id is None:
         logger.warning("Slack workspace is not mapped to a tenant")
-        return Response(status_code=200)
-
-    if not await _is_authorized_slack_user(
-        authorization,
-        tenant_id=tenant_id,
-        team_id=interaction.team_id,
-        user_id=interaction.user_id,
-    ):
         return Response(status_code=200)
 
     background_tasks.add_task(

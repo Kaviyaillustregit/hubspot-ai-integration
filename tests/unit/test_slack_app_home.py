@@ -1058,6 +1058,16 @@ class AllowAuthorization:
         return True
 
 
+class DenyAuthorization:
+    async def is_authorized(self, **kwargs):
+        return False
+
+
+class ErrorAuthorization:
+    async def is_authorized(self, **kwargs):
+        raise RuntimeError("Database connection timed out")
+
+
 def app_with(
     agent,
     client,
@@ -1065,6 +1075,7 @@ def app_with(
     team_map='{"T1":"tenant-a"}',
     history=None,
     web_app_base_url=None,
+    authorization=None,
 ):
     app = create_app(
         Settings(
@@ -1075,7 +1086,9 @@ def app_with(
     )
     app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_slack_client] = lambda: client
-    app.dependency_overrides[get_slack_authorization] = lambda: AllowAuthorization()
+    app.dependency_overrides[get_slack_authorization] = (
+        lambda: authorization if authorization is not None else AllowAuthorization()
+    )
     app.dependency_overrides[get_action_safety] = lambda: safety
     app.dependency_overrides[get_conversation_history] = (
         lambda: history if history is not None else FakeConversationHistory()
@@ -1644,3 +1657,60 @@ def test_view_full_response_rejects_other_user_or_tenant(stored_tenant, stored_u
     assert response.status_code == 200
     assert client.views == []
     assert agent.requests == []
+
+
+def test_interactions_fast_acknowledgement_and_background_processing():
+    """Verify that interaction endpoint immediately returns 200 and background task runs."""
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history)
+
+    response = post_interaction(
+        app,
+        home_payload(
+            {"action_id": SUBMIT_ACTION},
+            request_text="Show my deals",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert len(agent.requests) == 1
+    assert agent.requests[0].message == "Show my deals"
+    assert len(client.views) == 2
+
+
+def test_interactions_unauthorized_user_is_denied_in_background_without_crm_work():
+    """Verify that unauthorized users are safely rejected in background without triggering CRM work."""
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history, authorization=DenyAuthorization())
+
+    response = post_interaction(
+        app,
+        home_payload(
+            {"action_id": SUBMIT_ACTION},
+            request_text="Delete all contacts",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert agent.requests == []
+    assert client.views == []
+
+def test_interactions_authorization_error_is_handled_gracefully():
+    """Verify that an authorization error in background is caught safely without leaking or crashing."""
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history, authorization=ErrorAuthorization())
+
+    response = post_interaction(
+        app,
+        home_payload(
+            {"action_id": SUBMIT_ACTION},
+            request_text="Get secret records",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert agent.requests == []
+    assert client.views == []
