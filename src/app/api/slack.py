@@ -134,10 +134,16 @@ async def _is_authorized_slack_user(
             slack_team_id=team_id,
             slack_user_id=user_id,
         )
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "Slack user authorization lookup failed; request denied",
-            extra={"tenant_id": tenant_id},
+            "Slack user authorization lookup failed; request denied: %s: %s",
+            type(exc).__name__,
+            exc,
+            extra={
+                "tenant_id": tenant_id,
+                "error_type": type(exc).__name__,
+                "error_detail": str(exc),
+            },
         )
         return False
 
