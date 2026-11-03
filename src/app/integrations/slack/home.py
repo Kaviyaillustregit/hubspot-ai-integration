@@ -724,11 +724,13 @@ def parse_home_interaction(payload: object) -> HomeInteraction | None:
 
     if action_id == REQUEST_INPUT_ACTION:
         value = action.get("value")
+        text = value.strip() if isinstance(value, str) and value.strip() else _submitted_text(view)
         return HomeInteraction(
             team_id,
             user_id,
-            "input",
-            value.strip() if isinstance(value, str) else "",
+            "submit",
+            text,
+            action_id=action_id,
             action_ts=action_ts,
         )
     if action_id == SUBMIT_ACTION:
@@ -954,6 +956,10 @@ def build_home_view(
                 "element": {
                     "type": "plain_text_input",
                     "action_id": REQUEST_INPUT_ACTION,
+                    "multiline": True,
+                    "dispatch_action_config": {
+                        "trigger_actions_on": ["on_enter_pressed"]
+                    },
                     "placeholder": _plain(
                         "Ask about deals, contacts, companies, or your pipeline..."
                     ),

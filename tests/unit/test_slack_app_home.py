@@ -1730,3 +1730,79 @@ def test_interactions_authorization_error_is_handled_gracefully():
     assert response.status_code == 200
     assert agent.requests == []
     assert client.views == []
+
+
+def test_home_view_input_element_has_multiline_and_enter_dispatch():
+    """Verify input block element has multiline and triggers on Enter pressed."""
+    view = build_home_view()
+    [request_input] = blocks_of_type(view, "input")
+    element = request_input["element"]
+    assert element["type"] == "plain_text_input"
+    assert element["action_id"] == REQUEST_INPUT_ACTION
+    assert element.get("multiline") is True
+    assert element.get("dispatch_action_config") == {
+        "trigger_actions_on": ["on_enter_pressed"]
+    }
+
+
+def test_home_press_enter_submits_query_to_agent():
+    """Verify pressing Enter in the input block submits the query to the agent."""
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history)
+
+    enter_payload = home_payload(
+        {"action_id": REQUEST_INPUT_ACTION, "value": "Show my deals via enter"}
+    )
+    response = post_interaction(app, enter_payload)
+
+    assert response.status_code == 200
+    assert len(agent.requests) == 1
+    assert agent.requests[0].message == "Show my deals via enter"
+    assert len(client.views) == 2
+    assert "Working..." in all_text(client.views[0][1]["blocks"])
+    assert "*Contact created*" in all_text(client.views[1][1]["blocks"])
+    [final_input] = blocks_of_type(client.views[1][1], "input")
+    assert "initial_value" not in final_input["element"]
+
+
+def test_home_send_button_submits_query_to_agent():
+    """Verify clicking Send button continues to submit the query to the agent."""
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history)
+
+    send_payload = home_payload(
+        {"action_id": SUBMIT_ACTION},
+        request_text="Show my deals via send button",
+    )
+    response = post_interaction(app, send_payload)
+
+    assert response.status_code == 200
+    assert len(agent.requests) == 1
+    assert agent.requests[0].message == "Show my deals via send button"
+    assert len(client.views) == 2
+
+
+def test_home_duplicate_submission_while_inflight_is_dropped():
+    """Verify that a duplicate submission while a request is already in-flight is dropped."""
+    from app.api.slack import _inflight_home_submissions
+
+    client, safety, agent = RecordingClient(), FakeSafety(), RecordingAgent()
+    history = FakeConversationHistory()
+    app = app_with(agent, client, safety, history=history)
+
+    submission_key = ("tenant-a", "T1", "U1")
+    _inflight_home_submissions.add(submission_key)
+    try:
+        duplicate_payload = home_payload(
+            {"action_id": SUBMIT_ACTION},
+            request_text="Duplicate request while working",
+        )
+        response = post_interaction(app, duplicate_payload)
+
+        assert response.status_code == 200
+        assert agent.requests == []
+        assert client.views == []
+    finally:
+        _inflight_home_submissions.discard(submission_key)

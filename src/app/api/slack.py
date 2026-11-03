@@ -522,6 +522,9 @@ class _SlackHomeProgressTracker:
                 )
 
 
+_inflight_home_submissions: set[tuple[str, str, str]] = set()
+_home_submission_lock = Lock()
+
 async def _publish_authorized_home(
     client: SlackClient,
     action_safety: ActionSafetyService,
@@ -612,19 +615,6 @@ async def _process_home_interaction(
             )
         return
 
-    if interaction.kind == "input":
-        await _publish_home(
-            client,
-            action_safety,
-            conversation_history,
-            tenant_id=tenant_id,
-            team_id=interaction.team_id,
-            user_id=interaction.user_id,
-            draft=interaction.text,
-            banner_image_url=banner_image_url,
-            )
-        return
-
     if interaction.kind == "select_contact":
         message = f"Update contact {interaction.action_id}"
     elif interaction.kind == "select_field":
@@ -666,100 +656,118 @@ async def _process_home_interaction(
             )
         return
 
-    await _publish_home(
-        client,
-        action_safety,
-        conversation_history,
-        tenant_id=tenant_id,
-        team_id=interaction.team_id,
-        user_id=interaction.user_id,
-        request_text=message,
-        working=True,
-        timing_label="loading",
-        banner_image_url=banner_image_url,
-    )
-    agent_started = perf_counter()
-    conversation_context = None
-    if interaction.kind in {"submit", "select_contact", "select_field", "select_value", "confirm"}:
-        try:
-            prior_turns = await conversation_history.latest(
-                tenant_id=tenant_id,
-                team_id=interaction.team_id,
-                user_id=interaction.user_id,
-                limit=3,
-            )
-            conversation_context = "\n".join(
-                f"User: {turn.question}\nAssistant: {turn.response_text[:400]}"
-                for turn in prior_turns
-            )[-2000:] or None
-        except Exception:
-            logger.warning(
-                "Slack Home conversation context lookup failed",
-                extra={"tenant_id": tenant_id},
-            )
-    home_progress = _SlackHomeProgressTracker(
-        client,
-        action_safety,
-        conversation_history,
-        tenant_id=tenant_id,
-        team_id=interaction.team_id,
-        user_id=interaction.user_id,
-        request_text=message,
-        banner_image_url=banner_image_url,
-    )
-    agent_request = AgentRequest(
-        tenant_id=tenant_id,
-        actor_id=interaction.user_id,
-        message=message,
-        request_id=request_id or uuid4().hex,
-        channel_id=f"apphome:{interaction.user_id}",
-        message_ts=interaction.action_ts or None,
-        event_id=interaction.action_ts or None,
-        conversation_context=conversation_context,
-    )
+    submission_key = (tenant_id, interaction.team_id, interaction.user_id)
+
+    if interaction.kind in {"submit", "input"}:
+        async with _home_submission_lock:
+            if submission_key in _inflight_home_submissions:
+                logger.info(
+                    "Dropping duplicate Slack Home submission from user %s",
+                    interaction.user_id,
+                    extra={"tenant_id": tenant_id, "user_id": interaction.user_id},
+                )
+                return
+            _inflight_home_submissions.add(submission_key)
+
     try:
-        if "on_progress" in signature(agent.respond).parameters:
-            response = await agent.respond(agent_request, on_progress=home_progress.update)
-        else:
-            response = await agent.respond(agent_request)
-    except Exception:
-        logger.exception(
-            "Slack App Home agent request failed",
-            extra={"tenant_id": tenant_id},
+        await _publish_home(
+            client,
+            action_safety,
+            conversation_history,
+            tenant_id=tenant_id,
+            team_id=interaction.team_id,
+            user_id=interaction.user_id,
+            request_text=message,
+            working=True,
+            timing_label="loading",
+            banner_image_url=banner_image_url,
         )
-        response = AgentResponse(
-            status="unavailable",
-            text="Something went wrong while processing your request. Please try again.",
-            request_id=request_id,
+        agent_started = perf_counter()
+        conversation_context = None
+        if interaction.kind in {"submit", "select_contact", "select_field", "select_value", "confirm"}:
+            try:
+                prior_turns = await conversation_history.latest(
+                    tenant_id=tenant_id,
+                    team_id=interaction.team_id,
+                    user_id=interaction.user_id,
+                    limit=3,
+                )
+                conversation_context = "\n".join(
+                    f"User: {turn.question}\nAssistant: {turn.response_text[:400]}"
+                    for turn in prior_turns
+                )[-2000:] or None
+            except Exception:
+                logger.warning(
+                    "Slack Home conversation context lookup failed",
+                    extra={"tenant_id": tenant_id},
+                )
+        home_progress = _SlackHomeProgressTracker(
+            client,
+            action_safety,
+            conversation_history,
+            tenant_id=tenant_id,
+            team_id=interaction.team_id,
+            user_id=interaction.user_id,
+            request_text=message,
+            banner_image_url=banner_image_url,
         )
-    finally:
-        _log_timing("agent.respond", agent_started, tenant_id)
-    if interaction.kind in {"submit", "select_contact", "select_field", "select_value", "confirm"}:
+        agent_request = AgentRequest(
+            tenant_id=tenant_id,
+            actor_id=interaction.user_id,
+            message=message,
+            request_id=request_id or uuid4().hex,
+            channel_id=f"apphome:{interaction.user_id}",
+            message_ts=interaction.action_ts or None,
+            event_id=interaction.action_ts or None,
+            conversation_context=conversation_context,
+        )
         try:
-            await conversation_history.save_completed(
-                tenant_id=tenant_id,
-                team_id=interaction.team_id,
-                user_id=interaction.user_id,
-                delivery_id=interaction.action_ts,
-                question=message,
-                response=response,
-            )
+            if "on_progress" in signature(agent.respond).parameters:
+                response = await agent.respond(agent_request, on_progress=home_progress.update)
+            else:
+                response = await agent.respond(agent_request)
         except Exception:
             logger.exception(
-                "Slack Home conversation history save failed", extra={"tenant_id": tenant_id}
+                "Slack App Home agent request failed",
+                extra={"tenant_id": tenant_id},
             )
-    await _publish_home(
-        client,
-        action_safety,
-        conversation_history,
-        tenant_id=tenant_id,
-        team_id=interaction.team_id,
-        user_id=interaction.user_id,
-        request_text=message,
-        response=response,
-        timing_label="final",
-        banner_image_url=banner_image_url,
-    )
+            response = AgentResponse(
+                status="unavailable",
+                text="Something went wrong while processing your request. Please try again.",
+                request_id=request_id,
+            )
+        finally:
+            _log_timing("agent.respond", agent_started, tenant_id)
+        if interaction.kind in {"submit", "select_contact", "select_field", "select_value", "confirm"}:
+            try:
+                await conversation_history.save_completed(
+                    tenant_id=tenant_id,
+                    team_id=interaction.team_id,
+                    user_id=interaction.user_id,
+                    delivery_id=interaction.action_ts,
+                    question=message,
+                    response=response,
+                )
+            except Exception:
+                logger.exception(
+                    "Slack Home conversation history save failed", extra={"tenant_id": tenant_id}
+                )
+        await _publish_home(
+            client,
+            action_safety,
+            conversation_history,
+            tenant_id=tenant_id,
+            team_id=interaction.team_id,
+            user_id=interaction.user_id,
+            request_text=message,
+            response=response,
+            timing_label="final",
+            banner_image_url=banner_image_url,
+        )
+    finally:
+        if interaction.kind in {"submit", "input"}:
+            async with _home_submission_lock:
+                _inflight_home_submissions.discard(submission_key)
 
 
 async def _handle_home_interaction(
