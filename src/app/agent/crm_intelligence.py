@@ -845,8 +845,8 @@ def plan_crm_query(message: str) -> CRMQueryPlan:
             *filters,
             CRMIntelligenceFilter(
                 field="lifecyclestage",
-                operator="in",
-                value="lead,marketingqualifiedlead,salesqualifiedlead",
+                operator="eq",
+                value="lead",
             ),
         ]
     overdue = object_name == "deal" and re.search(r"\boverdue\b", normalized_message)
@@ -959,14 +959,21 @@ def _resolve_property_candidates(message: str, object_name: str) -> list[str]:
         candidates.extend(["name", "hubspot_owner_id", "industry", "city", "numberofemployees"])
     else:
         candidates.extend(["firstname", "lastname", "email", "jobtitle", "city"])
+        if re.search(r"\b(?:lead\s+status|hs_lead_status)\b", text):
+            candidates.append("hs_lead_status")
     return candidates
 
 
 def _default_chart_type(message: str, group_field: str | None) -> str | None:
     text = _normalise_text(message)
-    explicit = re.search(r"\b(bar|line|pie|doughnut|donut|funnel)\s+chart\b", text)
+    explicit = re.search(
+        r"\b(bar|line|pie|doughnut|donut|funnel)\s+(?:chart|graph|plot)\b|"
+        r"\b(?:as|in|with)\s+(?:a|an)?\s*(bar|line|pie|doughnut|donut|funnel)\b",
+        text,
+    )
     if explicit:
-        return "doughnut" if explicit.group(1) == "donut" else explicit.group(1)
+        chart_kind = explicit.group(1) or explicit.group(2)
+        return "doughnut" if chart_kind == "donut" else chart_kind
     if "pipeline" in text or "funnel" in text or group_field == "pipeline":
         return "funnel"
     if (

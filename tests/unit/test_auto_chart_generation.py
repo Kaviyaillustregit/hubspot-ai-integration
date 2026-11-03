@@ -10,12 +10,14 @@ from app.ai.provider import AIProvider
 from app.ai.service import AIService
 from app.integrations.hubspot.models import (
     HubSpotCompaniesPage,
+    HubSpotContact,
     HubSpotContactsPage,
     HubSpotDeal,
     HubSpotDealsPage,
     HubSpotPipeline,
     HubSpotPipelineStage,
 )
+from app.integrations.hubspot.properties import HubSpotPropertyDefinition
 
 PIPELINE = HubSpotPipeline(
     id="default",
@@ -65,14 +67,49 @@ class MockCompanies:
 
 
 class MockContacts:
+    def __init__(self, contacts=None):
+        self.contacts = contacts or []
+
     async def get_hubspot_account_id(self, context):
         return "portal-123"
 
     async def list_contacts(self, context, **kwargs):
-        return HubSpotContactsPage(results=[])
+        offset = int(kwargs.get("after") or 0)
+        chunk = self.contacts[offset : offset + 100]
+        more = offset + 100 < len(self.contacts)
+        return HubSpotContactsPage(
+            results=chunk, next_after=str(offset + 100) if more else None
+        )
 
     async def search_contacts(self, context, **kwargs):
-        return HubSpotContactsPage(results=[])
+        return HubSpotContactsPage(results=self.contacts)
+
+
+class MockPropertiesService:
+    async def list_properties(self, context, object_type):
+        if object_type == "deals":
+            return [
+                HubSpotPropertyDefinition(name="dealname", label="Deal Name"),
+                HubSpotPropertyDefinition(name="amount", label="Amount", type="number"),
+                HubSpotPropertyDefinition(name="dealstage", label="Deal Stage"),
+                HubSpotPropertyDefinition(name="closedate", label="Close Date", type="date"),
+                HubSpotPropertyDefinition(name="pipeline", label="Pipeline"),
+            ]
+        if object_type == "companies":
+            return [
+                HubSpotPropertyDefinition(name="name", label="Company Name"),
+                HubSpotPropertyDefinition(name="industry", label="Industry"),
+                HubSpotPropertyDefinition(name="city", label="City"),
+            ]
+        return [
+            HubSpotPropertyDefinition(name="firstname", label="First Name"),
+            HubSpotPropertyDefinition(name="lastname", label="Last Name"),
+            HubSpotPropertyDefinition(name="email", label="Email"),
+            HubSpotPropertyDefinition(name="jobtitle", label="Job Title"),
+            HubSpotPropertyDefinition(name="city", label="City"),
+            HubSpotPropertyDefinition(name="lifecyclestage", label="Lifecycle Stage"),
+            HubSpotPropertyDefinition(name="hs_lead_status", label="Lead Status"),
+        ]
 
 
 class MockDeals:
@@ -120,11 +157,17 @@ def sample_deals():
     ]
 
 
-def make_test_agent(deals=None):
+def make_test_agent(deals=None, contacts=None):
     deals = deals or sample_deals()
     repo = MockDeals(deals)
+    contact_repo = MockContacts(contacts)
     return AccountIntelligenceAgent(
-        HubSpotToolRegistry(MockCompanies(), MockContacts(), repo),
+        HubSpotToolRegistry(
+            MockCompanies(),
+            contact_repo,
+            repo,
+            properties=MockPropertiesService(),
+        ),
         AIService(MockProvider()),
         object(),
     )
@@ -374,3 +417,105 @@ async def test_agent_plain_count_query_has_no_chart():
     result = response.result
     assert result.get("chart_url") is None
     assert "chart" not in result
+
+
+# ---------------------------------------------------------------------------
+# 9. Regression tests for lead lifecycle filtering, limits, and chart rendering
+# ---------------------------------------------------------------------------
+
+
+def test_plan_20_leads_with_bar_chart():
+    plan = plan_crm_query("Give me 20 leads with a bar chart")
+    assert plan.object == "contact"
+    assert plan.limit == 20
+    assert plan.chart_requested is True
+    assert plan.chart_type == "bar"
+    assert any(
+        f.field == "lifecyclestage" and f.operator == "eq" and f.value == "lead"
+        for f in plan.filters
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_20_leads_with_bar_chart_returns_strictly_leads_and_grouped_bar_chart():
+    # 25 total contacts: 22 leads with various statuses, 2 customers, 1 SQL
+    contacts = [
+        HubSpotContact(
+            id=f"lead-{i}",
+            properties={
+                "firstname": f"LeadFirst{i}",
+                "lastname": f"LeadLast{i}",
+                "email": f"lead{i}@example.com",
+                "lifecyclestage": "lead",
+                "hs_lead_status": "NEW" if i < 10 else ("OPEN" if i < 18 else "IN_PROGRESS"),
+            },
+        )
+        for i in range(22)
+    ] + [
+        HubSpotContact(
+            id=f"cust-{i}",
+            properties={
+                "firstname": f"Cust{i}",
+                "lastname": "Customer",
+                "email": f"cust{i}@example.com",
+                "lifecyclestage": "customer",
+            },
+        )
+        for i in range(2)
+    ] + [
+        HubSpotContact(
+            id="sql-1",
+            properties={
+                "firstname": "SQL1",
+                "lastname": "User",
+                "email": "sql1@example.com",
+                "lifecyclestage": "salesqualifiedlead",
+            },
+        )
+    ]
+
+    agent = make_test_agent(contacts=contacts)
+    response = await agent.respond(ask("Give me 20 leads with a bar chart"))
+
+    assert response.status == "ok"
+    result = response.result
+    # 1. Returned records are at most 20 and all are strictly leads
+    rows = result["rows"]
+    assert len(rows) == 20
+    assert all("Cust" not in row["firstname"] and "SQL" not in row["firstname"] for row in rows)
+
+    # 2. Chart is generated and present
+    assert result.get("chart_url") is not None
+    assert result["chart_url"].startswith("https://quickchart.io/chart?")
+    assert result.get("chart_type") == "bar"
+    assert result.get("chart_title") == "Leads by Status"
+
+    # 3. Chart values exactly match the 20 returned records
+    chart_data = result["chart"]["data"]
+    assert sum(chart_data["datasets"][0]["data"]) == 20
+    assert "_Chart shown below._" in response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_empty_results_with_chart_requested_explains_no_records():
+    # Agent with 0 contacts
+    agent = make_test_agent(contacts=[])
+    response = await agent.respond(ask("Give me 20 leads with a bar chart"))
+
+    assert response.status == "ok"
+    result = response.result
+    assert result.get("chart_url") is None
+    assert "_Chart could not be generated: no matching records found._" in response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_deal_listing_with_chart_generates_bar_chart():
+    agent = make_test_agent()
+    response = await agent.respond(ask("Show 5 deals as a bar chart"))
+
+    assert response.status == "ok"
+    result = response.result
+    assert result.get("chart_url") is not None
+    assert result["chart_url"].startswith("https://quickchart.io/chart?")
+    assert result.get("chart_type") == "bar"
+    assert "_Chart shown below._" in response.text

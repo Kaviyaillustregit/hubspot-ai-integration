@@ -18,16 +18,7 @@ def test_lead_retrieval_phrases_target_contacts_by_lifecycle_stage():
     for prompt in ("Can you show me our leads?", "Who are our potential customers?"):
         plan = plan_crm_query(prompt)
         assert plan.object == "contact"
-        assert any(
-            item.field == "lifecyclestage"
-            and item.operator == "in"
-            and {"lead", "marketingqualifiedlead", "salesqualifiedlead"}.issubset(
-                set(item.value.split(","))
-            )
-            for item in plan.filters
-        )
-
-
+        assert any(item.field == "lifecyclestage" and item.value == "lead" for item in plan.filters)
 def test_overdue_query_has_open_stage_and_half_open_close_date_bounds():
     plan = plan_crm_query("Which of my deals are overdue?")
     assert plan.object == "deal"

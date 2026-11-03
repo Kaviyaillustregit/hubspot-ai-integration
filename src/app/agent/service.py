@@ -346,7 +346,7 @@ _LEAD_QUALIFICATION_REQUEST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _LEAD_RETRIEVAL_REQUEST_PATTERN = re.compile(
-    r"\b(?:show|list|display|get|find|who\s+are)\b.{0,80}"
+    r"\b(?:show|list|display|get|give|find|fetch|retrieve|pull|who\s+are)\b.{0,80}"
     r"\b(?:our\s+)?(?:leads?|potential\s+customers?|prospects?)\b",
     re.IGNORECASE,
 )
@@ -760,7 +760,7 @@ class AccountIntelligenceAgent:
                 re.I,
             )
             and re.search(
-                r"\b(?:show|list|find|get|display|count|how many|who\s+are|group|"
+                r"\b(?:show|list|find|get|give|fetch|retrieve|pull|display|count|how many|who\s+are|group|"
                 r"breakdown|sort|filter)\b",
                 request.message,
                 re.I,
@@ -1095,28 +1095,31 @@ class AccountIntelligenceAgent:
                     if len(text) + len(links_line) <= _SLACK_MESSAGE_MAX_LENGTH:
                         text += links_line
             await _report_progress("Preparing your response")
-            if plan.chart_requested and rows and grouped:
+            if plan.chart_requested and not rows:
+                text += "\n_Chart could not be generated: no matching records found._"
+            elif plan.chart_requested and rows and grouped:
                 chart = build_chart_payload(plan, rows)
                 payload.update(chart)
                 payload["chart_url"] = generate_chart_url(chart["chart"])
                 payload["chart_title"] = f"Deals by {plan.group_by or 'stage'}"
                 text += "\n_Chart shown below._"
-            elif plan.chart_requested and rows and not grouped and plan.sort:
+            elif plan.chart_requested and rows and not grouped:
                 chart_rows = rows[: plan.limit or len(rows)]
                 labels = [str(row.get("dealname") or "Untitled deal") for row in chart_rows]
                 values = [
                     float(_parse_decimal(str(row.get("amount") or "0").split()[-1]) or 0)
                     for row in chart_rows
                 ]
+                chart_title = "Top deals by amount" if plan.sort else "Deals by amount"
                 chart = build_chart_config(
-                    plan.chart_type or "bar", "Top deals by amount", labels, values,
+                    plan.chart_type or "bar", chart_title, labels, values,
                     value_label="Deal amount",
                 )
                 payload.update({
                     "chart": chart,
                     "chart_type": plan.chart_type or "bar",
                     "chart_url": generate_chart_url(chart),
-                    "chart_title": "Top deals by amount",
+                    "chart_title": chart_title,
                 })
                 text += "\n_Chart shown below._"
             return AgentResponse(
@@ -1212,6 +1215,11 @@ class AccountIntelligenceAgent:
         ):
             plan = initial_plan.model_copy(update={"properties": plan.properties})
         plan = _ground_explicit_query_properties(request.message, plan, catalog)
+        known_props = {item.name for item in catalog}
+        if plan.object == "contact" and "hs_lead_status" in known_props:
+            if re.search(r"\b(?:leads?|prospects?)\b", request.message, re.I) or plan.chart_requested:
+                if "hs_lead_status" not in plan.properties:
+                    plan = plan.model_copy(update={"properties": [*plan.properties, "hs_lead_status"]})
         association_key = _requested_association(request.message, plan.object)
         if association_key == "associated_company":
             plan = plan.model_copy(update={
@@ -1347,6 +1355,8 @@ class AccountIntelligenceAgent:
                 re.IGNORECASE,
             )
         )
+        if plan.chart_requested and not no_chart and not result.get("rows"):
+            text += "\n_Chart could not be generated: no matching records found._"
         should_chart = bool(
             result.get("rows")
             and not no_chart
@@ -1357,32 +1367,66 @@ class AccountIntelligenceAgent:
         )
         if should_chart:
             chart_rows = result["rows"]
-            value_key = next(
-                (
-                    f"{item.operation}_{item.field}"
-                    for item in plan.aggregations
-                    if item.operation in {"sum", "avg", "min", "max"}
-                ),
-                "count",
-            )
-            labels = [str(row.get("group") or "Unknown") for row in chart_rows]
-            values = []
-            for row in chart_rows:
-                try:
-                    values.append(float(row.get(value_key) or 0))
-                except (TypeError, ValueError):
-                    values.append(0.0)
             chart_type = plan.chart_type or "bar"
-            chart = build_chart_config(
-                chart_type,
-                f"{record_type.title()} by {plan.group_by or 'requested metric'}",
-                labels,
-                values,
-                value_label=(
+            if plan.group_by is not None:
+                value_key = next(
+                    (
+                        f"{item.operation}_{item.field}"
+                        for item in plan.aggregations
+                        if item.operation in {"sum", "avg", "min", "max"}
+                    ),
+                    "count",
+                )
+                labels = [str(row.get("group") or "Unknown") for row in chart_rows]
+                values = []
+                for row in chart_rows:
+                    try:
+                        values.append(float(row.get(value_key) or 0))
+                    except (TypeError, ValueError):
+                        values.append(0.0)
+                chart_title = f"{record_type.title()} by {plan.group_by or 'requested metric'}"
+                value_label = (
                     "Record count"
                     if value_key == "count"
                     else value_key.replace("_", " ").title()
-                ),
+                )
+            else:
+                if plan.object == "contact":
+                    has_lead_status = any(
+                        row.get("hs_lead_status") or row.get("hs_lead_status_raw")
+                        for row in chart_rows
+                    )
+                    is_lead = bool(
+                        re.search(r"\b(?:leads?|prospects?)\b", request.message, re.IGNORECASE)
+                    )
+                    if has_lead_status or is_lead:
+                        group_prop = "hs_lead_status"
+                        chart_title = "Leads by Status"
+                    else:
+                        group_prop = "lifecyclestage"
+                        chart_title = "Contacts by Lifecycle Stage"
+                elif plan.object == "company":
+                    group_prop = "industry" if any(row.get("industry") for row in chart_rows) else "city"
+                    chart_title = f"Companies by {group_prop.title()}"
+                else:
+                    group_prop = "dealstage"
+                    chart_title = "Deals by Stage"
+
+                from collections import Counter
+
+                counts = Counter(
+                    str(row.get(group_prop) or "Unassigned") for row in chart_rows
+                )
+                labels = list(counts.keys())
+                values = [float(c) for c in counts.values()]
+                value_label = "Record count"
+
+            chart = build_chart_config(
+                chart_type,
+                chart_title,
+                labels,
+                values,
+                value_label=value_label,
             )
             chart_url = generate_chart_url(chart)
             text += "\n_Chart shown below._"
@@ -1402,11 +1446,9 @@ class AccountIntelligenceAgent:
         if chart_url:
             payload.update({
                 "chart": chart,
-                "chart_type": plan.chart_type or "bar",
+                "chart_type": chart_type,
                 "chart_url": chart_url,
-                "chart_title": (
-                    f"{record_type.title()} by {plan.group_by or 'requested metric'}"
-                ),
+                "chart_title": chart_title,
             })
         return AgentResponse(
             status="ok", text=text, request_id=request.request_id,
