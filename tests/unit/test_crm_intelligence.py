@@ -55,6 +55,28 @@ def test_rule_based_query_planner_handles_groupby_and_quarter_variations():
     assert quarter_plan.group_by == "dealstage"
 
 
+def test_rule_based_query_planner_recognizes_quarterly_amount_trends():
+    plan = plan_crm_query("Show quarterly deal amount trends")
+
+    assert plan.object == "deal"
+    assert plan.group_by == "quarter"
+    assert plan.group_date_field == "closedate"
+    assert plan.chart_requested is True
+    assert plan.chart_type == "line"
+    assert any(
+        item.operation == "sum" and item.field == "amount" for item in plan.aggregations
+    )
+
+
+def test_rule_based_query_planner_autocharts_grouped_deal_queries():
+    plan = plan_crm_query("Show open deals by stage")
+
+    assert plan.object == "deal"
+    assert plan.group_by == "dealstage"
+    assert plan.chart_requested is True
+    assert plan.chart_type == "bar"
+
+
 def test_grouping_and_aggregation_are_deterministic_for_deal_records():
     plan = CRMQueryPlan(
         object="deal",

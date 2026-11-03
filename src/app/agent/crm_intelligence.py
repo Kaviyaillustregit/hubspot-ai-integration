@@ -324,12 +324,23 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
         return "dealstatus"
     if re.search(r"\bmonthly\b", text):
         return "month"
+    if re.search(r"\bquarterly\b", text):
+        return "quarter"
+    if object_name == "deal" and re.search(r"\bdistribution\b", text) and all(
+        re.search(rf"\b{status}\b", text) for status in ("won", "lost")
+    ):
+        return "dealstage"
+    if object_name == "contact" and re.search(r"\b(leads?|prospects?)\b", text) and re.search(
+        r"\bby\s+status\b", text
+    ):
+        return "hs_lead_status"
     label_breakdown = re.search(
         r"\b(stage|pipeline|owner|month|quarter|year)\s+(?:breakdown|distribution)\b",
         text,
     )
     if label_breakdown:
-        return _normalise_field_name(label_breakdown.group(1), object_name)
+        field = _normalise_field_name(label_breakdown.group(1), object_name)
+        return field or None
     known_group = re.search(
         r"\b(?:group(?:ed)?\s+by|breakdown\s+by|by|each|every|per)\s+"
         r"(?:deal\s+)?(stage|pipeline|owner|month|quarter|year)\b",
@@ -337,7 +348,8 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
     )
     if known_group:
         candidate = known_group.group(1)
-        return _normalise_field_name(candidate, object_name)
+        field = _normalise_field_name(candidate, object_name)
+        return field or None
     for pattern in (
         r"\b(?:by|per|each|every)\s+(month|quarter|year)\b",
         r"groupby\s+([a-z0-9 _-]+)",
@@ -347,16 +359,19 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
         r"\b(?:each|every|per)\s+(?:deal\s+)?(stage|pipeline|owner|company|type)\b",
     ):
         match = re.search(pattern, text.rstrip("?.! "))
-        if match:
-            candidate = match.group(1).strip()
-            if candidate:
-                aliases = _FIELD_ALIASES.get(object_name, {}).values()
-                words = candidate.split()
-                for size in range(len(words), 0, -1):
-                    field = _normalise_field_name(" ".join(words[:size]), object_name)
-                    if field in aliases:
-                        return field
-                return _normalise_field_name(candidate, object_name)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        aliases = _FIELD_ALIASES.get(object_name, {}).values()
+        words = candidate.split()
+        for size in range(len(words), 0, -1):
+            field = _normalise_field_name(" ".join(words[:size]), object_name)
+            if field in aliases:
+                return field or None
+        field = _normalise_field_name(candidate, object_name)
+        return field or None
     if object_name in {"company", "contact"} and re.search(
         r"\b(?:count|counts|number\s+of|group(?:ed)?|breakdown|distribution|trend|compare|chart|graph|visuali[sz])\b",
         text,
@@ -370,7 +385,7 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
             candidate = grouped_by.group(1).strip()
             field = _normalise_field_name(candidate, object_name)
             if field in _FIELD_ALIASES.get(object_name, {}).values():
-                return field
+                return field or None
     return None
 
 
@@ -436,14 +451,35 @@ def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilt
     if object_name != "deal":
         return filters
     # Date ranges are carried by CRMQueryPlan.date_range, not by filters.
-    if re.search(r"\bopen\b", text):
-        filters.append(CRMIntelligenceFilter(field="dealstage", operator="in", value="open"))
-    if re.search(r"\bclosed\b", text):
-        filters.append(CRMIntelligenceFilter(field="dealstage", operator="in", value="closed"))
-    if re.search(r"\bwon\b", text):
-        filters.append(CRMIntelligenceFilter(field="dealstage", operator="eq", value="won"))
-    if re.search(r"\blost\b", text):
-        filters.append(CRMIntelligenceFilter(field="dealstage", operator="eq", value="lost"))
+    state_terms = [
+        name
+        for name in ("open", "closed", "won", "lost")
+        if re.search(rf"\b{name}\b", text)
+    ]
+    if state_terms:
+        comparing = bool(re.search(r"\b(?:compare|comparison|versus|vs)\b", text))
+        unique_terms = list(dict.fromkeys(state_terms))
+        if not comparing and "open" not in unique_terms and all(term in unique_terms for term in ("won", "lost")):
+            for term in [t for t in unique_terms if t not in {"won", "lost"}]:
+                filters.append(
+                    CRMIntelligenceFilter(
+                        field="dealstage",
+                        operator="in" if term in {"open", "closed"} else "eq",
+                        value=term,
+                    )
+                )
+            filters.append(
+                CRMIntelligenceFilter(field="dealstage", operator="in", value="won,lost")
+            )
+        else:
+            for term in unique_terms:
+                filters.append(
+                    CRMIntelligenceFilter(
+                        field="dealstage",
+                        operator="in" if term in {"open", "closed"} else "eq",
+                        value=term,
+                    )
+                )
 
     def capture(pattern: str) -> str | None:
         match = re.search(pattern, text)
@@ -918,6 +954,7 @@ def plan_crm_query(message: str) -> CRMQueryPlan:
                         _normalise_text(message),
                     )
                 )
+                or (object_name == "deal" and group_field is not None)
                 or (object_name in {"contact", "company"} and group_field is not None)
             )
         ),
@@ -981,7 +1018,7 @@ def _default_chart_type(message: str, group_field: str | None) -> str | None:
         or group_field in {"month", "quarter", "year"}
     ):
         return "line"
-    if "distribution" in text or "share" in text or "proportion" in text:
+    if re.search(r"\b(?:distribution|distributed|share|proportion)\b", text):
         return "doughnut"
     if "breakdown" in text or "compare" in text or "comparison" in text or "versus" in text or "vs" in text or group_field is not None:
         return "bar"

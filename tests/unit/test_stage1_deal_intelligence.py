@@ -730,13 +730,14 @@ async def test_chart_uses_requested_metric_for_counts_and_averages():
 
 
 @pytest.mark.asyncio
-async def test_no_chart_claim_when_chart_not_requested():
+async def test_stage_breakdown_generates_chart_by_default():
     agent, _ = make_agent(twenty_six_deals())
 
     result = await agent.respond(ask("How many deals are in each stage?"))
 
-    assert "chart" not in result.result
-    assert "Chart shown" not in result.text
+    assert result.result.get("chart_url") is not None
+    assert result.result["chart_url"].startswith("https://quickchart.io/chart?")
+    assert "_Chart shown below._" in result.text
 
 
 @pytest.mark.asyncio
@@ -885,6 +886,20 @@ def test_stage_state_filters_use_pipeline_metadata():
         plan, twenty_six_deals(), [PIPELINE], "how many open deals by stage"
     )
     assert [row["label"] for row in analysis["rows"]] == ["Qualification", "Proposal"]
+
+
+def test_closed_won_and_closed_lost_distribution_includes_both_states():
+    plan = plan_crm_query("Show the distribution of closed won and closed lost deals")
+    analysis, _ = analyze_deals(
+        plan,
+        twenty_six_deals(),
+        [PIPELINE],
+        "Show the distribution of closed won and closed lost deals",
+    )
+
+    rows = {row["label"]: row for row in analysis["rows"]}
+    assert rows["Closed Won"]["count"] == 7
+    assert rows["Closed Lost"]["count"] == 3
 
 
 @pytest.mark.asyncio

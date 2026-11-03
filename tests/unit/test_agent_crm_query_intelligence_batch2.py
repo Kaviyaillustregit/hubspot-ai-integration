@@ -501,6 +501,61 @@ async def test_final_batch2_slack_text_renders_all_explicit_fields_and_links(
         assert "Pune" in response.text
 
 
+@pytest.mark.asyncio
+async def test_contact_query_strips_deal_only_amount_property_from_plan():
+    class Provider(AIProvider):
+        async def generate_structured(self, *, prompt_name, variables, output_schema):
+            if prompt_name == "crm-intelligence/v1":
+                return CRMQueryPlan(
+                    object="contact",
+                    properties=["amount", "firstname"],
+                    limit=5,
+                )
+            raise AssertionError(prompt_name)
+
+    class Tools:
+        property_discovery_available = True
+
+        async def discover_properties(self, tenant_id, object_name):
+            assert object_name == "contacts"
+            return [
+                HubSpotPropertyDefinition(name="firstname", label="First name", type="string"),
+                HubSpotPropertyDefinition(name="lastname", label="Last name", type="string"),
+                HubSpotPropertyDefinition(name="email", label="Email", type="string"),
+            ]
+
+        async def list_all_contacts(self, tenant_id, *, properties):
+            return [
+                HubSpotContact(
+                    id="contact-amount-guard",
+                    properties={"firstname": "Ava", "lastname": "Kumar", "email": "ava@example.com"},
+                )
+            ]
+
+        async def list_owners(self, tenant_id):
+            return []
+
+        async def hubspot_record_urls(self, tenant_id, records):
+            return [f"https://hubspot.test/{record_id}" for _, record_id in records]
+
+    agent = AccountIntelligenceAgent(Tools(), AIService(Provider()), object())
+    request = AgentRequest(
+        tenant_id="tenant-amount-guard",
+        actor_id="user-amount-guard",
+        message="Show the top 10 contacts by lead status",
+        request_id="contact-amount-guard",
+    )
+
+    response = await agent._run_generic_crm_query(
+        request,
+        CRMQueryPlan(object="contact", properties=["firstname"], limit=10),
+    )
+
+    assert response.status == "ok"
+    assert "amount" not in response.result["plan"]["properties"]
+
+
+
 def test_batch2_slack_table_formatter_respects_message_limit():
     text = _format_batch2_slack_table(
         "Found 3 companies. Showing 3 records.",

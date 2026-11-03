@@ -293,7 +293,6 @@ def test_negative_chart_requests_suppress_chart(message: str):
 @pytest.mark.parametrize(
     "message",
     [
-        "How many deals are in each stage?",
         "Tell me about Acme Corp",
         "Find contact Ava Kumar",
         "Show all open deals",
@@ -409,14 +408,72 @@ async def test_agent_respects_negative_chart_request():
 
 
 @pytest.mark.asyncio
-async def test_agent_plain_count_query_has_no_chart():
+async def test_agent_stage_distribution_query_generates_chart():
     agent = make_test_agent()
     response = await agent.respond(ask("How many deals are in each stage?"))
 
     assert response.status == "ok"
     result = response.result
-    assert result.get("chart_url") is None
-    assert "chart" not in result
+    assert result.get("chart_url") is not None
+    assert result["chart_url"].startswith("https://quickchart.io/chart?")
+    assert result.get("chart_type") == "bar"
+    assert "_Chart shown below._" in response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_open_deals_by_stage_generates_grouped_chart():
+    agent = make_test_agent()
+    response = await agent.respond(ask("Show open deals by stage"))
+
+    assert response.status == "ok"
+    result = response.result
+    assert result.get("chart_url") is not None
+    assert result["chart_url"].startswith("https://quickchart.io/chart?")
+    assert result.get("chart_type") == "bar"
+    assert "_Chart shown below._" in response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_lead_distribution_by_status_routes_to_contact_analytics_and_charts():
+    contacts = [
+        HubSpotContact(
+            id="lead-1",
+            properties={
+                "firstname": "Lead",
+                "lastname": "One",
+                "email": "lead1@example.com",
+                "lifecyclestage": "lead",
+                "hs_lead_status": "NEW",
+            },
+        ),
+        HubSpotContact(
+            id="lead-2",
+            properties={
+                "firstname": "Lead",
+                "lastname": "Two",
+                "email": "lead2@example.com",
+                "lifecyclestage": "lead",
+                "hs_lead_status": "OPEN",
+            },
+        ),
+        HubSpotContact(
+            id="lead-3",
+            properties={
+                "firstname": "Lead",
+                "lastname": "Three",
+                "email": "lead3@example.com",
+                "lifecyclestage": "lead",
+            },
+        ),
+    ]
+    agent = make_test_agent(contacts=contacts)
+    response = await agent.respond(ask("How are our leads distributed by status?"))
+
+    assert response.status == "ok"
+    result = response.result
+    assert result.get("chart_url") is not None
+    assert result["chart_url"].startswith("https://quickchart.io/chart?")
+    assert "Missing lead status" in result["chart"]["data"]["labels"]
 
 
 # ---------------------------------------------------------------------------

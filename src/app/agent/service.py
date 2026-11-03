@@ -760,8 +760,8 @@ class AccountIntelligenceAgent:
                 re.I,
             )
             and re.search(
-                r"\b(?:show|list|find|get|give|fetch|retrieve|pull|display|count|how many|who\s+are|group|"
-                r"breakdown|sort|filter)\b",
+                r"\b(?:show|list|find|get|give|fetch|retrieve|pull|display|count|how many|how\s+are|how\s+is|what\s+is|what\s+are|who\s+are|group|"
+                r"breakdown|distribution|distributed|trend|compare|comparison|sort|filter)\b",
                 request.message,
                 re.I,
             )
@@ -1228,6 +1228,31 @@ class AccountIntelligenceAgent:
                     if prop.casefold() not in {"company", "company_name", "associatedcompanyid"}
                 ]
             })
+        if plan.object in {"contact", "company"}:
+            plan = plan.model_copy(
+                update={
+                    "properties": [
+                        prop for prop in plan.properties if prop.casefold() != "amount"
+                    ],
+                    "filters": [
+                        item for item in plan.filters if item.field.casefold() != "amount"
+                    ],
+                    "sort": [
+                        item for item in plan.sort if item.field.casefold() != "amount"
+                    ],
+                    "aggregations": [
+                        item
+                        for item in plan.aggregations
+                        if item.field.casefold() != "amount"
+                    ],
+                    "group_by": (
+                        None
+                        if (plan.group_by or "").casefold() == "amount"
+                        else plan.group_by
+                    ),
+                }
+            )
+
         try:
             plan = resolve_catalog_fields(plan, catalog)
         except UnsupportedCRMField as exc:
@@ -1414,8 +1439,11 @@ class AccountIntelligenceAgent:
 
                 from collections import Counter
 
+                missing_label = (
+                    "Missing lead status" if group_prop == "hs_lead_status" else "Unassigned"
+                )
                 counts = Counter(
-                    str(row.get(group_prop) or "Unassigned") for row in chart_rows
+                    str(row.get(group_prop) or missing_label) for row in chart_rows
                 )
                 labels = list(counts.keys())
                 values = [float(c) for c in counts.values()]

@@ -1,5 +1,7 @@
 import pytest
 
+from datetime import UTC, datetime, timedelta
+
 from app.agent.crm_intelligence import plan_crm_query
 from app.agent.schemas import AgentRequest, CRMIntentExtraction, GroundedSummary
 from app.agent.service import AccountIntelligenceAgent
@@ -243,7 +245,7 @@ async def test_overdue_deal_request_returns_only_open_past_due_records_with_link
             id="future",
             properties={
                 "dealname": "Future", "dealstage": "qualification", "amount": "7000",
-                "closedate": "2026-10-25",
+                "closedate": (datetime.now(UTC).date() + timedelta(days=7)).isoformat(),
             },
         ),
         HubSpotDeal(

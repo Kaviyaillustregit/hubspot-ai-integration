@@ -205,7 +205,10 @@ def execute_record_query(
                 else:
                     key = str(field_date.year)
             else:
-                key = str(raw) if raw not in {None, ""} else "Unknown"
+                if raw not in {None, ""}:
+                    key = str(raw)
+                else:
+                    key = "Missing lead status" if plan.group_by == "hs_lead_status" else "Unknown"
             buckets[key].append(record)
         rows = [{"group": key, "count": len(items)} for key, items in sorted(buckets.items())]
         for aggregation in plan.aggregations:
