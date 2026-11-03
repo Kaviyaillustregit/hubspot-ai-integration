@@ -147,7 +147,9 @@ def _pair_record_field_lines(
     *,
     max_segment_width: int = 80,
     max_paired_width: int = 180,
-) -> list[str]:
+
+    return_pairs: bool = False,
+) -> list[str | tuple[str, str]]:
     """Return Slack mrkdwn lines, pairing related fields when feasible.
 
     Each item is (key, label, rendered_line, pairable).
@@ -223,7 +225,10 @@ def _pair_record_field_lines(
     ]
     target_left_width = min(max(left_widths, default=0), 44)
 
-    combined: list[str] = []
+    if return_pairs:
+        return list(rendered)
+
+    combined: list[str | tuple[str, str]] = []
     for item in rendered:
         if not isinstance(item, tuple):
             combined.append(item)
@@ -1732,20 +1737,8 @@ def _render_table_row(
     if structured:
         return _render_grouped_row(grouped_fields)
 
-    render_lines = _pair_record_field_lines(record_type, field_entries)
-
-    content: list[str] = []
-    current = ""
-    for line in render_lines:
-        for part in _split_escaped_text(line, _MAX_SECTION_TEXT):
-            if current and len(current) + 1 + len(part) > _MAX_SECTION_TEXT:
-                content.append(current)
-                current = ""
-            current = f"{current}\n{part}" if current else part
-    if current:
-        content.append(current)
-
-    return [_section(chunk) for chunk in content]
+    render_items = _pair_record_field_lines(record_type, field_entries, return_pairs=True)
+    return _render_paired_field_lines_as_blocks(render_items)
 
 def _render_record_card(
     record_type: str,
@@ -1825,13 +1818,10 @@ def _render_record_card(
         line = f"*{html.escape(label, quote=False)}:* {value}"
         field_entries.append((key, str(raw_label), line, True))
 
-    lines = _pair_record_field_lines(record_type, field_entries)
+    lines = _pair_record_field_lines(record_type, field_entries, return_pairs=True)
 
     if lines:
-        blocks.extend(
-            _section(chunk)
-            for chunk in _split_escaped_text("\n".join(lines), _MAX_SECTION_TEXT)
-        )
+        blocks.extend(_render_paired_field_lines_as_blocks(lines))
     if not lines:
         blocks.append(_context("No record details are available."))
     return blocks
@@ -2085,6 +2075,44 @@ def _header(text: str) -> Block:
 
 def _section(text: str) -> Block:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+def _section_fields(fields: list[str]) -> Block:
+    return {
+        "type": "section",
+        "fields": [{"type": "mrkdwn", "text": field} for field in fields],
+    }
+
+
+def _render_paired_field_lines_as_blocks(
+    lines: list[str | tuple[str, str]],
+) -> list[Block]:
+    blocks: list[Block] = []
+    field_buffer: list[str] = []
+
+    def flush_fields() -> None:
+        while len(field_buffer) >= 2:
+            chunk = field_buffer[:10]
+            blocks.append(_section_fields(chunk))
+            del field_buffer[:10]
+
+        if field_buffer:
+            for part in _split_escaped_text(field_buffer[0], _MAX_SECTION_TEXT):
+                blocks.append(_section(part))
+            field_buffer.clear()
+
+    for item in lines:
+        if isinstance(item, tuple):
+            if len(field_buffer) + 2 > 10:
+                flush_fields()
+            field_buffer.extend([item[0], item[1]])
+            continue
+
+        flush_fields()
+        for part in _split_escaped_text(item, _MAX_SECTION_TEXT):
+            blocks.append(_section(part))
+
+    flush_fields()
+    return blocks
 
 
 def _context(text: str) -> Block:

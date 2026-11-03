@@ -683,20 +683,25 @@ def test_structured_tables_render_dynamic_columns_rows_and_hubspot_links(
     assert blocks[1]["text"]["text"] == f"Found {len(rows)} records."
     assert all(value in text for value in expected_values)
     assert text.count("|View in HubSpot>") == len(rows)
-    record_blocks = [
-        block
-        for block in blocks[2:]
-        if block["type"] == "section" and isinstance(block.get("text"), dict)
-    ]
+    record_blocks = [block for block in blocks[2:] if block["type"] == "section"]
     assert all(
-        block["type"] == "section" and isinstance(block.get("text"), dict)
-        for block in blocks[2:]
-        if block["type"] == "section"
+        (
+            isinstance(block.get("text"), dict)
+            or (isinstance(block.get("fields"), list) and block["fields"])
+        )
+        for block in record_blocks
     )
     assert all(
         len(block["text"]["text"]) <= 3000
         for block in record_blocks
         if isinstance(block.get("text"), dict)
+    )
+    assert all(
+        len(field["text"]) <= 2000
+        for block in record_blocks
+        if isinstance(block.get("fields"), list)
+        for field in block["fields"]
+        if isinstance(field, dict) and isinstance(field.get("text"), str)
     )
     assert len(record_blocks) >= len(rows)
     assert sum(block["type"] == "divider" for block in blocks) == len(rows) - 1

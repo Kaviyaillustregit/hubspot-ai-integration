@@ -7,12 +7,29 @@ import pytest
 from app.agent.schemas import AgentResponse
 from app.api.slack import _respond
 from app.integrations.slack.home import CONFIRM_ACTION, render_response_blocks
+
+
 from app.integrations.slack.response_formatting import (
     escape_slack_text,
     format_property_value,
     format_slack_response,
     normalize_slack_display_text,
 )
+
+
+def _has_field_pair(blocks: list[dict[str, object]], left: str, right: str) -> bool:
+    for block in blocks:
+        if block.get("type") != "section":
+            continue
+        fields = block.get("fields")
+        if not isinstance(fields, list):
+            continue
+        texts = [field.get("text") for field in fields if isinstance(field, dict)]
+        for idx in range(len(texts) - 1):
+            if texts[idx] == left and texts[idx + 1] == right:
+                return True
+    return False
+
 
 
 def test_channel_response_uses_panel_blocks_and_original_fallback_text():
@@ -381,7 +398,7 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
     encoded = json.dumps(blocks, ensure_ascii=False)
     detail_sections = [
         block for block in blocks
-        if block.get("type") == "section" and isinstance(block.get("text"), dict)
+        if block.get("type") == "section" and ("text" in block or "fields" in block)
     ]
     channel = format_slack_response(response)
     channel_encoded = json.dumps(channel.messages, ensure_ascii=False)
@@ -393,9 +410,10 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
     assert detail_sections
     if kind == "deal":
         assert "*\U0001F4BC Name:* Cloud Migration Project" in encoded
-        assert re.search(
-            r"\*\U0001F4C5 Close Date:\* Dec 10, 2026\u2007{2,}\*\U0001F464 Owner ID:\* 98711688",
-            encoded,
+        assert _has_field_pair(
+            blocks,
+            "*\U0001F4C5 Close Date:* Dec 10, 2026",
+            "*\U0001F464 Owner ID:* 98711688",
         )
         assert "*\U0001F464 Owner ID:* 98711688" in encoded
         assert "*\U0001F7E1 Stage:* Qualified To Buy" in encoded
@@ -458,13 +476,15 @@ def test_contact_record_details_render_as_compact_two_column_pairs():
     blocks = render_response_blocks(response)
     encoded = json.dumps(blocks, ensure_ascii=False)
 
-    assert re.search(
-        r"\*\U0001F464 Name:\* A\. Example\u2007{2,}\*\U0001F4E7 Email:\* a@example\.com",
-        encoded,
+    assert _has_field_pair(
+        blocks,
+        "*\U0001F464 Name:* A. Example",
+        "*\U0001F4E7 Email:* a@example.com",
     )
-    assert re.search(
-        r"\*\U0001F4DE Phone:\* \+1 555 0100\u2007{2,}\*\U0001F3E2 Company:\* Northwind",
-        encoded,
+    assert _has_field_pair(
+        blocks,
+        "*\U0001F4DE Phone:* +1 555 0100",
+        "*\U0001F3E2 Company:* Northwind",
     )
     assert "*\U0001F464 Owner ID:* 123456" in encoded
     assert f"<{url}|View in HubSpot>" in encoded
@@ -508,17 +528,20 @@ def test_company_record_details_render_as_compact_two_column_pairs():
     blocks = render_response_blocks(response)
     encoded = json.dumps(blocks, ensure_ascii=False)
 
-    assert re.search(
-        r"\*\U0001F3E2 Company name:\* Northwind\u2007{2,}\*\U0001F310 Domain:\* northwind\.example",
-        encoded,
+    assert _has_field_pair(
+        blocks,
+        "*\U0001F3E2 Company name:* Northwind",
+        "*\U0001F310 Domain:* northwind.example",
     )
-    assert re.search(
-        r"\*\U0001F3ED Industry:\* Software\u2007{2,}\*\U0001F4CD City:\* Seattle",
-        encoded,
+    assert _has_field_pair(
+        blocks,
+        "*\U0001F3ED Industry:* Software",
+        "*\U0001F4CD City:* Seattle",
     )
-    assert re.search(
-        r"\*\U0001F465 Employees:\* 120\u2007{2,}\*\U0001F464 Owner ID:\* 654321",
-        encoded,
+    assert _has_field_pair(
+        blocks,
+        "*\U0001F465 Employees:* 120",
+        "*\U0001F464 Owner ID:* 654321",
     )
     assert f"<{url}|View in HubSpot>" in encoded
     assert encoded.count(url) == 1
@@ -944,11 +967,18 @@ def test_section_fields_obey_limits_and_long_values_are_preserved():
     field_blocks = [
         block for block in blocks if block.get("type") == "section" and "fields" in block
     ]
-    long_chunks = [
-        block["text"]["text"]
-        for block in blocks
-        if block.get("type") == "section" and isinstance(block.get("text"), dict)
-    ]
+    long_chunks: list[str] = []
+    for block in blocks:
+        if block.get("type") != "section":
+            continue
+        if isinstance(block.get("text"), dict):
+            long_chunks.append(block["text"]["text"])
+        if isinstance(block.get("fields"), list):
+            long_chunks.extend(
+                field.get("text")
+                for field in block["fields"]
+                if isinstance(field, dict) and isinstance(field.get("text"), str)
+            )
 
     assert [len(block["fields"]) for block in field_blocks] == [10, 1]
     assert all(
