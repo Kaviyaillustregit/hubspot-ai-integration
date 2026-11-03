@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -378,8 +379,10 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
 
     blocks = render_response_blocks(response)
     encoded = json.dumps(blocks, ensure_ascii=False)
-    sections = [block for block in blocks if block.get("type") == "section"]
-    section_text = "\n".join(block["text"]["text"] for block in sections)
+    detail_sections = [
+        block for block in blocks
+        if block.get("type") == "section" and isinstance(block.get("text"), dict)
+    ]
     channel = format_slack_response(response)
     channel_encoded = json.dumps(channel.messages, ensure_ascii=False)
 
@@ -387,24 +390,28 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
         block.get("type") == "header" and header in block["text"]["text"]
         for block in blocks
     )
-    assert all("fields" not in block for block in sections)
+    assert detail_sections
     if kind == "deal":
-        assert "*💼 Name:* Cloud Migration Project" in section_text
-        assert "*👤 Owner ID:* 98711688" in section_text
-        assert "*🟡 Stage:* Qualified To Buy" in section_text
-        assert "*💰 Amount:* *250,000*" in section_text
-        assert "*📅 Close Date:* Dec 10, 2026" in section_text
-        assert "🔗 <https://app.hubspot.com/contacts/123/record/0-3/456|View in HubSpot>" in encoded
+        assert "*\U0001F4BC Name:* Cloud Migration Project" in encoded
+        assert re.search(
+            r"\*\U0001F4C5 Close Date:\* Dec 10, 2026\u2007{2,}\*\U0001F464 Owner ID:\* 98711688",
+            encoded,
+        )
+        assert "*\U0001F464 Owner ID:* 98711688" in encoded
+        assert "*\U0001F7E1 Stage:* Qualified To Buy" in encoded
+        assert "*\U0001F4B0 Amount:* *250,000*" in encoded
+        assert "*\U0001F4C5 Close Date:* Dec 10, 2026" in encoded
+        assert "\U0001F517 <https://app.hubspot.com/contacts/123/record/0-3/456|View in HubSpot>" in encoded
     elif kind == "contact":
-        assert "*👤 Name:* Cloud Migration Project" in section_text
-        assert "*👤 Owner ID:* 98711688" in section_text
-        assert "*💰 Amount:* *250,000*" in section_text
-        assert "*📅 Close Date:* Dec 10, 2026" in section_text
+        assert "*\U0001F464 Name:* Cloud Migration Project" in encoded
+        assert "*\U0001F464 Owner ID:* 98711688" in encoded
+        assert "*\U0001F4B0 Amount:* *250,000*" in encoded
+        assert "*\U0001F4C5 Close Date:* Dec 10, 2026" in encoded
     else:  # company
-        assert "*🏢 Name:* Cloud Migration Project" in section_text
-        assert "*👤 Owner ID:* 98711688" in section_text
-        assert "*💰 Amount:* *250,000*" in section_text
-        assert "*📅 Close Date:* Dec 10, 2026" in section_text
+        assert "*\U0001F3E2 Name:* Cloud Migration Project" in encoded
+        assert "*\U0001F464 Owner ID:* 98711688" in encoded
+        assert "*\U0001F4B0 Amount:* *250,000*" in encoded
+        assert "*\U0001F4C5 Close Date:* Dec 10, 2026" in encoded
     assert "Owner ID" in encoded
     assert "Ada" not in encoded
     assert "Dec 10, 2026" in encoded
@@ -414,6 +421,107 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
     assert channel.fallback_text == response.text
     assert channel_encoded.count(url) == 1
     assert any(block.get("type") == "header" for page in channel.messages for block in page)
+
+
+def test_contact_record_details_render_as_compact_two_column_pairs():
+    url = "https://app.hubspot.com/contacts/123/record/0-1/999"
+    response = AgentResponse(
+        status="ok",
+        text=f"Contact details. <{url}|Open in HubSpot>",
+        request_id="contact-details-two-column",
+        result={
+            "kind": "crm_records",
+            "title": "Contact Details",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "phone", "label": "Phone"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "name": "A. Example",
+                        "email": "a@example.com",
+                        "phone": "+1 555 0100",
+                        "company": "Northwind",
+                        "owner": "123456",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    assert re.search(
+        r"\*\U0001F464 Name:\* A\. Example\u2007{2,}\*\U0001F4E7 Email:\* a@example\.com",
+        encoded,
+    )
+    assert re.search(
+        r"\*\U0001F4DE Phone:\* \+1 555 0100\u2007{2,}\*\U0001F3E2 Company:\* Northwind",
+        encoded,
+    )
+    assert "*\U0001F464 Owner ID:* 123456" in encoded
+    assert f"<{url}|View in HubSpot>" in encoded
+    assert encoded.count(url) == 1
+
+
+def test_company_record_details_render_as_compact_two_column_pairs():
+    url = "https://app.hubspot.com/contacts/123/record/0-2/321"
+    response = AgentResponse(
+        status="ok",
+        text=f"Company details. <{url}|Open in HubSpot>",
+        request_id="company-details-two-column",
+        result={
+            "kind": "crm_records",
+            "title": "Company Details",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Company name"},
+                    {"key": "domain", "label": "Domain"},
+                    {"key": "industry", "label": "Industry"},
+                    {"key": "city", "label": "City"},
+                    {"key": "employees", "label": "Employees"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "name": "Northwind",
+                        "domain": "northwind.example",
+                        "industry": "Software",
+                        "city": "Seattle",
+                        "employees": "120",
+                        "owner": "654321",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    assert re.search(
+        r"\*\U0001F3E2 Company name:\* Northwind\u2007{2,}\*\U0001F310 Domain:\* northwind\.example",
+        encoded,
+    )
+    assert re.search(
+        r"\*\U0001F3ED Industry:\* Software\u2007{2,}\*\U0001F4CD City:\* Seattle",
+        encoded,
+    )
+    assert re.search(
+        r"\*\U0001F465 Employees:\* 120\u2007{2,}\*\U0001F464 Owner ID:\* 654321",
+        encoded,
+    )
+    assert f"<{url}|View in HubSpot>" in encoded
+    assert encoded.count(url) == 1
 
 
 def test_listing_rows_use_readable_sections_and_preserve_all_requested_columns():
@@ -924,11 +1032,7 @@ def test_contact_and_company_field_labels_have_emoji_prefixes_regression():
     )
 
     contact_blocks = render_response_blocks(contact_response)
-    contact_text = "\n".join(
-        block["text"]["text"]
-        for block in contact_blocks
-        if block.get("type") == "section"
-    )
+    contact_text = json.dumps(contact_blocks, ensure_ascii=False)
     # Name field on a contact card must carry the person emoji.
     assert "*\U0001F464 Name:* Ava Kumar" in contact_text
     # Email field on a contact card must carry the envelope emoji.
@@ -963,11 +1067,7 @@ def test_contact_and_company_field_labels_have_emoji_prefixes_regression():
     )
 
     company_blocks = render_response_blocks(company_response)
-    company_text = "\n".join(
-        block["text"]["text"]
-        for block in company_blocks
-        if block.get("type") == "section"
-    )
+    company_text = json.dumps(company_blocks, ensure_ascii=False)
     # Company name field must carry the office building emoji.
     assert "*\U0001F3E2 Name:* Northwind" in company_text
     # Domain field must carry the globe emoji.

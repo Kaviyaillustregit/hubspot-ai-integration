@@ -31,6 +31,210 @@ _QUICK_ACTIONS = {
 _ACTION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _MAX_HOME_TABLE_BLOCKS = 70
 _MAX_SECTION_TEXT = 3000
+
+# Figure spaces keep the column gap compact while still readable.
+_COMPACT_COLUMN_GAP = "\u2007\u2007"
+
+
+_SLACK_LINK_LABEL = re.compile(r"<[^|>]+\|(?P<label>[^>]+)>")
+_SLACK_MARKDOWN_CHARS = re.compile(r"[\*`_~]")
+
+
+def _approx_visible_width(text: str) -> int:
+    if not text:
+        return 0
+    unescaped = html.unescape(text)
+    unescaped = _SLACK_LINK_LABEL.sub(lambda match: match.group("label"), unescaped)
+    unescaped = _SLACK_MARKDOWN_CHARS.sub("", unescaped)
+    return len(unescaped)
+
+
+def _field_slot(record_type: str | None, key: str, label: str) -> str:
+    normalized_key = key.casefold()
+    normalized_label = " ".join(str(label).casefold().split())
+
+    if normalized_key == "view_url" or "hubspot" in normalized_label or "view in hubspot" in normalized_label:
+        return "link"
+    if normalized_key.endswith("_links"):
+        return "links"
+
+    if record_type == "deal":
+        if normalized_key in {"name", "dealname", "deal_name"} or normalized_label in {"name", "deal name"}:
+            return "name"
+        if (
+            normalized_key in {"dealstage", "stage", "deal_stage", "status", "dealstatus"}
+            or "stage" in normalized_label
+        ):
+            return "stage"
+        if normalized_key in {"amount", "deal_amount"} or "amount" in normalized_label:
+            return "amount"
+        if (
+            normalized_key in {"closedate", "close_date", "closing_date"}
+            or "close date" in normalized_label
+            or "closing date" in normalized_label
+        ):
+            return "close_date"
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return "owner"
+        if "company" in normalized_label or normalized_key in {
+            "company",
+            "company_name",
+            "companyname",
+            "associatedcompany",
+            "account",
+        }:
+            return "company"
+        return "other"
+
+    if record_type == "contact":
+        if normalized_key in {
+            "name",
+            "contactname",
+            "contact_name",
+            "firstname",
+            "lastname",
+        } or normalized_label in {"name", "contact name", "first name", "last name"}:
+            return "name"
+        if normalized_key == "email" or "email" in normalized_label:
+            return "email"
+        if normalized_key in {"phone", "mobilephone"} or "phone" in normalized_label:
+            return "phone"
+        if "company" in normalized_label or normalized_key in {
+            "company",
+            "company_name",
+            "companyname",
+            "associatedcompany",
+            "account",
+        }:
+            return "company"
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return "owner"
+        if "status" in normalized_label or "lifecycle" in normalized_label or "lead status" in normalized_label:
+            return "status"
+        return "other"
+
+    if record_type == "company":
+        if normalized_key in {"name", "companyname", "company_name"} or normalized_label in {
+            "name",
+            "company name",
+        }:
+            return "name"
+        if (
+            normalized_key in {"domain", "website"}
+            or "domain" in normalized_label
+            or "website" in normalized_label
+        ):
+            return "domain"
+        if normalized_key == "industry" or "industry" in normalized_label:
+            return "industry"
+        if normalized_key in {"city", "location"} or "city" in normalized_label or "location" in normalized_label:
+            return "city"
+        if (
+            normalized_key in {"employees", "numemployees", "employee_count"}
+            or "employee" in normalized_label
+        ):
+            return "employees"
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return "owner"
+        return "other"
+
+    return "other"
+
+
+def _pair_record_field_lines(
+    record_type: str | None,
+    fields: list[tuple[str, str, str, bool]],
+    *,
+    max_segment_width: int = 80,
+    max_paired_width: int = 180,
+) -> list[str]:
+    """Return Slack mrkdwn lines, pairing related fields when feasible.
+
+    Each item is (key, label, rendered_line, pairable).
+    """
+
+    preferred_pairs: dict[str, dict[str, str]] = {
+        "deal": {"stage": "company", "company": "stage", "owner": "close_date", "close_date": "owner"},
+        "contact": {"name": "email", "phone": "company", "owner": "status"},
+        "company": {"name": "domain", "industry": "city", "employees": "owner"},
+    }
+
+    plan = preferred_pairs.get(record_type or "", {})
+    slots = [
+        (_field_slot(record_type, key, label), pairable)
+        for key, label, _, pairable in fields
+    ]
+    used: set[int] = set()
+    rendered: list[str | tuple[str, str]] = []
+
+    for idx, (key, label, line, pairable) in enumerate(fields):
+        if idx in used:
+            continue
+        slot, is_pairable = slots[idx]
+        if not (pairable and is_pairable) or slot in {"link", "links"}:
+            rendered.append(line)
+            used.add(idx)
+            continue
+
+        partner_slot = plan.get(slot)
+        if not partner_slot:
+            rendered.append(line)
+            used.add(idx)
+            continue
+
+        partner_index = None
+        for j in range(idx + 1, len(fields)):
+            if j in used:
+                continue
+            other_slot, other_pairable = slots[j]
+            if other_pairable and other_slot == partner_slot:
+                partner_index = j
+                break
+
+        if partner_index is None:
+            rendered.append(line)
+            used.add(idx)
+            continue
+
+        partner_line = fields[partner_index][2]
+        if (
+            _approx_visible_width(line) > max_segment_width
+            or _approx_visible_width(partner_line) > max_segment_width
+            or _approx_visible_width(line) + _approx_visible_width(partner_line) > max_paired_width
+        ):
+            rendered.append(line)
+            used.add(idx)
+            continue
+        left_line = line
+        right_line = partner_line
+        if record_type == "deal":
+            if {slot, partner_slot} == {"company", "stage"} and slot == "stage":
+                left_line, right_line = partner_line, line
+            if {slot, partner_slot} == {"close_date", "owner"} and slot == "owner":
+                left_line, right_line = partner_line, line
+        rendered.append((left_line, right_line))
+        used.add(idx)
+        used.add(partner_index)
+
+    left_widths = [
+        _approx_visible_width(item[0])
+        for item in rendered
+        if isinstance(item, tuple)
+    ]
+    target_left_width = min(max(left_widths, default=0), 44)
+
+    combined: list[str] = []
+    for item in rendered:
+        if not isinstance(item, tuple):
+            combined.append(item)
+            continue
+        left, right = item
+        padding = max(0, target_left_width - _approx_visible_width(left))
+        if padding > 4:
+            padding = 0
+        combined.append(f"{left}{'\u2007' * padding}{_COMPACT_COLUMN_GAP}{right}")
+    return combined
+
 _SLACK_LINK_TEXT = re.compile(r"<([^<>|]+)\|([^<>]*)>")
 _HISTORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _HISTORY_TOKEN_PATTERN = re.compile(r"<[^<>\n]*>|https?://[^\s<>]+|\s+|[^\s]+", re.IGNORECASE)
@@ -1440,6 +1644,7 @@ def _render_table_row(
         is_deal_row = True
     lines: list[str] = []
     grouped_fields: list[tuple[str, str, str]] = []
+    field_entries: list[tuple[str, str, str, bool]] = []
     for column in columns:
         key = column["key"]
         raw_label = column["label"]
@@ -1453,13 +1658,16 @@ def _render_table_row(
 
         if key == "view_url":
             value = _slack_hubspot_link(raw_value)
-            if value == "—":
+            if value == "â€”":
                 if show_missing:
-                    lines.append("*\U0001F517 HubSpot record:* Not available")
+                    line = "*\U0001F517 HubSpot record:* Not available"
+                    lines.append(line)
+                    field_entries.append((key, raw_label, line, False))
             else:
                 link_text = f"\U0001F517 {value}"
                 lines.append(link_text)
                 grouped_fields.append((key, "HubSpot record", link_text))
+                field_entries.append((key, raw_label, link_text, False))
             continue
 
         if key.endswith("_links") and isinstance(raw_value, list):
@@ -1468,14 +1676,16 @@ def _render_table_row(
                 if not isinstance(association, dict):
                     continue
                 link = _slack_hubspot_link(association.get("url"))
-                if link == "—":
+                if link == "â€”":
                     continue
                 name = html.escape(str(association.get("name") or "Record"), quote=False)
                 links.append(link.replace("View in HubSpot", name))
             if links:
                 value = ", ".join(links)
-                lines.append(f"*{label}:* {value}")
+                line = f"*{label}:* {value}"
+                lines.append(line)
                 grouped_fields.append((key, html.unescape(label), value))
+                field_entries.append((key, raw_label, line, False))
             continue
         else:
             if (
@@ -1490,7 +1700,7 @@ def _render_table_row(
                 if key in {"owner", "hubspot_owner_id"} and raw_value in (None, "")
                 else "Not available"
                 if show_missing and (
-                    raw_value is None or raw_value == "" or raw_value == "—" or raw_value == _MOJIBAKE_EM_DASH
+                    raw_value is None or raw_value == "" or raw_value == "â€”" or raw_value == _MOJIBAKE_EM_DASH
                 )
                 else format_property_value(key, raw_value)
             )
@@ -1511,8 +1721,10 @@ def _render_table_row(
         if not value:
             continue
 
-        lines.append(f"*{label}:* {value}")
+        line = f"*{label}:* {value}"
+        lines.append(line)
         grouped_fields.append((key, html.unescape(label), value))
+        field_entries.append((key, raw_label, line, True))
 
     if not lines:
         return [_section("No record details available.")]
@@ -1520,9 +1732,11 @@ def _render_table_row(
     if structured:
         return _render_grouped_row(grouped_fields)
 
+    render_lines = _pair_record_field_lines(record_type, field_entries)
+
     content: list[str] = []
     current = ""
-    for line in lines:
+    for line in render_lines:
         for part in _split_escaped_text(line, _MAX_SECTION_TEXT):
             if current and len(current) + 1 + len(part) > _MAX_SECTION_TEXT:
                 content.append(current)
@@ -1532,7 +1746,6 @@ def _render_table_row(
         content.append(current)
 
     return [_section(chunk) for chunk in content]
-
 
 def _render_record_card(
     record_type: str,
@@ -1563,24 +1776,25 @@ def _render_record_card(
             row_columns.append({"key": "view_url", "label": "HubSpot record"})
 
     is_deal_row = record_type == "deal"
-    lines: list[str] = []
+    field_entries: list[tuple[str, str, str, bool]] = []
     for column in row_columns:
         key = column.get("key", "")
         raw_value = rendered_row.get(key)
+        raw_label = column.get("label", key.replace("_", " ").title())
         if key == "view_url":
             link = _slack_hubspot_link(raw_value)
-            if link == "—":
+            if link == "â€”":
                 continue
-            lines.append(f"\U0001F517 {link}")
+            line = f"\U0001F517 {link}"
+            field_entries.append((key, str(raw_label), line, False))
             continue
         else:
             is_stage_key = (
                 key.casefold() in {"stage", "dealstage", "deal_stage", "status", "dealstatus"}
-                or "stage" in str(column.get("label", "")).casefold()
+                or "stage" in str(raw_label).casefold()
             )
             stage_val = str(raw_value or "") if is_stage_key and is_deal_row else None
-            label = column.get("label", key.replace("_", " ").title())
-            label = _decorate_field_label(record_type, key, str(label), stage_value=stage_val)
+            label = _decorate_field_label(record_type, key, str(raw_label), stage_value=stage_val)
 
             if (
                 key in {"owner", "hubspot_owner_id"}
@@ -1591,7 +1805,7 @@ def _render_record_card(
 
             if key in {"owner", "hubspot_owner_id"} and raw_value in (None, ""):
                 displayed = "Unassigned"
-            elif raw_value is None or raw_value == "" or raw_value == "—" or raw_value == _MOJIBAKE_EM_DASH:
+            elif raw_value is None or raw_value == "" or raw_value == "â€”" or raw_value == _MOJIBAKE_EM_DASH:
                 displayed = "Not available"
             else:
                 displayed = format_property_value(key, raw_value)
@@ -1608,7 +1822,10 @@ def _render_record_card(
             displayed = _bold_metric_value(key, displayed)
             value = html.escape(displayed, quote=False)
 
-        lines.append(f"*{html.escape(label, quote=False)}:* {value}")
+        line = f"*{html.escape(label, quote=False)}:* {value}"
+        field_entries.append((key, str(raw_label), line, True))
+
+    lines = _pair_record_field_lines(record_type, field_entries)
 
     if lines:
         blocks.extend(
@@ -1618,7 +1835,6 @@ def _render_record_card(
     if not lines:
         blocks.append(_context("No record details are available."))
     return blocks
-
 
 def _render_grouped_row(fields: list[tuple[str, str, str]]) -> list[Block]:
     """Render group names and metrics as a compact single-column summary."""
