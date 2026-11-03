@@ -1195,3 +1195,278 @@ def test_grouped_deal_stage_summary_all_expected_colors_regression():
     assert "*\U0001F7E1 Contract Sent*: *4* deals | *Total amount:* *1,300,000*" in rendered
     assert "*\U0001F7E2 Closed Won*: *4* deals | *Total amount:* *477,000*" in rendered
     assert "*\U0001F534 Closed Lost*: *4* deals | *Total amount:* *980,000*" in rendered
+
+
+def test_contact_compact_two_column_layout_all_pairs():
+    """Verify contact records render in a compact 2-column grid matching Section 3 A."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-1/888"
+    response = AgentResponse(
+        status="ok",
+        text="Contact details",
+        request_id="contact-full-grid",
+        result={
+            "kind": "crm_records",
+            "title": "Contact Details",
+            "table": {
+                "columns": [
+                    {"key": "firstname", "label": "First name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "lastname", "label": "Last name"},
+                    {"key": "phone", "label": "Phone"},
+                    {"key": "jobtitle", "label": "Job title"},
+                    {"key": "city", "label": "City"},
+                    {"key": "state", "label": "State/Region"},
+                    {"key": "industry", "label": "Industry"},
+                    {"key": "lifecyclestage", "label": "Lifecycle stage"},
+                    {"key": "hs_lead_status", "label": "Lead status"},
+                    {"key": "owner", "label": "HubSpot owner"},
+                    {"key": "createdate", "label": "Create date"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "firstname": "Sarah",
+                        "email": "sarah@example.com",
+                        "lastname": "Wilson",
+                        "phone": "+1 555 0199",
+                        "jobtitle": "VP Engineering",
+                        "city": "Austin",
+                        "state": "Texas",
+                        "industry": "Software",
+                        "lifecyclestage": "customer",
+                        "hs_lead_status": "OPEN",
+                        "owner": "169090866",
+                        "createdate": "2026-10-07T07:05:11Z",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    # Check all 6 canonical pairs in intended Left | Right columns
+    assert _has_field_pair(
+        blocks,
+        "*👤 First name:* Sarah",
+        "*📧 Email:* sarah@example.com",
+    )
+    assert _has_field_pair(
+        blocks,
+        "*👤 Last name:* Wilson",
+        "*📞 Phone:* +1 555 0199",
+    )
+    assert _has_field_pair(
+        blocks,
+        "*Job title:* VP Engineering",
+        "*City:* Austin",
+    )
+    assert _has_field_pair(
+        blocks,
+        "*State/Region:* Texas",
+        "*Industry:* Software",
+    )
+    assert _has_field_pair(
+        blocks,
+        "*Lifecycle stage:* customer",
+        "*Lead status:* OPEN",
+    )
+    assert _has_field_pair(
+        blocks,
+        "*👤 Owner ID:* 169090866",
+        "*📅 Create date:* Oct 7, 2026 at 07:05:11 +0000",
+    )
+    # Link is clickable and present once
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert f"<{url}|View in HubSpot>" in encoded
+
+
+def test_contact_compact_two_column_partial_fields_and_fallback():
+    """Verify contacts with partial fields (e.g. Image 1) pair remaining fields without vertical stacking."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-1/999"
+    response = AgentResponse(
+        status="ok",
+        text="Here's what I found",
+        request_id="contact-partial-grid",
+        result={
+            "kind": "crm_records",
+            "table": {
+                "columns": [
+                    {"key": "firstname", "label": "First name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "lastname", "label": "Last name"},
+                    {"key": "createdate", "label": "Create date"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "firstname": "Sarah",
+                        "email": None,
+                        "lastname": "Wilson",
+                        "createdate": "2026-10-07T07:05:11Z",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    # First name and Email (with Not available fallback) are paired
+    assert _has_field_pair(
+        blocks,
+        "*👤 First name:* Sarah",
+        "*📧 Email:* Not available",
+    )
+    # Last name and Create date are paired together into row 2
+    assert _has_field_pair(
+        blocks,
+        "*👤 Last name:* Wilson",
+        "*📅 Create date:* Oct 7, 2026 at 07:05:11 +0000",
+    )
+    # Total section blocks: 1 for heading, 1 with 4 fields, 1 for link
+    field_sections = [b for b in blocks if b.get("type") == "section" and "fields" in b]
+    assert len(field_sections) == 1
+    assert len(field_sections[0]["fields"]) == 4
+
+
+def test_company_compact_two_column_layout_all_pairs():
+    """Verify company records render in a compact 2-column grid matching Section 3 B (Image 2)."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-2/555"
+    response = AgentResponse(
+        status="ok",
+        text="Company listing",
+        request_id="company-full-grid",
+        result={
+            "kind": "crm_records",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Company name"},
+                    {"key": "domain", "label": "Company domain"},
+                    {"key": "industry", "label": "Industry"},
+                    {"key": "city", "label": "City"},
+                    {"key": "phone", "label": "Phone"},
+                    {"key": "lifecyclestage", "label": "Lifecycle stage"},
+                    {"key": "hs_lead_status", "label": "Lead status"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "name": "GreenPeak AI",
+                        "domain": None,
+                        "industry": None,
+                        "city": "Hyderabad",
+                        "phone": "23853",
+                        "lifecyclestage": "customer",
+                        "hs_lead_status": None,
+                        "owner": "169090866",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    # Row 1: Company name | Company domain
+    assert _has_field_pair(
+        blocks,
+        "*🏢 Company name:* GreenPeak AI",
+        "*🌐 Company domain:* Not available",
+    )
+    # Row 2: Industry | City
+    assert _has_field_pair(
+        blocks,
+        "*🏭 Industry:* Not available",
+        "*📍 City:* Hyderabad",
+    )
+    # Row 3: Phone | Lifecycle stage
+    assert _has_field_pair(
+        blocks,
+        "*Phone:* 23853",
+        "*Lifecycle stage:* customer",
+    )
+    # Row 4: Lead status | Owner ID
+    assert _has_field_pair(
+        blocks,
+        "*Lead status:* Not available",
+        "*👤 Owner ID:* 169090866",
+    )
+    # All 8 fields in a single compact section block
+    field_sections = [b for b in blocks if b.get("type") == "section" and "fields" in b]
+    assert len(field_sections) == 1
+    assert len(field_sections[0]["fields"]) == 8
+
+
+def test_deal_compact_two_column_layout_with_prominent_title():
+    """Verify deal records render with prominent title and 2-column grid matching Section 3 C (Image 4)."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-3/777"
+    response = AgentResponse(
+        status="ok",
+        text="Deal details",
+        request_id="deal-prominent-grid",
+        result={
+            "kind": "crm_records",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Account"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "GlobalHolding 1725955822 Opportunity",
+                        "company": "GlobalHolding 1725955822",
+                        "dealstage": "prospecting",
+                        "closedate": "2026-12-31",
+                        "owner": "Abhishek Kumar",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    # 1. Prominent deal title on its own line
+    text_sections = [
+        b.get("text", {}).get("text", "")
+        for b in blocks
+        if b.get("type") == "section" and "text" in b
+    ]
+    assert any("GlobalHolding 1725955822 Opportunity" in t for t in text_sections)
+
+    # 2. Account | Stage paired
+    assert _has_field_pair(
+        blocks,
+        "*🏢 Account:* GlobalHolding 1725955822",
+        "*⚪ Stage:* prospecting",
+    )
+
+    # 3. Close Date | Owner paired
+    assert _has_field_pair(
+        blocks,
+        "*📅 Close Date:* Dec 31, 2026",
+        "*👤 Owner:* Abhishek Kumar",
+    )
+
+    # 4. View in HubSpot link clickable
+    assert f"<{url}|View in HubSpot>" in encoded

@@ -53,20 +53,24 @@ def _field_slot(record_type: str | None, key: str, label: str) -> str:
     normalized_key = key.casefold()
     normalized_label = " ".join(str(label).casefold().split())
 
-    if normalized_key == "view_url" or "hubspot" in normalized_label or "view in hubspot" in normalized_label:
+    if (
+        normalized_key in {"view_url", "hubspot_url"}
+        or normalized_label in {"view in hubspot", "hubspot record"}
+        or "view in hubspot" in normalized_label
+    ):
         return "link"
     if normalized_key.endswith("_links"):
         return "links"
 
     if record_type == "deal":
         if normalized_key in {"name", "dealname", "deal_name"} or normalized_label in {"name", "deal name"}:
-            return "name"
+            return "deal_title"
         if (
             normalized_key in {"dealstage", "stage", "deal_stage", "status", "dealstatus"}
             or "stage" in normalized_label
         ):
             return "stage"
-        if normalized_key in {"amount", "deal_amount"} or "amount" in normalized_label:
+        if normalized_key in {"amount", "deal_amount", "total_amount"} or "amount" in normalized_label:
             return "amount"
         if (
             normalized_key in {"closedate", "close_date", "closing_date"}
@@ -76,7 +80,7 @@ def _field_slot(record_type: str | None, key: str, label: str) -> str:
             return "close_date"
         if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
             return "owner"
-        if "company" in normalized_label or normalized_key in {
+        if "company" in normalized_label or "account" in normalized_label or normalized_key in {
             "company",
             "company_name",
             "companyname",
@@ -87,18 +91,46 @@ def _field_slot(record_type: str | None, key: str, label: str) -> str:
         return "other"
 
     if record_type == "contact":
-        if normalized_key in {
-            "name",
-            "contactname",
-            "contact_name",
-            "firstname",
-            "lastname",
-        } or normalized_label in {"name", "contact name", "first name", "last name"}:
+        if normalized_key in {"firstname", "first_name"} or normalized_label in {"first name", "firstname"}:
+            return "firstname"
+        if normalized_key in {"lastname", "last_name"} or normalized_label in {"last name", "lastname"}:
+            return "lastname"
+        if normalized_key in {"name", "contactname", "contact_name"} or normalized_label in {"name", "contact name"}:
             return "name"
         if normalized_key == "email" or "email" in normalized_label:
             return "email"
-        if normalized_key in {"phone", "mobilephone"} or "phone" in normalized_label:
+        if normalized_key in {"phone", "mobilephone", "telephone"} or "phone" in normalized_label:
             return "phone"
+        if normalized_key in {"jobtitle", "job_title", "title"} or normalized_label in {"job title", "title"}:
+            return "jobtitle"
+        if normalized_key == "city" or normalized_label == "city" or "city" in normalized_label:
+            return "city"
+        if (
+            normalized_key in {"state", "region", "state_region"}
+            or normalized_label in {"state", "region", "state/region", "state / region", "state/province"}
+            or "state" in normalized_label
+        ):
+            return "state"
+        if normalized_key == "industry" or "industry" in normalized_label:
+            return "industry"
+        if (
+            normalized_key in {"lifecyclestage", "lifecycle_stage"}
+            or "lifecycle" in normalized_label
+        ):
+            return "lifecyclestage"
+        if (
+            normalized_key in {"hs_lead_status", "lead_status", "leadstatus"}
+            or "lead status" in normalized_label
+        ):
+            return "lead_status"
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return "owner"
+        if (
+            normalized_key in {"createdate", "create_date", "creation_date"}
+            or "create date" in normalized_label
+            or "creation date" in normalized_label
+        ):
+            return "createdate"
         if "company" in normalized_label or normalized_key in {
             "company",
             "company_name",
@@ -107,9 +139,11 @@ def _field_slot(record_type: str | None, key: str, label: str) -> str:
             "account",
         }:
             return "company"
-        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
-            return "owner"
-        if "status" in normalized_label or "lifecycle" in normalized_label or "lead status" in normalized_label:
+        if normalized_key in {"amount", "total_amount"} or "amount" in normalized_label:
+            return "amount"
+        if normalized_key in {"closedate", "close_date"} or "close date" in normalized_label:
+            return "close_date"
+        if "status" in normalized_label:
             return "status"
         return "other"
 
@@ -129,16 +163,77 @@ def _field_slot(record_type: str | None, key: str, label: str) -> str:
             return "industry"
         if normalized_key in {"city", "location"} or "city" in normalized_label or "location" in normalized_label:
             return "city"
+        if normalized_key in {"phone", "telephone"} or "phone" in normalized_label:
+            return "phone"
+        if (
+            normalized_key in {"lifecyclestage", "lifecycle_stage"}
+            or "lifecycle" in normalized_label
+        ):
+            return "lifecyclestage"
+        if (
+            normalized_key in {"hs_lead_status", "lead_status", "leadstatus"}
+            or "lead status" in normalized_label
+        ):
+            return "lead_status"
+        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+            return "owner"
         if (
             normalized_key in {"employees", "numemployees", "employee_count"}
             or "employee" in normalized_label
         ):
             return "employees"
-        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
-            return "owner"
+        if (
+            normalized_key in {"createdate", "create_date", "creation_date"}
+            or "create date" in normalized_label
+            or "creation date" in normalized_label
+        ):
+            return "createdate"
+        if normalized_key in {"amount", "total_amount"} or "amount" in normalized_label:
+            return "amount"
+        if normalized_key in {"closedate", "close_date"} or "close date" in normalized_label:
+            return "close_date"
+        return "other"
+
+    if record_type is None:
+        for rt in ("deal", "contact", "company"):
+            s = _field_slot(rt, key, label)
+            if s not in {"other", "name", "deal_title"}:
+                return s
         return "other"
 
     return "other"
+
+
+_CANONICAL_PAIRS: dict[str, list[tuple[str, str]]] = {
+    "contact": [
+        ("firstname", "email"),
+        ("lastname", "phone"),
+        ("jobtitle", "city"),
+        ("state", "industry"),
+        ("lifecyclestage", "lead_status"),
+        ("owner", "createdate"),
+        # Fallbacks:
+        ("name", "email"),
+        ("phone", "company"),
+        ("owner", "status"),
+    ],
+    "company": [
+        ("name", "domain"),
+        ("industry", "city"),
+        ("phone", "lifecyclestage"),
+        ("lead_status", "owner"),
+        # Fallbacks:
+        ("employees", "owner"),
+    ],
+    "deal": [
+        ("company", "stage"),
+        ("close_date", "owner"),
+        # Fallbacks:
+        ("amount", "stage"),
+        ("close_date", "amount"),
+        ("company", "amount"),
+    ],
+}
 
 
 def _pair_record_field_lines(
@@ -147,76 +242,79 @@ def _pair_record_field_lines(
     *,
     max_segment_width: int = 80,
     max_paired_width: int = 180,
-
     return_pairs: bool = False,
 ) -> list[str | tuple[str, str]]:
-    """Return Slack mrkdwn lines, pairing related fields when feasible.
+    """Return Slack mrkdwn lines, pairing related fields into a compact 2-column grid.
 
-    Each item is (key, label, rendered_line, pairable).
+    Each item in fields is (key, label, rendered_line, pairable).
     """
-
-    preferred_pairs: dict[str, dict[str, str]] = {
-        "deal": {"stage": "company", "company": "stage", "owner": "close_date", "close_date": "owner"},
-        "contact": {"name": "email", "phone": "company", "owner": "status"},
-        "company": {"name": "domain", "industry": "city", "employees": "owner"},
-    }
-
-    plan = preferred_pairs.get(record_type or "", {})
     slots = [
         (_field_slot(record_type, key, label), pairable)
         for key, label, _, pairable in fields
     ]
     used: set[int] = set()
-    rendered: list[str | tuple[str, str]] = []
+    top_standalone: list[str] = []
+    bottom_standalone: list[str] = []
+    pairs: list[tuple[str, str]] = []
 
-    for idx, (key, label, line, pairable) in enumerate(fields):
-        if idx in used:
-            continue
-        slot, is_pairable = slots[idx]
-        if not (pairable and is_pairable) or slot in {"link", "links"}:
-            rendered.append(line)
+    # Deal title always prominent on its own line at the top
+    for idx, (slot, pairable) in enumerate(slots):
+        if slot == "deal_title":
+            top_standalone.append(fields[idx][2])
             used.add(idx)
-            continue
 
-        partner_slot = plan.get(slot)
-        if not partner_slot:
-            rendered.append(line)
-            used.add(idx)
-            continue
+    # Links always at the bottom
+    for idx, (slot, pairable) in enumerate(slots):
+        if not pairable or slot in {"link", "links"}:
+            if idx not in used:
+                bottom_standalone.append(fields[idx][2])
+                used.add(idx)
 
-        partner_index = None
-        for j in range(idx + 1, len(fields)):
-            if j in used:
-                continue
-            other_slot, other_pairable = slots[j]
-            if other_pairable and other_slot == partner_slot:
-                partner_index = j
+    # Pass 1: Match canonical pairs in designated order
+    plan = _CANONICAL_PAIRS.get(record_type or "", [])
+    for left_slot, right_slot in plan:
+        left_idx = None
+        for i, (slot, pairable) in enumerate(slots):
+            if i not in used and pairable and slot == left_slot:
+                left_idx = i
                 break
-
-        if partner_index is None:
-            rendered.append(line)
-            used.add(idx)
+        if left_idx is None:
             continue
 
-        partner_line = fields[partner_index][2]
-        if (
-            _approx_visible_width(line) > max_segment_width
-            or _approx_visible_width(partner_line) > max_segment_width
-            or _approx_visible_width(line) + _approx_visible_width(partner_line) > max_paired_width
-        ):
-            rendered.append(line)
-            used.add(idx)
+        right_idx = None
+        for j, (slot, pairable) in enumerate(slots):
+            if j not in used and j != left_idx and pairable and slot == right_slot:
+                right_idx = j
+                break
+        if right_idx is None:
             continue
-        left_line = line
-        right_line = partner_line
-        if record_type == "deal":
-            if {slot, partner_slot} == {"company", "stage"} and slot == "stage":
-                left_line, right_line = partner_line, line
-            if {slot, partner_slot} == {"close_date", "owner"} and slot == "owner":
-                left_line, right_line = partner_line, line
-        rendered.append((left_line, right_line))
-        used.add(idx)
-        used.add(partner_index)
+
+        pairs.append((fields[left_idx][2], fields[right_idx][2]))
+        used.add(left_idx)
+        used.add(right_idx)
+
+    # Pass 2: Pair any remaining unused pairable fields
+    remaining = [
+        i for i in range(len(fields))
+        if i not in used and fields[i][3] and slots[i][0] not in {"deal_title", "link", "links"}
+    ]
+    while len(remaining) >= 2:
+        i = remaining.pop(0)
+        j = remaining.pop(0)
+        pairs.append((fields[i][2], fields[j][2]))
+        used.add(i)
+        used.add(j)
+
+    middle_standalone = [fields[i][2] for i in remaining]
+
+    rendered: list[str | tuple[str, str]] = []
+    rendered.extend(top_standalone)
+    rendered.extend(pairs)
+    rendered.extend(middle_standalone)
+    rendered.extend(bottom_standalone)
+
+    if return_pairs:
+        return list(rendered)
 
     left_widths = [
         _approx_visible_width(item[0])
@@ -224,9 +322,6 @@ def _pair_record_field_lines(
         if isinstance(item, tuple)
     ]
     target_left_width = min(max(left_widths, default=0), 44)
-
-    if return_pairs:
-        return list(rendered)
 
     combined: list[str | tuple[str, str]] = []
     for item in rendered:
@@ -503,6 +598,12 @@ def _decorate_field_label(
             return _prefix_field_emoji(label, "\U0001F465")  # 👥
         if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
             return _prefix_field_emoji(label, "\U0001F464")  # 👤
+        if (
+            normalized_key in {"company", "company_name", "companyname", "associatedcompany", "account"}
+            or "company" in normalized_label
+            or "account" in normalized_label
+        ):
+            return _prefix_field_emoji(label, "\U0001F3E2")  # 🏢
         return label
 
     if record_type == "deal":
@@ -519,6 +620,12 @@ def _decorate_field_label(
             return _prefix_field_emoji(label, dot)
         if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
             return _prefix_field_emoji(label, "\U0001F464")  # 👤
+        if (
+            normalized_key in {"company", "company_name", "companyname", "associatedcompany", "account"}
+            or "company" in normalized_label
+            or "account" in normalized_label
+        ):
+            return _prefix_field_emoji(label, "\U0001F3E2")  # 🏢
         return label
 
     return label
@@ -1564,7 +1671,7 @@ def _render_table_response(
     summary: str,
     table: dict[str, Any],
     *,
-    show_missing: bool = False,
+    show_missing: bool = True,
     include_heading: bool = True,
     include_summary: bool = True,
     structured_rows: bool = False,
