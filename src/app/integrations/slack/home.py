@@ -637,8 +637,9 @@ def _infer_record_type_for_columns(columns: list[dict[str, str]]) -> str | None:
     labels = {column.get("label", "").casefold() for column in columns}
 
     is_deal_row = bool(
-        keys.intersection({"dealname", "dealstage", "closedate"})
-        or any("deal" in label for label in labels)
+        keys.intersection({"dealname", "dealstage", "deal_stage", "closedate", "close_date", "closing_date", "deal_name", "probability"})
+        or ("stage" in keys and ("amount" in keys or "close_date" in keys or "probability" in keys or "owner" in keys))
+        or any("deal" in label and "associated" not in label for label in labels)
     )
     if is_deal_row:
         return "deal"
@@ -1495,12 +1496,28 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
             )
         )
 
+        is_deal_record = bool(
+            not grouped
+            and rec_type == "deal"
+            and table.get("rows")
+            and (
+                detail_type == "deal"
+                or result.get("query") in {
+                    "open_deals", "all_deals", "closed_deals", "closed_won_deals", "closed_lost_deals",
+                    "best_chance_deals", "company_deals", "contact_deals", "deal_list", "deal_search", "deal_details"
+                }
+                or (isinstance(result.get("title"), str) and "deal" in result["title"].casefold())
+                or (isinstance(result.get("message"), str) and "deal" in result["message"].casefold() and result.get("title") is not None)
+            )
+        )
+
         is_card_response = bool(
             kind in {"crm_card", "crm_record_card", "unstructured_crm_records"}
             or result.get("card") is True
             or result.get("unstructured") is True
             or (isinstance(table, dict) and (table.get("card") is True or table.get("unstructured") is True))
             or is_plan_record_query
+            or is_deal_record
         )
         if is_card_response:
             blocks = [_section(heading)]
@@ -1509,7 +1526,7 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
                 if (response.text and kind == "crm_intelligence")
                 else (response.text or "")
             )
-            if summary_text.strip():
+            if summary_text.strip() and not (detail_type and len(table["rows"]) == 1):
                 blocks.extend(_section(chunk) for chunk in _split_text(summary_text))
             for row in table["rows"]:
                 row_url = row.get("view_url") or result.get("hubspot_url")
@@ -1901,6 +1918,8 @@ def _resolve_company_display(val: object, row: dict[str, Any], col_map: dict[str
     has_account_label = any("account" in str(col_map.get(k, "")).casefold() for k in ("company", "account"))
     default_label = "Account" if has_account_label else "Company"
     comp_label = col_map.get("company") or col_map.get("account") or default_label
+    if comp_label and comp_label.casefold() in {"account/company", "account / company"}:
+        comp_label = "Company"
 
     for key in ("company_name", "companyname", "associated_company_name", "account_name"):
         cand = row.get(key)
@@ -2059,9 +2078,14 @@ def _render_crm_record_card(
         stage_val = row.get("dealstage") or row.get("stage") or row.get("deal_stage") or row.get("status")
         stage_str = _format_card_stage(stage_val)
         stage_raw_label = col_map.get("dealstage") or col_map.get("stage") or col_map.get("deal_stage") or "Stage"
-        dot = (_stage_dot(stage_val) if isinstance(stage_val, str) else None) or (_stage_dot(stage_raw_label) if isinstance(stage_raw_label, str) else None)
-        stage_prefix = dot if dot else "\U0001F3AF"  # 🎯
-        f_stage = f"*{stage_prefix} {stage_raw_label}:* {stage_str}"
+        if stage_raw_label and stage_raw_label.casefold() == "stage name":
+            stage_raw_label = "Stage"
+        dot = (
+            (_stage_dot(str(stage_val)) if stage_val is not None else None)
+            or (_stage_dot(stage_raw_label) if isinstance(stage_raw_label, str) else None)
+            or _DOT_YELLOW
+        )
+        f_stage = f"*{dot} {stage_raw_label}:* {stage_str}"
 
         # 3. Close Date
         date_val = row.get("closedate") or row.get("close_date") or row.get("closing_date")
@@ -2078,7 +2102,7 @@ def _render_crm_record_card(
         has_date_col = any(k in col_map for k in ("closedate", "close_date", "closing_date"))
         has_stage_col = any(k in col_map for k in ("dealstage", "stage", "deal_stage", "status"))
 
-        if not has_owner_col and not has_date_col and (has_stage_col or len(col_map) <= 2):
+        if not has_owner_col and not has_date_col and len(col_map) <= 2 and has_stage_col:
             card_fields = [f_comp, f_stage]
         else:
             card_fields = [f_comp, f_stage, f_date, f_owner]
@@ -2092,6 +2116,7 @@ def _render_crm_record_card(
             "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
             "view_url", "hubspot_url", "url",
             "amount", "total_amount", "sum_amount", "deal_amount",
+            "probability",
         }
         for col in columns:
             k = col.get("key", "")

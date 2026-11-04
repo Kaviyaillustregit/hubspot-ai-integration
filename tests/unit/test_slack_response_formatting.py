@@ -357,7 +357,6 @@ def test_deal_listing_keeps_distinct_record_links_and_removes_narrative_duplicat
 @pytest.mark.parametrize(
     ("title", "kind", "header"),
     [
-        ("Deal Details", "deal", "Deal details"),
         ("Contact Details", "contact", "Contact details"),
         ("Company Details", "company", "Company details"),
     ],
@@ -408,19 +407,7 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
         for block in blocks
     )
     assert detail_sections
-    if kind == "deal":
-        assert "*\U0001F4BC Name:* Cloud Migration Project" in encoded
-        assert _has_field_pair(
-            blocks,
-            "*\U0001F4C5 Close Date:* Dec 10, 2026",
-            "*\U0001F464 Owner ID:* 98711688",
-        )
-        assert "*\U0001F464 Owner ID:* 98711688" in encoded
-        assert "*\U0001F7E1 Stage:* Qualified To Buy" in encoded
-        assert "*\U0001F4B0 Amount:* *250,000*" in encoded
-        assert "*\U0001F4C5 Close Date:* Dec 10, 2026" in encoded
-        assert "\U0001F517 <https://app.hubspot.com/contacts/123/record/0-3/456|View in HubSpot>" in encoded
-    elif kind == "contact":
+    if kind == "contact":
         assert "*\U0001F464 Name:* Cloud Migration Project" in encoded
         assert "*\U0001F464 Owner ID:* 98711688" in encoded
         assert "*\U0001F4B0 Amount:* *250,000*" in encoded
@@ -439,6 +426,142 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
     assert channel.fallback_text == response.text
     assert channel_encoded.count(url) == 1
     assert any(block.get("type") == "header" for page in channel.messages for block in page)
+
+
+def test_single_deal_detail_renders_as_crm_record_card():
+    """Verify single deal detail responses route through _render_crm_record_card."""
+    url = "https://app.hubspot.com/contacts/123/record/0-3/456"
+    response = AgentResponse(
+        status="ok",
+        text=f"Cloud Migration Project is owned by 98711688. <{url}|Open in HubSpot>",
+        request_id="deal-details-check",
+        result={
+            "kind": "crm_records",
+            "title": "Deal Details",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Name"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "stage", "label": "Stage Name"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "close_date", "label": "Close Date"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "name": "Cloud Migration Project",
+                        "owner": "98711688",
+                        "stage": "Qualified To Buy",
+                        "amount": "250000",
+                        "close_date": "2026-12-10",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    divider_indices = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+    assert len(divider_indices) == 1
+
+    header_block = blocks[divider_indices[0] + 1]
+    header_text = header_block["text"]["text"]
+    assert "💼" in header_text
+    assert f"<{url}|Cloud Migration Project>" in header_text
+    assert "`Deal`" in header_text
+    assert "*💰 Amount:* $250,000" in header_text
+    assert header_block["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    assert header_block["accessory"]["url"] == url
+
+    fields_block = blocks[divider_indices[0] + 2]
+    fields = fields_block["fields"]
+    assert len(fields) == 4
+    assert fields[0]["text"] == "*🏢 Company:* Not available"
+    assert fields[1]["text"] == "*🟡 Stage:* Qualified To Buy"
+    assert fields[2]["text"] == "*📅 Close Date:* 2026-12-10"
+    assert fields[3]["text"] == "*👤 Owner ID:* 98711688"
+
+
+def test_operations_deal_list_renders_as_crm_record_cards():
+    """Verify deal list with kind='crm_records' and title='Open Deals' renders as Deal Cards."""
+    url1 = "https://app.hubspot.com/contacts/123/record/0-3/111"
+    url2 = "https://app.hubspot.com/contacts/123/record/0-3/222"
+    response = AgentResponse(
+        status="ok",
+        text="Found 2 open deals.",
+        request_id="open-deals-list",
+        result={
+            "kind": "crm_records",
+            "title": "Open Deals",
+            "message": "Found 2 open deals.",
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Name"},
+                    {"key": "company", "label": "Account/Company"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "stage", "label": "Stage Name"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "probability", "label": "Probability"},
+                    {"key": "close_date", "label": "Close Date"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "name": "Acme Renewal",
+                        "company": "Acme Corp",
+                        "owner": "Sarah Wilson",
+                        "stage": "Qualified To Buy",
+                        "amount": "$100,000",
+                        "probability": "80%",
+                        "close_date": "2026-11-20",
+                        "view_url": url1,
+                    },
+                    {
+                        "name": "Beta Expansion",
+                        "company": "",
+                        "owner": "",
+                        "stage": "Prospecting",
+                        "amount": "$50,000",
+                        "probability": "20%",
+                        "close_date": "2026-12-01",
+                        "view_url": url2,
+                    },
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    divider_indices = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+    assert len(divider_indices) == 2
+
+    # Card 1
+    h1 = blocks[divider_indices[0] + 1]
+    assert "💼" in h1["text"]["text"]
+    assert f"<{url1}|Acme Renewal>" in h1["text"]["text"]
+    assert "`Deal`" in h1["text"]["text"]
+    assert "*💰 Amount:* $100,000" in h1["text"]["text"]
+    assert h1["accessory"]["text"]["text"] == "View in HubSpot ↗"
+
+    f1 = blocks[divider_indices[0] + 2]["fields"]
+    assert len(f1) == 4
+    assert f1[0]["text"] == "*🏢 Company:* Acme Corp"
+    assert f1[1]["text"] == "*🟡 Stage:* Qualified To Buy"
+    assert f1[2]["text"] == "*📅 Close Date:* 2026-11-20"
+    assert f1[3]["text"] == "*👤 Owner:* Sarah Wilson"
+
+    # Card 2
+    h2 = blocks[divider_indices[1] + 1]
+    assert f"<{url2}|Beta Expansion>" in h2["text"]["text"]
+    assert "*💰 Amount:* $50,000" in h2["text"]["text"]
+
+    f2 = blocks[divider_indices[1] + 2]["fields"]
+    assert len(f2) == 4
+    assert f2[0]["text"] == "*🏢 Company:* Not available"
+    assert f2[1]["text"] == "*⚪ Stage:* Prospecting"
+    assert f2[2]["text"] == "*📅 Close Date:* 2026-12-01"
+    assert f2[3]["text"] == "*👤 Owner:* Unassigned"
 
 
 def test_contact_record_details_render_as_compact_two_column_pairs():
@@ -1146,9 +1269,9 @@ def test_slack_edge_emoji_image_links_do_not_leak_into_deal_stage_text_regressio
     assert "slack-edge.com" not in rendered
     assert "\U0001F7E1" in rendered
     assert "*\U0001F7E1 Deal stage:* Qualified To Buy" in rendered
-    assert "*💼 Deal name:* Acme expansion" in rendered
-    assert "*💰 Amount:* *850,000*" in rendered
-    assert "🔗 <https://app.hubspot.com/deals/123|View in HubSpot>" in rendered
+    assert "Acme expansion" in rendered
+    assert "*💰 Amount:* $850,000" in rendered
+    assert "View in HubSpot ↗" in rendered
 
 
 def test_grouped_deal_stage_summary_all_expected_colors_regression():
