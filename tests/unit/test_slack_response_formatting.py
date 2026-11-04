@@ -1911,3 +1911,252 @@ def test_explicit_card_flag_preempts_legacy_single_record_detail():
     assert "*🟡 Stage:* Qualified To Buy" in encoded
     # Legacy header is not present
     assert not any(b.get("type") == "header" and "Deal details" in b.get("text", {}).get("text", "") for b in blocks)
+
+
+def test_normal_crm_intelligence_query_activates_deal_cards_with_header_amount_and_four_fields():
+    """Verify normal CRM query without artificial card=True flag activates deal cards."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url1 = "https://app.hubspot.com/contacts/123/record/0-3/101"
+    url2 = "https://app.hubspot.com/contacts/123/record/0-3/102"
+    raw_table_text = (
+        "Found 2 deals. Showing 2 records.\n"
+        "| Deal name | Amount | Stage | Close Date | Owner |\n"
+        "| Renewal | 850000 | Qualified | 2026-11-20 | Sarah |\n"
+    )
+    response = AgentResponse(
+        status="ok",
+        text=raw_table_text,
+        request_id="top-deals-check",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "deal", "limit": 2},
+            "summary": {"matched_records": 2, "returned_records": 2},
+            "pagination": {"offset": 0, "limit": 2, "has_more": False},
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "AI Transformation Project",
+                        "amount": 850000,
+                        "company": "Acme Corp",
+                        "dealstage": "Qualified To Buy",
+                        "closedate": "2026-11-20",
+                        "owner": "Sarah Wilson",
+                        "view_url": url1,
+                    },
+                    {
+                        "dealname": "Cloud Upgrade",
+                        "amount": 125000,
+                        "company": None,
+                        "dealstage": "Contract Sent",
+                        "closedate": "2026-12-31",
+                        "owner": None,
+                        "view_url": url2,
+                    },
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    # Summary text is clean without raw markdown table
+    assert blocks[1]["text"]["text"] == "Found 2 deals. Showing 2 records."
+    assert "| Deal name |" not in encoded
+
+    # Dividers
+    dividers = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+    assert len(dividers) == 2
+
+    # Card 1
+    h1 = blocks[dividers[0] + 1]
+    assert "💼" in h1["text"]["text"]
+    assert f"<{url1}|AI Transformation Project>" in h1["text"]["text"]
+    assert "`Deal`" in h1["text"]["text"]
+    assert "*💰 Amount:* $850,000" in h1["text"]["text"]
+    assert h1["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    assert h1["accessory"]["url"] == url1
+
+    f1 = blocks[dividers[0] + 2]["fields"]
+    assert len(f1) == 4
+    assert f1[0]["text"] == "*🏢 Company:* Acme Corp"
+    assert f1[1]["text"] == "*🟡 Stage:* Qualified To Buy"
+    assert f1[2]["text"] == "*📅 Close Date:* 2026-11-20"
+    assert f1[3]["text"] == "*👤 Owner:* Sarah Wilson"
+
+    # Card 2
+    h2 = blocks[dividers[1] + 1]
+    assert f"<{url2}|Cloud Upgrade>" in h2["text"]["text"]
+    assert "*💰 Amount:* $125,000" in h2["text"]["text"]
+
+    f2 = blocks[dividers[1] + 2]["fields"]
+    assert len(f2) == 4
+    assert f2[0]["text"] == "*🏢 Company:* Not available"
+    assert f2[1]["text"] == "*🟡 Stage:* Contract Sent"
+    assert f2[2]["text"] == "*📅 Close Date:* 2026-12-31"
+    assert f2[3]["text"] == "*👤 Owner:* Unassigned"
+
+
+def test_normal_crm_intelligence_query_activates_contact_cards():
+    """Verify contact list queries like 'show top 3 contact' activate Contact Cards."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-1/301"
+    response = AgentResponse(
+        status="ok",
+        text="Found 71 contacts. Showing 1 records. Use offset 1 to view the next page.\n| Table |",
+        request_id="contacts-card-check",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "contact", "limit": 1},
+            "summary": {"matched_records": 71, "returned_records": 1},
+            "pagination": {"offset": 0, "limit": 1, "has_more": True},
+            "table": {
+                "columns": [
+                    {"key": "firstname", "label": "First name"},
+                    {"key": "lastname", "label": "Last name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "phone", "label": "Phone"},
+                    {"key": "createdate", "label": "Create date"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "firstname": "Maria",
+                        "lastname": "Johnson",
+                        "email": "maria@example.com",
+                        "phone": "+1 555 1234",
+                        "createdate": "Sep 17, 2026 at 15:14:04 +0000",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    dividers = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+    assert len(dividers) == 1
+
+    header = blocks[dividers[0] + 1]
+    assert "👤" in header["text"]["text"]
+    assert f"<{url}|Maria Johnson>" in header["text"]["text"]
+    assert "`Contact`" in header["text"]["text"]
+    assert header["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    assert header["accessory"]["url"] == url
+
+    fields = blocks[dividers[0] + 2]["fields"]
+    assert len(fields) >= 4
+    assert "*📅 Create date:* 2026-09-17" in json.dumps(fields, ensure_ascii=False)
+
+
+def test_normal_crm_intelligence_query_activates_company_cards():
+    """Verify company list queries activate Company Cards."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-2/501"
+    response = AgentResponse(
+        status="ok",
+        text="Found 22 companies. Showing 1 records.",
+        request_id="company-card-check",
+        result={
+            "kind": "crm_intelligence",
+            "plan": {"object": "company", "limit": 1},
+            "summary": {"matched_records": 22, "returned_records": 1},
+            "pagination": {"offset": 0, "limit": 1, "has_more": True},
+            "table": {
+                "columns": [
+                    {"key": "name", "label": "Company name"},
+                    {"key": "domain", "label": "Company domain"},
+                    {"key": "industry", "label": "Industry"},
+                    {"key": "city", "label": "City"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "name": "Global Holding",
+                        "domain": "globalholding.com",
+                        "industry": "Finance",
+                        "city": "New York",
+                        "owner": "Abhishek Kumar",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    dividers = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+    assert len(dividers) == 1
+
+    header = blocks[dividers[0] + 1]
+    assert "🏢" in header["text"]["text"]
+    assert f"<{url}|Global Holding>" in header["text"]["text"]
+    assert "`Company`" in header["text"]["text"]
+    assert header["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    assert header["accessory"]["url"] == url
+
+    fields = blocks[dividers[0] + 2]["fields"]
+    assert len(fields) == 4
+    assert fields[0]["text"] == "*🌐 Company domain:* globalholding.com"
+    assert fields[1]["text"] == "*🏭 Industry:* Finance"
+    assert fields[2]["text"] == "*📍 City:* New York"
+    assert fields[3]["text"] == "*👤 Owner:* Abhishek Kumar"
+
+
+def test_zero_deal_amount_is_formatted_as_dollar_zero():
+    """Verify deal with 0 amount renders as $0 instead of being treated as missing."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-3/701"
+    response = AgentResponse(
+        status="ok",
+        text="Deal with zero amount",
+        request_id="zero-deal-amount",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Pro Bono Project",
+                        "amount": 0,
+                        "company": "Nonprofit Org",
+                        "dealstage": "Closed Won",
+                        "closedate": "2026-11-01",
+                        "owner": "Sarah",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    header = [b for b in blocks if b.get("type") == "section" and "Pro Bono Project" in b.get("text", {}).get("text", "")][0]
+    assert "*💰 Amount:* $0" in header["text"]["text"]

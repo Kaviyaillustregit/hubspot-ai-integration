@@ -1478,17 +1478,39 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
 
 
     if table is not None:
+        rec_type = _record_detail_type(result) or (
+            result.get("plan", {}).get("object")
+            if isinstance(result.get("plan"), dict)
+            else None
+        ) or _infer_record_type_for_columns(table.get("columns", []))
+
+        is_plan_record_query = bool(
+            not grouped
+            and kind == "crm_intelligence"
+            and rec_type in {"deal", "contact", "company"}
+            and (
+                (isinstance(result.get("plan"), dict) and result["plan"].get("object") in {"deal", "contact", "company"})
+                or (isinstance(result.get("summary"), dict) and result["summary"].get("matched_records") is not None)
+                or (result.get("pagination") is not None)
+            )
+        )
+
         is_card_response = bool(
             kind in {"crm_card", "crm_record_card", "unstructured_crm_records"}
             or result.get("card") is True
             or result.get("unstructured") is True
             or (isinstance(table, dict) and (table.get("card") is True or table.get("unstructured") is True))
+            or is_plan_record_query
         )
         if is_card_response:
             blocks = [_section(heading)]
-            if response.text and response.text.strip():
-                blocks.extend(_section(chunk) for chunk in _split_text(response.text))
-            rec_type = _infer_record_type_for_columns(table["columns"])
+            summary_text = (
+                response.text.splitlines()[0]
+                if (response.text and kind == "crm_intelligence")
+                else (response.text or "")
+            )
+            if summary_text.strip():
+                blocks.extend(_section(chunk) for chunk in _split_text(summary_text))
             for row in table["rows"]:
                 row_url = row.get("view_url") or result.get("hubspot_url")
                 card_blocks = _render_crm_record_card(
@@ -1989,8 +2011,19 @@ def _render_crm_record_card(
     badge = badge_map.get(record_type, "Record")
     escaped_title = html.escape(title, quote=False)
 
+    amt_val = None
+    for k in ("amount", "deal_amount", "total_amount"):
+        if k in row and row[k] is not None and row[k] != "" and row[k] not in ("—", _MOJIBAKE_EM_DASH):
+            amt_val = row[k]
+            break
+    amt_line = ""
+    if record_type == "deal" and amt_val is not None:
+        amt_formatted = _format_card_amount(amt_val)
+        if amt_formatted != "Not available":
+            amt_line = f"\n*💰 Amount:* {amt_formatted}"
+
     if valid_url:
-        header_text = f"{emoji} *<{valid_url}|{escaped_title}>* `{badge}`"
+        header_text = f"{emoji} *<{valid_url}|{escaped_title}>* `{badge}`{amt_line}"
         header_block: Block = {
             "type": "section",
             "text": {"type": "mrkdwn", "text": header_text},
@@ -2006,7 +2039,7 @@ def _render_crm_record_card(
             },
         }
     else:
-        header_text = f"{emoji} *{escaped_title}* `{badge}`"
+        header_text = f"{emoji} *{escaped_title}* `{badge}`{amt_line}"
         header_block = {
             "type": "section",
             "text": {"type": "mrkdwn", "text": header_text},
@@ -2050,7 +2083,7 @@ def _render_crm_record_card(
         else:
             card_fields = [f_comp, f_stage, f_date, f_owner]
 
-        # Extra requested columns (preserving dynamic columns such as amount, probability, etc.)
+        # Extra requested columns (preserving dynamic columns such as probability, custom fields, etc.)
         handled_keys = {
             "dealname", "deal_name", "name", "title",
             "company", "account", "company_name", "companyname", "associatedcompany",
@@ -2058,6 +2091,7 @@ def _render_crm_record_card(
             "closedate", "close_date", "closing_date",
             "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
             "view_url", "hubspot_url", "url",
+            "amount", "total_amount", "sum_amount", "deal_amount",
         }
         for col in columns:
             k = col.get("key", "")
@@ -2246,7 +2280,7 @@ def _render_table_row(
 
         if key == "view_url":
             value = _slack_hubspot_link(raw_value)
-            if value == "â€”":
+            if value in ("—", _MOJIBAKE_EM_DASH):
                 if show_missing:
                     line = "*\U0001F517 HubSpot record:* Not available"
                     lines.append(line)
@@ -2264,7 +2298,7 @@ def _render_table_row(
                 if not isinstance(association, dict):
                     continue
                 link = _slack_hubspot_link(association.get("url"))
-                if link == "â€”":
+                if link in ("—", _MOJIBAKE_EM_DASH):
                     continue
                 name = html.escape(str(association.get("name") or "Record"), quote=False)
                 links.append(link.replace("View in HubSpot", name))
@@ -2288,7 +2322,7 @@ def _render_table_row(
                 if key in {"owner", "hubspot_owner_id"} and raw_value in (None, "")
                 else "Not available"
                 if show_missing and (
-                    raw_value is None or raw_value == "" or raw_value == "â€”" or raw_value == _MOJIBAKE_EM_DASH
+                    raw_value is None or raw_value == "" or raw_value in ("—", _MOJIBAKE_EM_DASH)
                 )
                 else format_property_value(key, raw_value)
             )
@@ -2359,7 +2393,7 @@ def _render_record_card(
         raw_label = column.get("label", key.replace("_", " ").title())
         if key == "view_url":
             link = _slack_hubspot_link(raw_value)
-            if link == "â€”":
+            if link in ("—", _MOJIBAKE_EM_DASH):
                 continue
             line = f"\U0001F517 {link}"
             field_entries.append((key, str(raw_label), line, False))
@@ -2381,7 +2415,7 @@ def _render_record_card(
 
             if key in {"owner", "hubspot_owner_id"} and raw_value in (None, ""):
                 displayed = "Unassigned"
-            elif raw_value is None or raw_value == "" or raw_value == "â€”" or raw_value == _MOJIBAKE_EM_DASH:
+            elif raw_value is None or raw_value == "" or raw_value in ("—", _MOJIBAKE_EM_DASH):
                 displayed = "Not available"
             else:
                 displayed = format_property_value(key, raw_value)
