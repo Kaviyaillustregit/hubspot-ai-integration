@@ -1470,3 +1470,444 @@ def test_deal_compact_two_column_layout_with_prominent_title():
 
     # 4. View in HubSpot link clickable
     assert f"<{url}|View in HubSpot>" in encoded
+
+
+def test_deal_card_structure_header_accessory_button_and_paired_fields():
+    """Verify card structure: emoji, hyperlinked title, badge, accessory button, 4 fields."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-3/999"
+    response = AgentResponse(
+        status="ok",
+        text="Deal listing",
+        request_id="deal-card-check",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Enterprise Renewal",
+                        "company": "Acme Corp",
+                        "dealstage": "Qualified To Buy",
+                        "closedate": "2026-11-15T10:00:00Z",
+                        "owner": "Sarah Wilson",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    # 1. Divider above card
+    divider_indices = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+    assert len(divider_indices) >= 1
+
+    # 2. Header with emoji, hyperlinked title, badge, and accessory button
+    header_block = blocks[divider_indices[0] + 1]
+    assert header_block["type"] == "section"
+    assert "💼" in header_block["text"]["text"]
+    assert f"<{url}|Enterprise Renewal>" in header_block["text"]["text"]
+    assert "`Deal`" in header_block["text"]["text"]
+    assert header_block["accessory"]["type"] == "button"
+    assert header_block["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    assert header_block["accessory"]["url"] == url
+
+    # 3. Fields in section block (strictly 4)
+    fields_block = blocks[divider_indices[0] + 2]
+    assert fields_block["type"] == "section"
+    fields = fields_block["fields"]
+    assert len(fields) == 4
+    # Company | Stage
+    assert fields[0]["text"] == "*🏢 Company:* Acme Corp"
+    assert fields[1]["text"] == "*🟡 Stage:* Qualified To Buy"
+    # Close Date | Owner
+    assert fields[2]["text"] == "*📅 Close Date:* 2026-11-15"
+    assert fields[3]["text"] == "*👤 Owner:* Sarah Wilson"
+
+
+def test_card_resolves_owner_and_company_never_raw_ids():
+    """Verify owner and company names resolve when available, and unresolved IDs are labeled cleanly without misleading values."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    response_resolved = AgentResponse(
+        status="ok",
+        text="Deal with resolved names",
+        request_id="resolved-check",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Named Deal",
+                        "company": "00100",
+                        "company_name": "Acme Corp",
+                        "dealstage": "prospecting",
+                        "closedate": "2026-12-31",
+                        "owner": "169090866",
+                        "owner_name": "Abhishek Kumar",
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks_resolved = render_response_blocks(response_resolved)
+    encoded_resolved = json.dumps(blocks_resolved, ensure_ascii=False)
+    assert "*🏢 Company:* Acme Corp" in encoded_resolved
+    assert "*👤 Owner:* Abhishek Kumar" in encoded_resolved
+
+    response_unresolved = AgentResponse(
+        status="ok",
+        text="Deal with raw IDs",
+        request_id="raw-ids-check",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Raw ID Deal",
+                        "company": "00100",  # raw numeric ID
+                        "dealstage": "prospecting",
+                        "closedate": "2026-12-31",
+                        "owner": "169090866",  # raw numeric ID
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks_unresolved = render_response_blocks(response_unresolved)
+    encoded_unresolved = json.dumps(blocks_unresolved, ensure_ascii=False)
+
+    assert "*🏢 Company ID:* 00100" in encoded_unresolved
+    assert "*👤 Owner ID:* 169090866" in encoded_unresolved
+    assert "*🏢 Company:* Not available" not in encoded_unresolved
+    assert "*👤 Owner:* Unassigned" not in encoded_unresolved
+
+    response_missing = AgentResponse(
+        status="ok",
+        text="Deal with missing fields",
+        request_id="missing-check",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Missing Deal",
+                        "company": None,
+                        "dealstage": "prospecting",
+                        "closedate": "2026-12-31",
+                        "owner": None,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks_missing = render_response_blocks(response_missing)
+    encoded_missing = json.dumps(blocks_missing, ensure_ascii=False)
+    assert "*🏢 Company:* Not available" in encoded_missing
+    assert "*👤 Owner:* Unassigned" in encoded_missing
+
+
+def test_card_monetary_amount_formatted_with_dollar_sign():
+    """Verify monetary amounts are formatted with $ and commas."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    response = AgentResponse(
+        status="ok",
+        text="Deal with amount",
+        request_id="amount-dollar-check",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "High Value Deal",
+                        "amount": 850000,
+                        "dealstage": "Qualified To Buy",
+                        "closedate": "2026-12-31",
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    assert "$850,000" in encoded
+    assert "*💰 Amount:* $850,000" in encoded
+
+
+def test_card_date_formatted_as_yyyy_mm_dd():
+    """Verify dates are formatted as YYYY-MM-DD from various formats."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    response = AgentResponse(
+        status="ok",
+        text="Contact date test",
+        request_id="date-format-check",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "firstname", "label": "First name"},
+                    {"key": "lastname", "label": "Last name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "createdate", "label": "Create date"},
+                ],
+                "rows": [
+                    {
+                        "firstname": "Victor",
+                        "lastname": "Hall",
+                        "email": "victor@example.com",
+                        "createdate": "Oct 7, 2026 at 05:44:11 +0000",
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    assert "2026-10-07" in encoded
+    assert "*📅 Create date:* 2026-10-07" in encoded
+    assert "Oct 7, 2026 at 05:44:11" not in encoded
+
+
+def test_card_divider_present_above_each_card():
+    """Verify dividers appear correctly above each card in a multi-record table."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url1 = "https://app.hubspot.com/contacts/123/record/0-1/1"
+    url2 = "https://app.hubspot.com/contacts/123/record/0-1/2"
+    response = AgentResponse(
+        status="ok",
+        text="2 contacts found.",
+        request_id="multi-card-dividers",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "firstname", "label": "First name"},
+                    {"key": "lastname", "label": "Last name"},
+                    {"key": "email", "label": "Email"},
+                    {"key": "phone", "label": "Phone"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "firstname": "Contact",
+                        "lastname": "One",
+                        "email": "one@example.com",
+                        "phone": "111",
+                        "view_url": url1,
+                    },
+                    {
+                        "firstname": "Contact",
+                        "lastname": "Two",
+                        "email": "two@example.com",
+                        "phone": "222",
+                        "view_url": url2,
+                    },
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    dividers = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
+
+    # Exactly 2 cards -> 2 dividers, one before each card
+    assert len(dividers) == 2
+    # Immediately after each divider is the card header section
+    assert blocks[dividers[0] + 1]["type"] == "section"
+    assert "Contact One" in blocks[dividers[0] + 1]["text"]["text"]
+    assert blocks[dividers[1] + 1]["type"] == "section"
+    assert "Contact Two" in blocks[dividers[1] + 1]["text"]["text"]
+
+
+def test_deal_always_shows_company_field_never_substitutes_amount():
+    """Verify company field is always shown (using Not available when missing) and never substituted by Amount."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    response = AgentResponse(
+        status="ok",
+        text="Deal without company",
+        request_id="deal-no-comp",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Standalone Deal",
+                        "amount": 850000,
+                        "dealstage": "Qualified To Buy",
+                        "closedate": "2026-12-31",
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    # Field 1 is Company (Not available), NEVER substituted by Amount
+    assert "*🏢 Company:* Not available" in encoded
+    # Amount is preserved as its own requested column
+    assert "*💰 Amount:* $850,000" in encoded
+
+
+def test_preserves_user_requested_columns_and_dynamic_pairs():
+    """Verify arbitrary user-requested columns (probability, custom fields) are preserved in card sections."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    response = AgentResponse(
+        status="ok",
+        text="Deal with extra columns",
+        request_id="deal-extra-cols",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "amount", "label": "Amount"},
+                    {"key": "hs_deal_stage_probability", "label": "Probability"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Expansion Deal",
+                        "company": "Acme Corp",
+                        "dealstage": "Negotiation",
+                        "closedate": "2026-11-30",
+                        "owner": "Alice Smith",
+                        "amount": 125000,
+                        "hs_deal_stage_probability": "0.8",
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "*🏢 Company:* Acme Corp" in encoded
+    assert "*👤 Owner:* Alice Smith" in encoded
+    assert "*💰 Amount:* $125,000" in encoded
+    assert "Probability" in encoded and "0.8" in encoded
+
+
+def test_explicit_card_flag_preempts_legacy_single_record_detail():
+    """Verify single-record detail query with explicit card flag uses _render_crm_record_card."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+
+    url = "https://app.hubspot.com/contacts/123/record/0-3/456"
+    response = AgentResponse(
+        status="ok",
+        text="Single deal details",
+        request_id="single-card-preempt",
+        result={
+            "kind": "crm_card",
+            "card": True,
+            "title": "Deal details",
+            "table": {
+                "columns": [
+                    {"key": "dealname", "label": "Deal name"},
+                    {"key": "company", "label": "Company"},
+                    {"key": "dealstage", "label": "Stage"},
+                    {"key": "closedate", "label": "Close Date"},
+                    {"key": "owner", "label": "Owner"},
+                    {"key": "view_url", "label": "View in HubSpot"},
+                ],
+                "rows": [
+                    {
+                        "dealname": "Single Record Deal",
+                        "company": "Acme Corp",
+                        "dealstage": "Qualified To Buy",
+                        "closedate": "2026-12-31",
+                        "owner": "Sarah Wilson",
+                        "view_url": url,
+                    }
+                ],
+            },
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+
+    # Uses the new CRM card renderer with accessory button and divider
+    assert "View in HubSpot ↗" in encoded
+    assert f"<{url}|Single Record Deal>" in encoded
+    assert "`Deal`" in encoded
+    assert "*🏢 Company:* Acme Corp" in encoded
+    assert "*🟡 Stage:* Qualified To Buy" in encoded
+    # Legacy header is not present
+    assert not any(b.get("type") == "header" and "Deal details" in b.get("text", {}).get("text", "") for b in blocks)

@@ -2,6 +2,7 @@ import html
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -1477,6 +1478,29 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
 
 
     if table is not None:
+        is_card_response = bool(
+            kind in {"crm_card", "crm_record_card", "unstructured_crm_records"}
+            or result.get("card") is True
+            or result.get("unstructured") is True
+            or (isinstance(table, dict) and (table.get("card") is True or table.get("unstructured") is True))
+        )
+        if is_card_response:
+            blocks = [_section(heading)]
+            if response.text and response.text.strip():
+                blocks.extend(_section(chunk) for chunk in _split_text(response.text))
+            rec_type = _infer_record_type_for_columns(table["columns"])
+            for row in table["rows"]:
+                row_url = row.get("view_url") or result.get("hubspot_url")
+                card_blocks = _render_crm_record_card(
+                    rec_type,
+                    table["columns"],
+                    row,
+                    record_url=row_url,
+                    show_missing=True,
+                )
+                blocks.extend(card_blocks)
+            return blocks
+
         if detail_type and len(table["rows"]) == 1:
             return _render_record_card(
                 detail_type,
@@ -1719,6 +1743,9 @@ def _render_table_response(
 
     rendered_rows = 0
     limit_reached = False
+    record_type = _infer_record_type_for_columns(columns)
+    is_crm_card = not structured_rows and record_type in {"deal", "contact", "company"}
+
     for row in rows:
         row_blocks = _render_table_row(
             columns, row, show_missing=show_missing, structured=structured_rows
@@ -1744,6 +1771,449 @@ def _render_table_response(
                 "the Slack Home display limit was reached."
             )
         )
+    return blocks
+
+
+def _format_card_date(val: object) -> str:
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available"
+    if isinstance(val, (int, float)):
+        try:
+            ts = float(val)
+            if ts > 1e11:
+                ts /= 1000.0
+            dt = datetime.fromtimestamp(ts, tz=UTC)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return str(val)
+    s = str(val).strip()
+    if not s or s.casefold() in {"not available", "none", "null", "—"}:
+        return "Not available"
+    iso_match = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
+    if iso_match:
+        return iso_match.group(1)
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%b %d, %Y at %H:%M:%S %z",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    m = re.search(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", s)
+    if m:
+        month_str, day_str, year_str = m.groups()
+        for mfmt in ("%b", "%B"):
+            try:
+                mdt = datetime.strptime(f"{month_str} {day_str} {year_str}", f"{mfmt} %d %Y")
+                return mdt.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    return s
+
+
+def _format_card_amount(val: object) -> str:
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available"
+    if isinstance(val, (int, float, Decimal)):
+        try:
+            d = Decimal(str(val))
+            if d == d.to_integral():
+                return f"${int(d):,}"
+            return f"${d:,.2f}"
+        except Exception:
+            return f"${val}"
+    s = str(val).strip()
+    if not s or s.casefold() in {"not available", "none", "null", "—"}:
+        return "Not available"
+    if s.startswith("$"):
+        return s
+    cleaned = re.sub(r"^[A-Z]{3}\s*", "", s, flags=re.IGNORECASE).replace(",", "").strip()
+    try:
+        d = Decimal(cleaned)
+        if d == d.to_integral():
+            return f"${int(d):,}"
+        return f"${d:,.2f}"
+    except (InvalidOperation, ValueError):
+        return f"${s}"
+
+
+def _resolve_owner_display(val: object, row: dict[str, Any], col_map: dict[str, str]) -> tuple[str, str]:
+    for key in ("owner_name", "hubspot_owner_name"):
+        cand = row.get(key)
+        if isinstance(cand, str) and cand.strip() and not cand.strip().isdigit():
+            owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
+            return cand.strip(), f"*👤 {owner_label}:*"
+
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
+        return "Unassigned", f"*👤 {owner_label}:*"
+
+    s = str(val).strip()
+    if not s or s.casefold() in {"unassigned", "none", "null", "—"}:
+        owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
+        return "Unassigned", f"*👤 {owner_label}:*"
+
+    if s.isdigit():
+        return s, "*👤 Owner ID:*"
+
+    owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
+    return s, f"*👤 {owner_label}:*"
+
+
+def _resolve_company_display(val: object, row: dict[str, Any], col_map: dict[str, str]) -> tuple[str, str]:
+    has_account_label = any("account" in str(col_map.get(k, "")).casefold() for k in ("company", "account"))
+    default_label = "Account" if has_account_label else "Company"
+    comp_label = col_map.get("company") or col_map.get("account") or default_label
+
+    for key in ("company_name", "companyname", "associated_company_name", "account_name"):
+        cand = row.get(key)
+        if isinstance(cand, str) and cand.strip() and not cand.strip().isdigit():
+            return cand.strip(), f"*🏢 {comp_label}:*"
+
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available", f"*🏢 {comp_label}:*"
+
+    s = str(val).strip()
+    if not s or s.casefold() in {"not available", "none", "null", "—"}:
+        return "Not available", f"*🏢 {comp_label}:*"
+
+    if s.isdigit():
+        return s, f"*🏢 {comp_label} ID:*"
+
+    return s, f"*🏢 {comp_label}:*"
+
+
+def _format_card_owner(val: object, row: dict[str, Any]) -> str:
+    res, _ = _resolve_owner_display(val, row, {})
+    return res
+
+
+def _format_card_company(val: object, row: dict[str, Any]) -> str:
+    res, _ = _resolve_company_display(val, row, {})
+    return res
+
+
+def _format_card_stage(val: object) -> str:
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available"
+    s = str(val).strip()
+    cleaned = _clean_deal_stage_value(s)
+    if not cleaned or cleaned.casefold() in {"not available", "none", "null"}:
+        return "Not available"
+    return cleaned
+
+
+def _extract_card_title(record_type: str, row: dict[str, Any]) -> str:
+    if record_type == "deal":
+        for k in ("dealname", "name", "deal_name", "title"):
+            v = row.get(k)
+            if v and str(v).strip() and not str(v).strip().casefold().startswith("http"):
+                return str(v).strip()
+        return "Deal"
+
+    if record_type == "contact":
+        first = row.get("firstname")
+        last = row.get("lastname")
+        first_clean = str(first).strip() if first and str(first).strip() and str(first).strip() != "None" else ""
+        last_clean = str(last).strip() if last and str(last).strip() and str(last).strip() != "None" else ""
+        if first_clean and last_clean:
+            return f"{first_clean} {last_clean}"
+        if first_clean:
+            return first_clean
+        if last_clean:
+            return last_clean
+        for k in ("name", "contact_name", "contactname", "email"):
+            v = row.get(k)
+            if v and str(v).strip():
+                return str(v).strip()
+        return "Contact"
+
+    if record_type == "company":
+        for k in ("name", "company_name", "companyname", "domain"):
+            v = row.get(k)
+            if v and str(v).strip() and not str(v).strip().casefold().startswith("http"):
+                return str(v).strip()
+        return "Company"
+
+    for k in ("name", "title", "label"):
+        v = row.get(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return "Record"
+
+
+def _render_crm_record_card(
+    record_type: str,
+    columns: list[dict[str, str]],
+    row: dict[str, Any],
+    *,
+    record_url: str | None = None,
+    show_missing: bool = True,
+) -> list[Block]:
+    title = _extract_card_title(record_type, row)
+
+    url_candidate = record_url or row.get("view_url") or row.get("hubspot_url") or row.get("url")
+    valid_url = None
+    if isinstance(url_candidate, str) and url_candidate.strip():
+        u = url_candidate.strip()
+        parsed = urlsplit(u)
+        if parsed.scheme == "https" and not any(c in u for c in "<>|\" "):
+            valid_url = u
+
+    emoji_map = {
+        "deal": "\U0001F4BC",     # 💼
+        "contact": "\U0001F464",  # 👤
+        "company": "\U0001F3E2",  # 🏢
+    }
+    badge_map = {
+        "deal": "Deal",
+        "contact": "Contact",
+        "company": "Company",
+    }
+    emoji = emoji_map.get(record_type, "\U0001F4C4")
+    badge = badge_map.get(record_type, "Record")
+    escaped_title = html.escape(title, quote=False)
+
+    if valid_url:
+        header_text = f"{emoji} *<{valid_url}|{escaped_title}>* `{badge}`"
+        header_block: Block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+            "accessory": {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "View in HubSpot ↗",
+                    "emoji": True,
+                },
+                "url": valid_url,
+                "action_id": "view_in_hubspot",
+            },
+        }
+    else:
+        header_text = f"{emoji} *{escaped_title}* `{badge}`"
+        header_block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+        }
+
+    col_map = {col.get("key", ""): col.get("label", "") for col in columns}
+
+    card_fields: list[str] = []
+
+    if record_type == "deal":
+        # 1. Company is ALWAYS field 1 for deals (never substituted by Amount)
+        comp_val = row.get("company") or row.get("account") or row.get("company_name") or row.get("companyname") or row.get("associatedcompany")
+        comp_str, comp_lbl = _resolve_company_display(comp_val, row, col_map)
+        f_comp = f"{comp_lbl} {comp_str}"
+
+        # 2. Stage
+        stage_val = row.get("dealstage") or row.get("stage") or row.get("deal_stage") or row.get("status")
+        stage_str = _format_card_stage(stage_val)
+        stage_raw_label = col_map.get("dealstage") or col_map.get("stage") or col_map.get("deal_stage") or "Stage"
+        dot = (_stage_dot(stage_val) if isinstance(stage_val, str) else None) or (_stage_dot(stage_raw_label) if isinstance(stage_raw_label, str) else None)
+        stage_prefix = dot if dot else "\U0001F3AF"  # 🎯
+        f_stage = f"*{stage_prefix} {stage_raw_label}:* {stage_str}"
+
+        # 3. Close Date
+        date_val = row.get("closedate") or row.get("close_date") or row.get("closing_date")
+        date_str = _format_card_date(date_val)
+        date_raw_label = col_map.get("closedate") or col_map.get("close_date") or "Close Date"
+        f_date = f"*📅 {date_raw_label}:* {date_str}"
+
+        # 4. Owner
+        owner_val = row.get("owner") or row.get("hubspot_owner_id")
+        owner_str, owner_lbl = _resolve_owner_display(owner_val, row, col_map)
+        f_owner = f"{owner_lbl} {owner_str}"
+
+        has_owner_col = any(k in col_map for k in ("owner", "hubspot_owner_id"))
+        has_date_col = any(k in col_map for k in ("closedate", "close_date", "closing_date"))
+        has_stage_col = any(k in col_map for k in ("dealstage", "stage", "deal_stage", "status"))
+
+        if not has_owner_col and not has_date_col and (has_stage_col or len(col_map) <= 2):
+            card_fields = [f_comp, f_stage]
+        else:
+            card_fields = [f_comp, f_stage, f_date, f_owner]
+
+        # Extra requested columns (preserving dynamic columns such as amount, probability, etc.)
+        handled_keys = {
+            "dealname", "deal_name", "name", "title",
+            "company", "account", "company_name", "companyname", "associatedcompany",
+            "dealstage", "stage", "deal_stage", "status", "dealstatus",
+            "closedate", "close_date", "closing_date",
+            "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
+            "view_url", "hubspot_url", "url",
+        }
+        for col in columns:
+            k = col.get("key", "")
+            if k in handled_keys:
+                continue
+            lbl = col.get("label", k)
+            raw_v = row.get(k)
+            if k in {"amount", "total_amount", "sum_amount"} or "amount" in lbl.casefold():
+                amt_str_raw = str(raw_v).strip() if raw_v is not None else ""
+                amt_formatted = amt_str_raw if (amt_str_raw.startswith("*") and amt_str_raw.endswith("*")) else _format_card_amount(raw_v)
+                card_fields.append(f"*\U0001F4B0 {lbl}:* {amt_formatted}")
+            elif "date" in k.casefold() or "date" in lbl.casefold():
+                card_fields.append(f"*📅 {lbl}:* {_format_card_date(raw_v)}")
+            else:
+                val_disp = html.escape(str(raw_v), quote=False) if raw_v not in (None, "", "—") else "Not available"
+                card_fields.append(f"*{_decorate_field_label('deal', k, lbl)}:* {val_disp}")
+
+    elif record_type == "contact":
+        has_first = "firstname" in col_map or "first_name" in col_map
+        has_last = "lastname" in col_map or "last_name" in col_map
+        if has_first and has_last:
+            f1_val = html.escape(str(row.get("firstname") or "Not available"), quote=False)
+            f1_label = col_map.get("firstname") or col_map.get("first_name") or "First name"
+            f1 = f"*👤 {f1_label}:* {f1_val}"
+
+            f2_val = html.escape(str(row.get("email") or "Not available"), quote=False)
+            f2_label = col_map.get("email") or "Email"
+            f2 = f"*📧 {f2_label}:* {f2_val}"
+
+            f3_val = html.escape(str(row.get("lastname") or "Not available"), quote=False)
+            f3_label = col_map.get("lastname") or col_map.get("last_name") or "Last name"
+            f3 = f"*👤 {f3_label}:* {f3_val}"
+
+            if "createdate" in col_map or "create_date" in col_map or row.get("createdate"):
+                cdate_str = _format_card_date(row.get("createdate") or row.get("create_date"))
+                cdate_label = col_map.get("createdate") or col_map.get("create_date") or "Create date"
+                f4 = f"*📅 {cdate_label}:* {cdate_str}"
+            elif "phone" in col_map or row.get("phone"):
+                phone_val = html.escape(str(row.get("phone") or "Not available"), quote=False)
+                phone_label = col_map.get("phone") or "Phone"
+                f4 = f"*📞 {phone_label}:* {phone_val}"
+            elif "owner" in col_map or "hubspot_owner_id" in col_map:
+                owner_str, owner_lbl = _resolve_owner_display(row.get("owner") or row.get("hubspot_owner_id"), row, col_map)
+                f4 = f"{owner_lbl} {owner_str}"
+            else:
+                f4 = "*📞 Phone:* Not available"
+            card_fields = [f1, f2, f3, f4]
+
+            handled_keys = {
+                "firstname", "first_name", "lastname", "last_name", "email",
+                "createdate", "create_date", "phone", "mobilephone", "telephone",
+                "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
+                "name", "contactname", "contact_name", "view_url", "hubspot_url", "url",
+            }
+        else:
+            f1_val = html.escape(str(row.get("email") or "Not available"), quote=False)
+            f1_label = col_map.get("email") or "Email"
+            f1 = f"*📧 {f1_label}:* {f1_val}"
+
+            f2_val = html.escape(str(row.get("phone") or "Not available"), quote=False)
+            f2_label = col_map.get("phone") or "Phone"
+            f2 = f"*📞 {f2_label}:* {f2_val}"
+
+            comp_str, comp_lbl = _resolve_company_display(row.get("company"), row, col_map)
+            f3 = f"{comp_lbl} {comp_str}"
+
+            if "createdate" in col_map or "create_date" in col_map or row.get("createdate"):
+                cdate_str = _format_card_date(row.get("createdate") or row.get("create_date"))
+                cdate_label = col_map.get("createdate") or col_map.get("create_date") or "Create date"
+                f4 = f"*📅 {cdate_label}:* {cdate_str}"
+            else:
+                owner_str, owner_lbl = _resolve_owner_display(row.get("owner") or row.get("hubspot_owner_id"), row, col_map)
+                f4 = f"{owner_lbl} {owner_str}"
+            card_fields = [f1, f2, f3, f4]
+
+            handled_keys = {
+                "email", "phone", "mobilephone", "telephone", "company", "account",
+                "company_name", "companyname", "associatedcompany",
+                "createdate", "create_date", "owner", "hubspot_owner_id",
+                "owner_name", "hubspot_owner_name", "name", "contactname", "contact_name",
+                "view_url", "hubspot_url", "url",
+            }
+
+        # Extra requested columns:
+        for col in columns:
+            k = col.get("key", "")
+            if k in handled_keys:
+                continue
+            lbl = col.get("label", k)
+            raw_v = row.get(k)
+            if "date" in k.casefold() or "date" in lbl.casefold():
+                card_fields.append(f"*📅 {lbl}:* {_format_card_date(raw_v)}")
+            else:
+                val_disp = html.escape(str(raw_v), quote=False) if raw_v not in (None, "", "—") else "Not available"
+                card_fields.append(f"*{_decorate_field_label('contact', k, lbl)}:* {val_disp}")
+
+    elif record_type == "company":
+        has_domain_col = "domain" in col_map or "website" in col_map
+        if not has_domain_col and ("name" in col_map or "company_name" in col_map or "companyname" in col_map):
+            name_label = col_map.get("name") or col_map.get("company_name") or col_map.get("companyname") or "Company name"
+            name_val = row.get("name") or row.get("company_name") or row.get("companyname")
+            name_str = html.escape(str(name_val), quote=False) if name_val else "Not available"
+            f1 = f"*🏢 {name_label}:* {name_str}"
+        else:
+            domain_label = col_map.get("domain") or "Company domain"
+            domain_val = row.get("domain") or row.get("website")
+            domain_str = html.escape(str(domain_val), quote=False) if domain_val else "Not available"
+            f1 = f"*🌐 {domain_label}:* {domain_str}"
+
+        ind_label = col_map.get("industry") or "Industry"
+        ind_val = row.get("industry")
+        ind_str = html.escape(str(ind_val), quote=False) if ind_val else "Not available"
+        f2 = f"*🏭 {ind_label}:* {ind_str}"
+
+        city_label = col_map.get("city") or "City"
+        city_val = row.get("city")
+        city_str = html.escape(str(city_val), quote=False) if city_val else "Not available"
+        f3 = f"*📍 {city_label}:* {city_str}"
+
+        owner_val = row.get("owner") or row.get("hubspot_owner_id")
+        owner_str, owner_lbl = _resolve_owner_display(owner_val, row, col_map)
+        f4 = f"{owner_lbl} {owner_str}"
+
+        card_fields = [f1, f2, f3, f4]
+
+        handled_keys = {
+            "name", "company_name", "companyname", "domain", "website",
+            "industry", "city", "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
+            "view_url", "hubspot_url", "url",
+        }
+
+        # Extra requested columns:
+        for col in columns:
+            k = col.get("key", "")
+            if k in handled_keys:
+                continue
+            lbl = col.get("label", k)
+            raw_v = row.get(k)
+            if "date" in k.casefold() or "date" in lbl.casefold():
+                card_fields.append(f"*📅 {lbl}:* {_format_card_date(raw_v)}")
+            else:
+                val_disp = html.escape(str(raw_v), quote=False) if raw_v not in (None, "", "—") else "Not available"
+                card_fields.append(f"*{_decorate_field_label('company', k, lbl)}:* {val_disp}")
+
+    blocks: list[Block] = [
+        {"type": "divider"},
+        header_block,
+    ]
+
+    for i in range(0, len(card_fields), 10):
+        chunk = card_fields[i : i + 10]
+        blocks.append({
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": f} for f in chunk],
+        })
+
     return blocks
 
 
