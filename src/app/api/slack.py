@@ -282,9 +282,17 @@ async def _respond(
                 extra={"tenant_id": tenant_id},
             )
 
+    actor_email = None
+    if hasattr(client, "get_user_email"):
+        try:
+            actor_email = await client.get_user_email(parsed.user_id)
+        except Exception:
+            actor_email = None
+
     agent_request = AgentRequest(
         tenant_id=tenant_id,
         actor_id=parsed.user_id,
+        actor_email=actor_email,
         message=parsed.text,
         request_id=request_id,
         channel_id=parsed.channel_id,
@@ -711,9 +719,17 @@ async def _process_home_interaction(
             request_text=message,
             banner_image_url=banner_image_url,
         )
+        actor_email = None
+        if hasattr(client, "get_user_email"):
+            try:
+                actor_email = await client.get_user_email(interaction.user_id)
+            except Exception:
+                actor_email = None
+
         agent_request = AgentRequest(
             tenant_id=tenant_id,
             actor_id=interaction.user_id,
+            actor_email=actor_email,
             message=message,
             request_id=request_id or uuid4().hex,
             channel_id=f"apphome:{interaction.user_id}",

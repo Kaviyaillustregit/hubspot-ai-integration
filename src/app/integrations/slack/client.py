@@ -33,3 +33,7 @@ class SlackClient(ABC):
     ) -> None:
         """Delete an existing Slack message if supported by the client implementation."""
         return None
+
+    async def get_user_email(self, user_id: str) -> str | None:
+        """Retrieve user's email address by Slack user ID if supported."""
+        return None

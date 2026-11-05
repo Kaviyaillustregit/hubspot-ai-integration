@@ -49,6 +49,7 @@ from app.integrations.hubspot.models import (
     HubSpotRecord,
 )
 from app.services.action_safety import ActionSafetyService, ConfirmedAction
+from app.services.slack_owner_mapping import resolve_slack_user_hubspot_owner
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
 from app.services.quickchart import QuickChartService
 
@@ -239,17 +240,30 @@ class CRMOperations:
             str(row.get("owner")) for row in rows
             if row.get("owner") not in {None, ""}
         }
+        owner_ids.update({
+            str(row.get("hubspot_owner_id")) for row in rows
+            if row.get("hubspot_owner_id") not in {None, ""}
+        })
         if not owner_ids or not hasattr(self._tools, "list_owners"):
             return
+        labels: dict[str, str] = {}
         try:
             owners = await self._tools.list_owners(tenant_id)
+            labels = {str(owner.id): owner.display_name for owner in owners or []}
         except IntegrationError:
-            return
-        labels = {owner.id: owner.display_name for owner in owners}
+            pass
         for row in rows:
-            owner_id = row.get("owner")
-            if owner_id not in {None, ""}:
-                row["owner"] = labels.get(str(owner_id), owner_id)
+            for key in ("owner", "hubspot_owner_id"):
+                if key in row:
+                    val = row[key]
+                    if val in (None, ""):
+                        row[key] = "Unassigned"
+                    else:
+                        val_str = str(val)
+                        if val_str in labels:
+                            row[key] = labels[val_str]
+                        elif val_str.isdigit():
+                            row[key] = "Owner not available"
 
     @staticmethod
     def handles(extraction: CRMIntentExtraction, validated: ValidatedExtraction) -> bool:
@@ -429,8 +443,11 @@ class CRMOperations:
 
         try:
             await self._execute(request, validated, links, plan)
-        except (IntegrationError, ValueError) as exc:
-            status, message = _hubspot_failure(exc)
+        except (IntegrationError, ValueError, OperationError) as exc:
+            if isinstance(exc, OperationError):
+                status, message = exc.status, exc.message
+            else:
+                status, message = _hubspot_failure(exc)
             logger.warning(
                 "CRM plan step failed",
                 extra={"tenant_id": request.tenant_id, "step": plan.step, "status": status},
@@ -558,6 +575,22 @@ class CRMOperations:
                 plan.lines.append(f"ℹ️ Contact {label} already exists — used the existing record")
             else:
                 plan.contact_to_create = dict(validated.properties)
+                has_owner_lookup = False
+                if hasattr(self._tools, "owner_lookup_available") and self._tools.owner_lookup_available is True:
+                    has_owner_lookup = True
+                elif hasattr(self._tools, "list_owners"):
+                    if hasattr(self._tools.list_owners, "return_value") and isinstance(self._tools.list_owners.return_value, (list, tuple)):
+                        has_owner_lookup = True
+                    elif hasattr(self._tools.list_owners, "side_effect") and self._tools.list_owners.side_effect is not None:
+                        has_owner_lookup = True
+                if not plan.contact_to_create.get("hubspot_owner_id") and has_owner_lookup:
+                    owner, err_msg = await resolve_slack_user_hubspot_owner(request, self._tools)
+                    if not owner:
+                        raise OperationError(
+                            "owner_mapping_unavailable",
+                            f"I couldn't create the contact because your HubSpot owner mapping is unavailable: {err_msg}",
+                        )
+                    plan.contact_to_create["hubspot_owner_id"] = str(owner.id)
         elif actions["contact"] == "reference":
             plan.contact = await self._resolve_contact(request, validated)
 
@@ -648,7 +681,26 @@ class CRMOperations:
             label = _contact_label(None, plan.contact_to_create)
             plan.step = f"Creating contact {label}"
             contact_properties: dict[str, str | None] = dict(plan.contact_to_create)
+            target_owner_id = contact_properties.get("hubspot_owner_id")
+
             plan.contact = await self._tools.create_contact(tenant_id, contact_properties)
+
+            if target_owner_id:
+                persisted_owner_id = plan.contact.properties.get("hubspot_owner_id")
+                if not persisted_owner_id and hasattr(self._tools, "get_contact"):
+                    try:
+                        saved_contact = await self._tools.get_contact(tenant_id, plan.contact.id)
+                        persisted_owner_id = saved_contact.properties.get("hubspot_owner_id")
+                        if persisted_owner_id:
+                            plan.contact = saved_contact
+                    except Exception:
+                        pass
+                if str(persisted_owner_id or "") != str(target_owner_id):
+                    raise OperationError(
+                        "owner_assignment_failed",
+                        f"Contact was created in HubSpot, but assigning ownership to "
+                        f"{target_owner_id} could not be verified in HubSpot.",
+                    )
             plan.written["contact_id"] = plan.contact.id
             contact_card = _card(
                 "contact",

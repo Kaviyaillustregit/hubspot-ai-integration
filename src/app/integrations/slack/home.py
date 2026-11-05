@@ -576,7 +576,7 @@ def _decorate_field_label(
             or "company" in normalized_label
         ):
             return _prefix_field_emoji(label, "\U0001F3E2")  # 🏢
-        if normalized_key in {"owner", "hubspot_owner_id"} or normalized_label.startswith("owner"):
+        if normalized_key in {"owner", "hubspot_owner_id"} or "owner" in normalized_label:
             return _prefix_field_emoji(label, "\U0001F454")  # 👔
         return label
 
@@ -1284,8 +1284,6 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
         detail_lines = [f"👤 *{html.escape(str(contact_name), quote=False)}*"]
         if email:
             detail_lines.append(f"• Email: {html.escape(str(email), quote=False)}")
-        if contact_id:
-            detail_lines.append(f"• HubSpot ID: `{html.escape(str(contact_id), quote=False)}`")
 
         options = [
             {
@@ -1388,7 +1386,6 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
             lines.append(f"• Email: {html.escape(str(c_email), quote=False)}")
             if c_company:
                 lines.append(f"• Company: {html.escape(str(c_company), quote=False)}")
-            lines.append(f"• HubSpot ID: `{html.escape(str(c_id), quote=False)}`")
             if c_url:
                 lines.append(f"• <{c_url}|View in HubSpot>")
 
@@ -1593,8 +1590,9 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
         metadata = []
         if isinstance(email, str) and email:
             metadata.append(html.escape(email, quote=False))
-        if isinstance(contact_id, str) and contact_id:
-            metadata.append("HubSpot ID `" + html.escape(contact_id, quote=False) + "`")
+        owner_name = result.get("owner_name")
+        if isinstance(owner_name, str) and owner_name and owner_name != "Unassigned":
+            metadata.append("👤 Owner: " + html.escape(owner_name, quote=False))
         if metadata:
             rendered.append(_context("  ·  ".join(metadata)))
         rendered.extend(_record_link_blocks(response))
@@ -1892,25 +1890,25 @@ def _format_card_amount(val: object) -> str:
 
 
 def _resolve_owner_display(val: object, row: dict[str, Any], col_map: dict[str, str]) -> tuple[str, str]:
+    owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
     for key in ("owner_name", "hubspot_owner_name"):
         cand = row.get(key)
         if isinstance(cand, str) and cand.strip() and not cand.strip().isdigit():
-            owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
             return cand.strip(), f"*👤 {owner_label}:*"
 
     if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
-        owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
         return "Unassigned", f"*👤 {owner_label}:*"
 
     s = str(val).strip()
     if not s or s.casefold() in {"unassigned", "none", "null", "—"}:
-        owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
         return "Unassigned", f"*👤 {owner_label}:*"
 
     if s.isdigit():
-        return s, "*👤 Owner ID:*"
+        return "Owner not available", f"*👤 {owner_label}:*"
 
-    owner_label = col_map.get("owner") or col_map.get("hubspot_owner_id") or "Owner"
+    if s.casefold() in {"owner not available", "not available"}:
+        return "Owner not available", f"*👤 {owner_label}:*"
+
     return s, f"*👤 {owner_label}:*"
 
 
@@ -1934,7 +1932,7 @@ def _resolve_company_display(val: object, row: dict[str, Any], col_map: dict[str
         return "Not available", f"*🏢 {comp_label}:*"
 
     if s.isdigit():
-        return s, f"*🏢 {comp_label} ID:*"
+        return "Not available", f"*🏢 {comp_label}:*"
 
     return s, f"*🏢 {comp_label}:*"
 
@@ -2117,6 +2115,7 @@ def _render_crm_record_card(
             "view_url", "hubspot_url", "url",
             "amount", "total_amount", "sum_amount", "deal_amount",
             "probability",
+            "id", "hs_object_id", "contact_id", "company_id", "deal_id", "record_id",
         }
         for col in columns:
             k = col.get("key", "")
@@ -2170,6 +2169,7 @@ def _render_crm_record_card(
                 "createdate", "create_date", "phone", "mobilephone", "telephone",
                 "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
                 "name", "contactname", "contact_name", "view_url", "hubspot_url", "url",
+                "id", "hs_object_id", "contact_id", "company_id", "deal_id", "record_id",
             }
         else:
             f1_val = html.escape(str(row.get("email") or "Not available"), quote=False)
@@ -2198,6 +2198,7 @@ def _render_crm_record_card(
                 "createdate", "create_date", "owner", "hubspot_owner_id",
                 "owner_name", "hubspot_owner_name", "name", "contactname", "contact_name",
                 "view_url", "hubspot_url", "url",
+                "id", "hs_object_id", "contact_id", "company_id", "deal_id", "record_id",
             }
 
         # Extra requested columns:
@@ -2246,6 +2247,7 @@ def _render_crm_record_card(
             "name", "company_name", "companyname", "domain", "website",
             "industry", "city", "owner", "hubspot_owner_id", "owner_name", "hubspot_owner_name",
             "view_url", "hubspot_url", "url",
+            "id", "hs_object_id", "contact_id", "company_id", "deal_id", "record_id",
         }
 
         # Extra requested columns:
@@ -2294,6 +2296,8 @@ def _render_table_row(
     field_entries: list[tuple[str, str, str, bool]] = []
     for column in columns:
         key = column["key"]
+        if key in {"id", "hs_object_id", "contact_id", "company_id", "deal_id", "record_id"}:
+            continue
         raw_label = column["label"]
         raw_value = row.get(key)
         is_stage_key = (
@@ -2340,15 +2344,23 @@ def _render_table_row(
                 and isinstance(raw_value, str)
                 and raw_value.isdigit()
             ):
-                label = html.escape(_prefix_field_emoji("Owner ID", "\U0001F464"), quote=False)
+                raw_value = "Owner not available"
+            elif (
+                key in {"company", "associatedcompanyid", "associatedcompany"}
+                and isinstance(raw_value, str)
+                and raw_value.isdigit()
+            ):
+                raw_value = "Not available"
 
             displayed = (
                 "Unassigned"
-                if key in {"owner", "hubspot_owner_id"} and raw_value in (None, "")
+                if key in {"owner", "hubspot_owner_id"} and (raw_value in (None, "") or str(raw_value).casefold() == "unassigned")
+                else "Owner not available"
+                if key in {"owner", "hubspot_owner_id"} and str(raw_value).casefold() in {"owner not available", "not available"}
                 else "Not available"
-                if show_missing and (
+                if (show_missing and (
                     raw_value is None or raw_value == "" or raw_value in ("—", _MOJIBAKE_EM_DASH)
-                )
+                )) or (isinstance(raw_value, str) and raw_value.casefold() == "not available")
                 else format_property_value(key, raw_value)
             )
 
@@ -2414,6 +2426,8 @@ def _render_record_card(
     field_entries: list[tuple[str, str, str, bool]] = []
     for column in row_columns:
         key = column.get("key", "")
+        if key in {"id", "hs_object_id", "contact_id", "company_id", "deal_id", "record_id"}:
+            continue
         raw_value = rendered_row.get(key)
         raw_label = column.get("label", key.replace("_", " ").title())
         if key == "view_url":
@@ -2436,11 +2450,19 @@ def _render_record_card(
                 and isinstance(raw_value, str)
                 and raw_value.isdigit()
             ):
-                label = _prefix_field_emoji("Owner ID", "\U0001F464")
+                raw_value = "Owner not available"
+            elif (
+                key in {"company", "associatedcompanyid", "associatedcompany"}
+                and isinstance(raw_value, str)
+                and raw_value.isdigit()
+            ):
+                raw_value = "Not available"
 
-            if key in {"owner", "hubspot_owner_id"} and raw_value in (None, ""):
+            if key in {"owner", "hubspot_owner_id"} and (raw_value in (None, "") or str(raw_value).casefold() == "unassigned"):
                 displayed = "Unassigned"
-            elif raw_value is None or raw_value == "" or raw_value in ("—", _MOJIBAKE_EM_DASH):
+            elif key in {"owner", "hubspot_owner_id"} and str(raw_value).casefold() in {"owner not available", "not available"}:
+                displayed = "Owner not available"
+            elif raw_value is None or raw_value == "" or raw_value in ("—", _MOJIBAKE_EM_DASH) or (isinstance(raw_value, str) and raw_value.casefold() == "not available"):
                 displayed = "Not available"
             else:
                 displayed = format_property_value(key, raw_value)
@@ -2602,7 +2624,13 @@ def _slack_hubspot_link(value: object) -> str:
 
 
 def _split_text(text: str) -> list[str]:
-    escaped = escape_slack_text(text)
+    sanitized = re.sub(
+        r"(?im)^\s*•\s*(?:HubSpot|Contact|Company|Deal)\s*ID:\s*`?[0-9a-zA-Z_-]+`?\s*\n?",
+        "",
+        text,
+    )
+    sanitized = re.sub(r"\s*\(contact ID `?[0-9a-zA-Z_-]+`?\)", "", sanitized)
+    escaped = escape_slack_text(sanitized)
     if not escaped:
         return ["No response was returned."]
     chunks: list[str] = []

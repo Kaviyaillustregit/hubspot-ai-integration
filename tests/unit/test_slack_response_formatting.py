@@ -409,15 +409,15 @@ def test_individual_record_details_render_as_compact_single_column_cards(title, 
     assert detail_sections
     if kind == "contact":
         assert "*\U0001F464 Name:* Cloud Migration Project" in encoded
-        assert "*\U0001F464 Owner ID:* 98711688" in encoded
+        assert any(x in encoded for x in ("*\U0001F454 Owner:* Owner not available", "*\U0001F454 Owner:* Unassigned"))
         assert "*\U0001F4B0 Amount:* *250,000*" in encoded
         assert "*\U0001F4C5 Close Date:* Dec 10, 2026" in encoded
     else:  # company
         assert "*\U0001F3E2 Name:* Cloud Migration Project" in encoded
-        assert "*\U0001F464 Owner ID:* 98711688" in encoded
+        assert any(x in encoded for x in ("*\U0001F464 Owner:* Owner not available", "*\U0001F464 Owner:* Unassigned"))
         assert "*\U0001F4B0 Amount:* *250,000*" in encoded
         assert "*\U0001F4C5 Close Date:* Dec 10, 2026" in encoded
-    assert "Owner ID" in encoded
+    assert "98711688" not in encoded
     assert "Ada" not in encoded
     assert "Dec 10, 2026" in encoded
     assert f"<{url}|View in HubSpot>" in encoded
@@ -480,7 +480,7 @@ def test_single_deal_detail_renders_as_crm_record_card():
     assert fields[0]["text"] == "*🏢 Company:* Not available"
     assert fields[1]["text"] == "*🟡 Stage:* Qualified To Buy"
     assert fields[2]["text"] == "*📅 Close Date:* 2026-12-10"
-    assert fields[3]["text"] == "*👤 Owner ID:* 98711688"
+    assert fields[3]["text"] in ("*👤 Owner:* Owner not available", "*👤 Owner:* Unassigned")
 
 
 def test_operations_deal_list_renders_as_crm_record_cards():
@@ -609,7 +609,8 @@ def test_contact_record_details_render_as_compact_two_column_pairs():
         "*\U0001F4DE Phone:* +1 555 0100",
         "*\U0001F3E2 Company:* Northwind",
     )
-    assert "*\U0001F464 Owner ID:* 123456" in encoded
+    assert any(x in encoded for x in ("*\U0001F454 Owner:* Owner not available", "*\U0001F454 Owner:* Unassigned"))
+    assert "123456" not in encoded
     assert f"<{url}|View in HubSpot>" in encoded
     assert encoded.count(url) == 1
 
@@ -664,8 +665,13 @@ def test_company_record_details_render_as_compact_two_column_pairs():
     assert _has_field_pair(
         blocks,
         "*\U0001F465 Employees:* 120",
-        "*\U0001F464 Owner ID:* 654321",
+        "*\U0001F464 Owner:* Owner not available",
+    ) or _has_field_pair(
+        blocks,
+        "*\U0001F465 Employees:* 120",
+        "*\U0001F464 Owner:* Unassigned",
     )
+    assert "654321" not in encoded
     assert f"<{url}|View in HubSpot>" in encoded
     assert encoded.count(url) == 1
 
@@ -1399,11 +1405,12 @@ def test_contact_compact_two_column_layout_all_pairs():
     )
     assert _has_field_pair(
         blocks,
-        "*👤 Owner ID:* 169090866",
+        "*👔 HubSpot owner:* Owner not available",
         "*📅 Create date:* Oct 7, 2026 at 07:05:11 +0000",
     )
     # Link is clickable and present once
     encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "169090866" not in encoded
     assert f"<{url}|View in HubSpot>" in encoded
 
 
@@ -1523,8 +1530,9 @@ def test_company_compact_two_column_layout_all_pairs():
     assert _has_field_pair(
         blocks,
         "*Lead status:* Not available",
-        "*👤 Owner ID:* 169090866",
+        "*👤 Owner:* Owner not available",
     )
+    assert "169090866" not in json.dumps(blocks, ensure_ascii=False)
     # All 8 fields in a single compact section block
     field_sections = [b for b in blocks if b.get("type") == "section" and "fields" in b]
     assert len(field_sections) == 1
@@ -1732,10 +1740,10 @@ def test_card_resolves_owner_and_company_never_raw_ids():
     blocks_unresolved = render_response_blocks(response_unresolved)
     encoded_unresolved = json.dumps(blocks_unresolved, ensure_ascii=False)
 
-    assert "*🏢 Company ID:* 00100" in encoded_unresolved
-    assert "*👤 Owner ID:* 169090866" in encoded_unresolved
-    assert "*🏢 Company:* Not available" not in encoded_unresolved
-    assert "*👤 Owner:* Unassigned" not in encoded_unresolved
+    assert "*🏢 Company:* Not available" in encoded_unresolved
+    assert "*👤 Owner:* Owner not available" in encoded_unresolved
+    assert "00100" not in encoded_unresolved
+    assert "169090866" not in encoded_unresolved
 
     response_missing = AgentResponse(
         status="ok",
@@ -2283,3 +2291,146 @@ def test_zero_deal_amount_is_formatted_as_dollar_zero():
     blocks = render_response_blocks(response)
     header = [b for b in blocks if b.get("type") == "section" and "Pro Bono Project" in b.get("text", {}).get("text", "")][0]
     assert "*💰 Amount:* $0" in header["text"]["text"]
+
+
+
+@pytest.mark.asyncio
+async def test_contact_creation_assigns_default_owner_and_displays_owner_name():
+    """Verify default owner assignment on contact creation and owner display in Slack metadata."""
+    from unittest.mock import AsyncMock
+    from app.agent.service import AccountIntelligenceAgent, _ContactDraft
+    from app.agent.schemas import AgentRequest
+    from app.integrations.hubspot.models import HubSpotContact
+    from app.integrations.hubspot.owners import HubSpotOwner
+    from app.integrations.slack.home import render_response_blocks
+
+    mock_tools = AsyncMock()
+    mock_ai = AsyncMock()
+    mock_safety = AsyncMock()
+    mock_claim = AsyncMock()
+    mock_claim.action_id = "act-123"
+    mock_safety.start_direct_action = AsyncMock(return_value=mock_claim)
+    mock_safety.complete_action = AsyncMock()
+
+    agent = AccountIntelligenceAgent(mock_tools, mock_ai, mock_safety)
+
+    mock_tools.list_owners.return_value = [
+        HubSpotOwner(id="998877", firstName="Alex", lastName="Rivera", email="alex@company.com")
+    ]
+    created = HubSpotContact(
+        id="contact-12345",
+        properties={"firstname": "Jordan", "email": "jordan@example.com", "hubspot_owner_id": "998877"},
+    )
+    mock_tools.create_contact.return_value = created
+    mock_tools.hubspot_record_urls.return_value = [
+        "https://app.hubspot.com/contacts/42/record/0-1/contact-12345"
+    ]
+
+    req = AgentRequest(
+        tenant_id="tenant-test",
+        actor_id="U1",
+        actor_email="alex@company.com",
+        message="Create contact Jordan with email jordan@example.com",
+        request_id="req-create-owner",
+    )
+    res = await agent._create_contact_directly(
+        req,
+        _ContactDraft(properties={"firstname": "Jordan", "email": "jordan@example.com"}, company_name=None),
+    )
+
+    assert res.status == "ok"
+    assert res.result["owner_id"] == "998877"
+    assert res.result["owner_name"] == "Alex Rivera"
+
+    call_args = mock_tools.create_contact.call_args[0]
+    assert call_args[1].get("hubspot_owner_id") == "998877"
+
+    blocks = render_response_blocks(res)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Alex Rivera" in encoded
+    assert "HubSpot ID" not in encoded
+    assert "Contact ID" not in encoded
+    # Visible text sections do not expose raw ID
+    for block in blocks:
+        if block.get("type") in ("section", "context"):
+            text_field = block.get("text", {})
+            if isinstance(text_field, dict):
+                t = text_field.get("text", "")
+                if "View in HubSpot" not in t:
+                    assert "contact-12345" not in t
+    # But direct record link is preserved
+    assert f"<{mock_tools.hubspot_record_urls.return_value[0]}|View in HubSpot>" in encoded
+
+
+@pytest.mark.asyncio
+async def test_hubspot_owner_service_caching_and_tenant_isolation():
+    """Verify HubSpotOwnersService caches per-tenant and maintains tenant isolation."""
+    from unittest.mock import AsyncMock
+    from app.services.hubspot_owners import HubSpotOwnersService
+    from app.integrations.hubspot.owners import HubSpotOwner
+    from app.integrations.hubspot.context import TenantContext
+
+    mock_client = AsyncMock()
+    mock_token_provider = AsyncMock()
+    token_a = AsyncMock(hubspot_account_id="acc-a", scopes=["crm.objects.owners.read"])
+    token_b = AsyncMock(hubspot_account_id="acc-b", scopes=["crm.objects.owners.read"])
+    mock_token_provider.get_access_token.side_effect = lambda t: (
+        ("tok-a", token_a) if t == "tenant-a" else ("tok-b", token_b)
+    )
+
+    owner_a = [HubSpotOwner(id="1", firstName="Owner", lastName="A")]
+    owner_b = [HubSpotOwner(id="2", firstName="Owner", lastName="B")]
+    mock_client.list_owners.side_effect = lambda ctx, tok: (
+        owner_a if ctx.tenant_id == "tenant-a" else owner_b
+    )
+
+    svc = HubSpotOwnersService(mock_client, mock_token_provider, cache_ttl_seconds=60.0)
+
+    ctx_a = TenantContext(tenant_id="tenant-a", hubspot_account_id="acc-a", credential_reference="ref")
+    res_a1 = await svc.list_owners(ctx_a)
+    assert res_a1[0].display_name == "Owner A"
+    assert mock_client.list_owners.call_count == 1
+
+    res_a2 = await svc.list_owners(ctx_a)
+    assert res_a2[0].display_name == "Owner A"
+    assert mock_client.list_owners.call_count == 1
+
+    ctx_b = TenantContext(tenant_id="tenant-b", hubspot_account_id="acc-b", credential_reference="ref")
+    res_b = await svc.list_owners(ctx_b)
+    assert res_b[0].display_name == "Owner B"
+    assert mock_client.list_owners.call_count == 2
+
+
+def test_sensitive_record_ids_hidden_from_all_slack_responses():
+    """Verify raw record IDs are stripped from all user-facing Slack blocks and fallback text."""
+    from app.agent.schemas import AgentResponse
+    from app.integrations.slack.home import render_response_blocks
+    from app.integrations.slack.response_formatting import format_slack_response
+
+    res_needs_field = AgentResponse(
+        status="needs_field",
+        text="Which field would you like to update?",
+        request_id="req-nf",
+        result={
+            "kind": "interactive_field_selection",
+            "contact_id": "contact_987654",
+            "contact_name": "Taylor",
+            "email": "taylor@test.com",
+            "fields": [{"label": "Phone", "value": "phone"}],
+        },
+    )
+    blocks_nf = render_response_blocks(res_needs_field)
+    encoded_nf = json.dumps(blocks_nf, ensure_ascii=False)
+    assert "HubSpot ID" not in encoded_nf
+    select = blocks_nf[2]["elements"][0]
+    assert select["options"][0]["value"] == "contact_987654:phone"
+
+    res_crud = AgentResponse(
+        status="ok",
+        text="Contact created successfully in HubSpot.\n• Contact ID: `5551234`\n• Email: test@example.com",
+        request_id="req-fb",
+    )
+    formatted = format_slack_response(res_crud)
+    assert "5551234" not in formatted.fallback_text
+    assert "Contact ID" not in formatted.fallback_text
+    assert "test@example.com" in formatted.fallback_text

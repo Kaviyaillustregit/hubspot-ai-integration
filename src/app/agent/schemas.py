@@ -16,6 +16,7 @@ class AgentRequest(BaseModel):
     channel_id: str | None = Field(default=None, max_length=128)
     message_ts: str | None = Field(default=None, max_length=64)
     event_id: str | None = Field(default=None, max_length=128)
+    actor_email: str | None = Field(default=None, max_length=320)
 
 
 CRMIntentName = Literal[

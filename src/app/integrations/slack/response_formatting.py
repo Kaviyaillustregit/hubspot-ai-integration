@@ -81,8 +81,14 @@ def format_slack_response(
 
     # Check the final Python data structure before handing it to Slack's API.
     json.dumps(messages, ensure_ascii=False)
+    clean_fallback = re.sub(
+        r"(?im)^\s*•\s*(?:HubSpot|Contact|Company|Deal)\s*ID:\s*`?[0-9a-zA-Z_-]+`?\s*\n?",
+        "",
+        response.text,
+    )
+    clean_fallback = re.sub(r"\s*\(contact ID `?[0-9a-zA-Z_-]+`?\)", "", clean_fallback)
     return FormattedSlackResponse(
-        fallback_text=response.text,
+        fallback_text=clean_fallback,
         messages=messages,
         response_type=response_type,
     )
@@ -330,6 +336,12 @@ def escape_slack_text(text: str) -> str:
 
 def normalize_slack_display_text(text: str) -> str:
     """Normalize current or stored AI prose for safe Slack mrkdwn display."""
+    text = re.sub(
+        r"(?im)^\s*•\s*(?:HubSpot|Contact|Company|Deal)\s*ID:\s*`?[0-9a-zA-Z_-]+`?\s*\n?",
+        "",
+        text,
+    )
+    text = re.sub(r"\s*\(contact ID `?[0-9a-zA-Z_-]+`?\)", "", text)
     links: list[tuple[str, str]] = []
     seen_hubspot_urls: set[str] = set()
     output: list[str] = []

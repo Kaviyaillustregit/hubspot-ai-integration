@@ -1,6 +1,7 @@
 import contextvars
 import hashlib
 import logging
+import os
 import re
 from asyncio import Semaphore, gather
 from collections.abc import Awaitable, Callable
@@ -67,10 +68,12 @@ from app.integrations.errors import (
     IntegrationTimeoutError,
 )
 from app.integrations.hubspot.models import HubSpotCompany, HubSpotContact, HubSpotDeal
+from app.integrations.hubspot.owners import HubSpotOwner
 from app.integrations.hubspot.properties import HubSpotPropertyDefinition
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
 from app.services.quickchart import build_chart_config, generate_chart_url
+from app.services.slack_owner_mapping import resolve_slack_user_hubspot_owner
 
 logger = logging.getLogger(__name__)
 
@@ -1488,24 +1491,69 @@ class AccountIntelligenceAgent:
             result=payload,
         )
 
+    async def _resolve_default_owner_for_tenant(self, tenant_id: str) -> HubSpotOwner | None:
+        """Resolve the configured or unambiguous default HubSpot owner for this tenant."""
+        if not hasattr(self._tools, "list_owners"):
+            return None
+        try:
+            owners = await self._tools.list_owners(tenant_id)
+        except IntegrationError:
+            return None
+        if not owners:
+            return None
+
+        configured = (
+            os.getenv(f"HUBSPOT_DEFAULT_OWNER_{tenant_id}")
+            or os.getenv("HUBSPOT_DEFAULT_OWNER_ID")
+            or os.getenv("HUBSPOT_DEFAULT_OWNER_EMAIL")
+            or os.getenv("HUBSPOT_DEFAULT_OWNER")
+        )
+        if configured:
+            conf_str = configured.strip()
+            for owner in owners:
+                if str(owner.id) == conf_str:
+                    return owner
+                if owner.email and owner.email.casefold() == conf_str.casefold():
+                    return owner
+                if owner.display_name and owner.display_name.casefold() == conf_str.casefold():
+                    return owner
+
+        if len(owners) == 1:
+            return owners[0]
+
+        return None
+
     async def _resolve_owner_labels(self, tenant_id: str, rows: list[dict]) -> None:
         owner_ids = {
             str(row.get("hubspot_owner_id"))
             for row in rows
             if row.get("hubspot_owner_id") not in {None, ""}
         }
+        owner_ids.update({
+            str(row.get("owner"))
+            for row in rows
+            if row.get("owner") not in {None, ""}
+        })
         if not owner_ids:
             return
+        names: dict[str, str] = {}
         try:
             owners = await self._tools.list_owners(tenant_id)
+            names = {str(owner.id): owner.display_name for owner in owners or []}
         except IntegrationError:
-            # Keep stable owner IDs visible when the tenant has not granted owner-read.
-            return
-        names = {owner.id: owner.display_name for owner in owners}
+            pass
         for row in rows:
-            owner_id = row.get("hubspot_owner_id")
-            if owner_id is not None:
-                row["hubspot_owner_id"] = names.get(str(owner_id), owner_id)
+            for key in ("hubspot_owner_id", "owner"):
+                if key in row:
+                    val = row[key]
+                    if val in (None, ""):
+                        row[key] = "Unassigned"
+                    else:
+                        val_str = str(val)
+                        if val_str in names:
+                            row[key] = names[val_str]
+                        elif val_str.isdigit():
+                            row[key] = "Owner not available"
 
 
     async def respond(
@@ -3373,12 +3421,58 @@ class AccountIntelligenceAgent:
 
                 company = resolution.company
 
+            properties_to_create = dict(draft.properties)
+            target_owner = None
+            has_owner_lookup = False
+            if hasattr(self._tools, "owner_lookup_available") and self._tools.owner_lookup_available is True:
+                has_owner_lookup = True
+            elif hasattr(self._tools, "list_owners"):
+                if hasattr(self._tools.list_owners, "return_value") and isinstance(self._tools.list_owners.return_value, (list, tuple)):
+                    has_owner_lookup = True
+                elif hasattr(self._tools.list_owners, "side_effect") and self._tools.list_owners.side_effect is not None:
+                    has_owner_lookup = True
+            if not properties_to_create.get("hubspot_owner_id") and has_owner_lookup:
+                tools_used.append("list_owners")
+                owner, err_msg = await resolve_slack_user_hubspot_owner(request, self._tools)
+                if not owner:
+                    await self._fail_direct_action(request, claim.action_id, "owner_mapping_unavailable")
+                    return self._safe(
+                        "owner_mapping_unavailable",
+                        f"I couldn't create the contact because your HubSpot owner mapping is unavailable: {err_msg}",
+                        request,
+                        tools_used,
+                    )
+                target_owner = owner
+                properties_to_create["hubspot_owner_id"] = str(owner.id)
+
             tools_used.append("create_contact")
             contact = await self._tools.create_contact(
                 request.tenant_id,
-                dict(draft.properties),
+                properties_to_create,
                 company_id=company.id if company is not None else None,
             )
+
+            # Verify that the owner was actually persisted in HubSpot
+            if target_owner:
+                persisted_owner_id = contact.properties.get("hubspot_owner_id")
+                if not persisted_owner_id and hasattr(self._tools, "get_contact"):
+                    try:
+                        saved_contact = await self._tools.get_contact(request.tenant_id, contact.id)
+                        persisted_owner_id = saved_contact.properties.get("hubspot_owner_id")
+                        if persisted_owner_id:
+                            contact = saved_contact
+                    except Exception:
+                        pass
+
+                if str(persisted_owner_id or "") != str(target_owner.id):
+                    await self._fail_direct_action(request, claim.action_id, "owner_assignment_failed")
+                    return self._safe(
+                        "owner_assignment_failed",
+                        f"I created contact {contact.id} in HubSpot, but assigning ownership to "
+                        f"{target_owner.display_name} could not be verified in HubSpot.",
+                        request,
+                        tools_used,
+                    )
 
         except HubSpotDuplicateContactError as exc:
             await self._fail_direct_action(request, claim.action_id, "duplicate")
@@ -3451,6 +3545,11 @@ class AccountIntelligenceAgent:
             "contact_id": contact.id,
             "name": display_name,
         }
+        if target_owner:
+            result["owner_id"] = str(target_owner.id)
+            result["owner_name"] = target_owner.display_name
+        elif contact.properties.get("hubspot_owner_id"):
+            result["owner_id"] = str(contact.properties["hubspot_owner_id"])
         result["hubspot_url"] = (
             await self._tools.hubspot_record_urls(
                 request.tenant_id, [("contacts", contact.id)]

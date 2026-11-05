@@ -184,9 +184,7 @@ def test_contact_created_renders_professional_fields():
     assert blocks[1]["text"]["text"] == (
         "Angel John was successfully added to HubSpot. Associated with ABC &lt;!channel&gt;."
     )
-    assert blocks[2]["elements"][0]["text"] == (
-        "angel@example.com  ·  HubSpot ID `565238436562`"
-    )
+    assert blocks[2]["elements"][0]["text"] == "angel@example.com"
     assert blocks[3]["text"]["text"] == (
         "<https://app.hubspot.com/contacts/42/record/0-1/565238436562|View in HubSpot>"
     )

@@ -137,3 +137,28 @@ class SlackWebApiClient(SlackClient):
         if not payload.get("ok", False):
             # Slack's error code (e.g. invalid_blocks) carries no secrets and is needed to debug.
             raise IntegrationError(f"Slack views.publish failed: {payload.get('error')}")
+
+    async def get_user_email(self, user_id: str) -> str | None:
+        if not self._settings.slack_bot_token:
+            return None
+        url = "https://slack.com/api/users.info"
+        headers = {"Authorization": f"Bearer {self._settings.slack_bot_token}"}
+        params = {"user": user_id}
+        try:
+            if self._client is not None:
+                response = await self._client.get(url, params=params, headers=headers)
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.request_timeout_seconds
+                ) as client:
+                    response = await client.get(url, params=params, headers=headers)
+            if response.is_error:
+                return None
+            data = response.json()
+            if not data.get("ok"):
+                return None
+            profile = (data.get("user") or {}).get("profile") or {}
+            email = profile.get("email")
+            return email.strip().lower() if email else None
+        except Exception:
+            return None

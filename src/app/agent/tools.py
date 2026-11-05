@@ -738,6 +738,10 @@ class HubSpotToolRegistry:
         return await self._owners_service.list_owners(self._context(tenant_id))
 
     @property
+    def owner_lookup_available(self) -> bool:
+        return self._owners_service is not None
+
+    @property
     def property_discovery_available(self) -> bool:
         return self._properties_service is not None
 
