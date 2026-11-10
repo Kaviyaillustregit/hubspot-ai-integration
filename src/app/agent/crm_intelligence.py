@@ -448,38 +448,8 @@ def _extract_limit(message: str) -> int | None:
 def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilter]:
     text = _normalise_text(message)
     filters: list[CRMIntelligenceFilter] = []
-    if object_name != "deal":
+    if object_name not in {"deal", "contact"}:
         return filters
-    # Date ranges are carried by CRMQueryPlan.date_range, not by filters.
-    state_terms = [
-        name
-        for name in ("open", "closed", "won", "lost")
-        if re.search(rf"\b{name}\b", text)
-    ]
-    if state_terms:
-        comparing = bool(re.search(r"\b(?:compare|comparison|versus|vs)\b", text))
-        unique_terms = list(dict.fromkeys(state_terms))
-        if not comparing and "open" not in unique_terms and all(term in unique_terms for term in ("won", "lost")):
-            for term in [t for t in unique_terms if t not in {"won", "lost"}]:
-                filters.append(
-                    CRMIntelligenceFilter(
-                        field="dealstage",
-                        operator="in" if term in {"open", "closed"} else "eq",
-                        value=term,
-                    )
-                )
-            filters.append(
-                CRMIntelligenceFilter(field="dealstage", operator="in", value="won,lost")
-            )
-        else:
-            for term in unique_terms:
-                filters.append(
-                    CRMIntelligenceFilter(
-                        field="dealstage",
-                        operator="in" if term in {"open", "closed"} else "eq",
-                        value=term,
-                    )
-                )
 
     def capture(pattern: str) -> str | None:
         match = re.search(pattern, text)
@@ -487,69 +457,116 @@ def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilt
             return None
         return match.group(1).strip(" `\"'.,?!")
 
-    stage = capture(
-        r"\b(?:deal\s+)?stage\s+(?:is|equals?|=|:)\s+([a-z0-9 _-]+?)"
-        r"(?=\s+(?:and|with|for|in|over|under|above|below|pipeline|owner|created|amount)\b|[,;?.!]|$)"
-    ) or capture(r"\bin\s+(?!(?:each|every)\b)(?:the\s+)?([a-z0-9 _-]+?)\s+stage\b")
-    if stage and stage not in {"open", "closed", "won", "lost"}:
-        filters.append(CRMIntelligenceFilter(field="dealstage", value=stage))
-    pipeline = capture(
-        r"\bpipeline\s+(?:is|equals?|=|:)\s+([a-z0-9 _-]+?)"
-        r"(?=\s+(?:and|with|for|over|under|owner|created|amount)\b|[,;?.!]|$)"
-    ) or capture(r"\b(?:in|from)\s+(?!(?:each|every)\b)(?:the\s+)?([a-z0-9 _-]+?)\s+pipeline\b")
-    if pipeline:
-        filters.append(CRMIntelligenceFilter(field="pipeline", value=pipeline))
-    deal_name = capture(
-        r"\b(?:deal\s+)?name\s+(?:is|equals?|=|contains?)\s+(.+?)"
-        r"(?=\s+(?:and|with|in|stage|pipeline)\b|[,;?!]|$)"
-    ) or capture(
-        r"\b(?:deals?|opportunities)\s+(?:named|called)\s+(.+?)"
-        r"(?=\s+(?:and|with|in|stage|pipeline)\b|[,;?!]|$)"
-    )
-    if deal_name:
-        operator = "eq" if re.search(r"\b(?:is|equals?)\b", text) else "contains"
-        filters.append(CRMIntelligenceFilter(field="dealname", operator=operator, value=deal_name))
-    deal_id = capture(r"\b(?:deal|record)\s+id\s+(?:is|equals?|=|:)?\s*([a-z0-9-]+)\b")
-    if deal_id:
-        filters.append(CRMIntelligenceFilter(field="id", value=deal_id))
-    amount = re.search(
-        r"\b(?:amount|deal\s+value|value)\s*(>=|<=|>|<|equals?|is|over|above|greater than|"
-        r"at least|under|below|less than|at most)\s*\$?([\d,]+(?:\.\d+)?)\b"
-        r"|\b(?:deals?\s+)?(over|above|greater than|at least|under|below|less than|at most)"
-        r"\s*\$?([\d,]+(?:\.\d+)?)\b",
-        text,
-    )
-    if amount:
-        raw_operator = amount.group(1) or amount.group(3)
-        raw_value = amount.group(2) or amount.group(4)
-        operator = {
-            "=": "eq",
-            "is": "eq",
-            "equal": "eq",
-            "equals": "eq",
-            ">": "gt",
-            "over": "gt",
-            "above": "gt",
-            "greater than": "gt",
-            ">=": "gte",
-            "at least": "gte",
-            "<": "lt",
-            "under": "lt",
-            "below": "lt",
-            "less than": "lt",
-            "<=": "lte",
-            "at most": "lte",
-        }[raw_operator]
-        filters.append(
-            CRMIntelligenceFilter(
-                field="amount", operator=operator, value=raw_value.replace(",", "")
-            )
+    if object_name == "deal":
+        # Date ranges are carried by CRMQueryPlan.date_range, not by filters.
+        state_terms = [
+            name
+            for name in ("open", "closed", "won", "lost")
+            if re.search(rf"\b{name}\b", text)
+        ]
+        if state_terms:
+            comparing = bool(re.search(r"\b(?:compare|comparison|versus|vs)\b", text))
+            unique_terms = list(dict.fromkeys(state_terms))
+            if not comparing and "open" not in unique_terms and all(term in unique_terms for term in ("won", "lost")):
+                for term in [t for t in unique_terms if t not in {"won", "lost"}]:
+                    filters.append(
+                        CRMIntelligenceFilter(
+                            field="dealstage",
+                            operator="in" if term in {"open", "closed"} else "eq",
+                            value=term,
+                        )
+                    )
+                filters.append(
+                    CRMIntelligenceFilter(field="dealstage", operator="in", value="won,lost")
+                )
+            else:
+                for term in unique_terms:
+                    filters.append(
+                        CRMIntelligenceFilter(
+                            field="dealstage",
+                            operator="in" if term in {"open", "closed"} else "eq",
+                            value=term,
+                        )
+                    )
+
+        stage = capture(
+            r"\b(?:deal\s+)?stage\s+(?:is|equals?|=|:)\s+([a-z0-9 _-]+?)"
+            r"(?=\s+(?:and|with|for|in|over|under|above|below|pipeline|owner|created|amount)\b|[,;?.!]|$)"
+        ) or capture(r"\bin\s+(?!(?:each|every)\b)(?:the\s+)?([a-z0-9 _-]+?)\s+stage\b")
+        if stage and stage not in {"open", "closed", "won", "lost"}:
+            filters.append(CRMIntelligenceFilter(field="dealstage", value=stage))
+        pipeline = capture(
+            r"\bpipeline\s+(?:is|equals?|=|:)\s+([a-z0-9 _-]+?)"
+            r"(?=\s+(?:and|with|for|over|under|owner|created|amount)\b|[,;?.!]|$)"
+        ) or capture(r"\b(?:in|from)\s+(?!(?:each|every)\b)(?:the\s+)?([a-z0-9 _-]+?)\s+pipeline\b")
+        if pipeline:
+            filters.append(CRMIntelligenceFilter(field="pipeline", value=pipeline))
+        deal_name = capture(
+            r"\b(?:deal\s+)?name\s+(?:is|equals?|=|contains?)\s+(.+?)"
+            r"(?=\s+(?:and|with|in|stage|pipeline)\b|[,;?!]|$)"
+        ) or capture(
+            r"\b(?:deals?|opportunities)\s+(?:named|called)\s+(.+?)"
+            r"(?=\s+(?:and|with|in|stage|pipeline)\b|[,;?!]|$)"
         )
-    owner_id = capture(
-        r"\bowner(?:\s+id)?\s*(?:(?:is|equals?|=|:)\s*)?(\d+)\b"
-    ) or capture(r"\bassigned\s+to\s+(?:owner\s+)?(\d+)\b")
-    if owner_id:
-        filters.append(CRMIntelligenceFilter(field="hubspot_owner_id", value=owner_id))
+        if deal_name:
+            operator = "eq" if re.search(r"\b(?:is|equals?)\b", text) else "contains"
+            filters.append(CRMIntelligenceFilter(field="dealname", operator=operator, value=deal_name))
+        deal_id = capture(r"\b(?:deal|record)\s+id\s+(?:is|equals?|=|:)?\s*([a-z0-9-]+)\b")
+        if deal_id:
+            filters.append(CRMIntelligenceFilter(field="id", value=deal_id))
+        amount = re.search(
+            r"\b(?:amount|deal\s+value|value)\s*(>=|<=|>|<|equals?|is|over|above|greater than|"
+            r"at least|under|below|less than|at most)\s*\$?([\d,]+(?:\.\d+)?)\b"
+            r"|\b(?:deals?\s+)?(over|above|greater than|at least|under|below|less than|at most)"
+            r"\s*\$?([\d,]+(?:\.\d+)?)\b",
+            text,
+        )
+        if amount:
+            raw_operator = amount.group(1) or amount.group(3)
+            raw_value = amount.group(2) or amount.group(4)
+            operator = {
+                "=": "eq",
+                "is": "eq",
+                "equal": "eq",
+                "equals": "eq",
+                ">": "gt",
+                "over": "gt",
+                "above": "gt",
+                "greater than": "gt",
+                ">=": "gte",
+                "at least": "gte",
+                "<": "lt",
+                "under": "lt",
+                "below": "lt",
+                "less than": "lt",
+                "<=": "lte",
+                "at most": "lte",
+            }[raw_operator]
+            filters.append(
+                CRMIntelligenceFilter(
+                    field="amount", operator=operator, value=raw_value.replace(",", "")
+                )
+            )
+
+    owner_match = (
+        capture(r"\b([a-z0-9_\-]+)\'s\s+(?:contacts?|deals?|leads?|opportunities|records?)\b")
+        or capture(
+            r"\b(?:owned\s+by|assigned\s+to\s*(?:owner)?|owner\s*(?:is|equals?|=|:)?|(?:contacts?|deals?|leads?)\s+of)\s+"
+            r"([a-z0-9_\-\. ]+?)(?=\s+(?:and|with|for|in|over|under|stage|pipeline|created|amount|as|chart|graph)\b|[,;?.!]|\s*$)"
+        )
+        or capture(r"\bowner(?:\s+id)?\s*(?:(?:is|equals?|=|:)\s*)?(\d+)\b")
+        or capture(r"\bassigned\s+to\s+(?:owner\s+)?(\d+)\b")
+    )
+    if owner_match:
+        val = owner_match.strip()
+        if val.casefold().startswith("the "):
+            val = val[4:].strip()
+        if val.casefold() not in {
+            "deal", "deals", "contact", "contacts", "company", "companies",
+            "lead", "leads", "owner", "owners", "each", "every", "stage",
+            "pipeline", "me", "my", "who", "what", "which", "today", "yesterday", "one", "none", "unassigned",
+        }:
+            filters.append(CRMIntelligenceFilter(field="hubspot_owner_id", value=val))
     return filters
 
 
@@ -996,6 +1013,8 @@ def _resolve_property_candidates(message: str, object_name: str) -> list[str]:
         candidates.extend(["name", "hubspot_owner_id", "industry", "city", "numberofemployees"])
     else:
         candidates.extend(["firstname", "lastname", "email", "jobtitle", "city"])
+        if "owner" in text:
+            candidates.append("hubspot_owner_id")
         if re.search(r"\b(?:lead\s+status|hs_lead_status)\b", text):
             candidates.append("hs_lead_status")
     return candidates

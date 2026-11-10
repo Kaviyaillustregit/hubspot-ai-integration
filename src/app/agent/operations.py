@@ -455,14 +455,13 @@ class CRMOperations:
             str(row.get("hubspot_owner_id")) for row in rows
             if row.get("hubspot_owner_id") not in {None, ""}
         })
-        if not owner_ids or not hasattr(self._tools, "list_owners"):
-            return
         labels: dict[str, str] = {}
-        try:
-            owners = await self._tools.list_owners(tenant_id)
-            labels = {str(owner.id): owner.display_name for owner in owners or []}
-        except IntegrationError:
-            pass
+        if owner_ids and hasattr(self._tools, "list_owners"):
+            try:
+                owners = await self._tools.list_owners(tenant_id)
+                labels = {str(owner.id): owner.display_name for owner in owners or []}
+            except IntegrationError:
+                pass
         for row in rows:
             for key in ("owner", "hubspot_owner_id"):
                 if key in row:
@@ -1587,6 +1586,28 @@ class CRMOperations:
                     if query == "contact_list"
                     else await self._tools.search_contacts(tenant_id, search_text)
                 )
+                owner_target = (
+                    validated.properties.get("hubspot_owner_id")
+                    or validated.properties.get("owner")
+                    or _extract_owner_from_text(request.message)
+                )
+                if owner_target and hasattr(self._tools, "list_owners"):
+                    try:
+                        all_owners = await self._tools.list_owners(tenant_id)
+                        matched = _match_owner_by_name(owner_target, all_owners or [])
+                        if matched:
+                            matched_owner_id = str(matched.id)
+                            contacts = [
+                                c for c in contacts
+                                if str(c.properties.get("hubspot_owner_id") or "") == matched_owner_id
+                            ]
+                        elif owner_target.isdigit():
+                            contacts = [
+                                c for c in contacts
+                                if str(c.properties.get("hubspot_owner_id") or "") == owner_target
+                            ]
+                    except IntegrationError:
+                        pass
                 async def contact_enrichment(
                     contact: HubSpotContact,
                 ) -> tuple[str, HubSpotRecord | None, str, str | None]:
@@ -1713,6 +1734,7 @@ class CRMOperations:
                         {**_contact_row(record, None), "company": label}
                         for record in company_records
                     ]
+                    await self._resolve_owner_labels(tenant_id, rows)
                     await _add_hubspot_urls(
                         self._tools,
                         tenant_id,
@@ -1771,6 +1793,7 @@ class CRMOperations:
                     row["associated_deals"] = ", ".join(
                         str(deal.properties.get("dealname") or deal.id) for deal in deals
                     )
+                    await self._resolve_owner_labels(tenant_id, [row])
                     await _add_hubspot_urls(
                         self._tools, tenant_id, [row], [("contacts", contact.id)]
                     )
@@ -2824,6 +2847,62 @@ def _deal_row(
         ),
         "close_date": _date_value(properties.get("closedate")),
     }
+
+
+def _extract_owner_from_text(text: str) -> str | None:
+    norm = re.sub(r"\s+", " ", text.strip())
+    m = re.search(r"\b([A-Za-z0-9_\-]+)\'s\s+(?:contacts?|deals?|leads?|opportunities|records?)\b", norm, re.I)
+    if m:
+        val = m.group(1).strip()
+        if val.casefold() not in {"who", "what", "which", "today", "yesterday", "one", "each", "every"}:
+            return val
+    m = re.search(
+        r"\b(?:owned\s+by|assigned\s+to\s*(?:owner)?|owner\s*(?:is|equals?|=|:)?|(?:contacts?|deals?|leads?)\s+of)\s+"
+        r"([A-Za-z0-9_\-\. ]+?)(?=\s+(?:and|with|for|in|over|under|stage|pipeline|created|amount|as|chart|graph)\b|[,;?.!]|\s*$)",
+        norm,
+        re.I,
+    )
+    if m:
+        val = m.group(1).strip()
+        if val.casefold().startswith("the "):
+            val = val[4:].strip()
+        if val.casefold() not in {
+            "deal", "deals", "contact", "contacts", "company", "companies",
+            "lead", "leads", "owner", "owners", "each", "every", "stage",
+            "pipeline", "me", "my", "who", "what", "which", "today", "yesterday", "one", "none", "unassigned",
+        }:
+            return val
+    return None
+
+
+def _match_owner_by_name(candidate: str, owners: list[Any]) -> Any | None:
+    c = candidate.strip().casefold()
+    if not c:
+        return None
+    for o in owners:
+        if str(getattr(o, "id", "")) == candidate.strip():
+            return o
+    for o in owners:
+        disp = getattr(o, "display_name", None)
+        if disp and disp.casefold() == c:
+            return o
+    for o in owners:
+        email = getattr(o, "email", None)
+        if email and email.casefold() == c:
+            return o
+    for o in owners:
+        fname = getattr(o, "first_name", None)
+        if fname and fname.casefold() == c:
+            return o
+        lname = getattr(o, "last_name", None)
+        if lname and lname.casefold() == c:
+            return o
+    for o in owners:
+        disp = getattr(o, "display_name", None)
+        tokens = [t.casefold() for t in (disp or "").split() if t]
+        if c in tokens:
+            return o
+    return None
 
 
 def _contact_search_text(validated: ValidatedExtraction) -> str:

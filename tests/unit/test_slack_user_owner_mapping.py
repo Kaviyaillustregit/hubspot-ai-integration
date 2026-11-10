@@ -985,3 +985,154 @@ async def test_company_industry_uses_discovered_options_when_available(agent, mo
     call_props = mock_tools.create_company.call_args[0][1]
     assert call_props["industry"] == "CUSTOM_DEV_SHOP"
 
+
+# ==============================================================================
+# CONTACT OWNER DISPLAY AND FILTERING REGRESSION TESTS
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_contact_list_resolves_owner_display_names(mock_tools, mock_safety):
+    """Contact retrieval resolves hubspot_owner_id into actual owner display names."""
+    rahul_owner = HubSpotOwner(id="owner_rahul_999", firstName="Rahul", lastName="Sharma", email="rahul@company.com")
+    amit_owner = HubSpotOwner(id="owner_amit_101", firstName="Amit", lastName="Kumar", email="amit@company.com")
+    mock_tools.list_owners = AsyncMock(return_value=[rahul_owner, amit_owner])
+    mock_tools.associated_records = AsyncMock(return_value=[])
+    mock_tools.hubspot_record_urls = AsyncMock(side_effect=lambda tenant_id, recs: [f"https://hubspot.test/{r_id}" for _, r_id in recs])
+
+    contacts = [
+        HubSpotContact(id="c1", properties={"firstname": "John", "lastname": "Doe", "email": "john@test.com", "hubspot_owner_id": "owner_rahul_999"}),
+        HubSpotContact(id="c2", properties={"firstname": "Jane", "lastname": "Smith", "email": "jane@test.com", "hubspot_owner_id": "owner_amit_101"}),
+        HubSpotContact(id="c3", properties={"firstname": "Bob", "lastname": "Lee", "email": "bob@test.com", "hubspot_owner_id": None}),
+        HubSpotContact(id="c4", properties={"firstname": "Alice", "lastname": "Wong", "email": "alice@test.com", "hubspot_owner_id": "88888888"}),
+    ]
+    mock_tools.list_all_contacts = AsyncMock(return_value=contacts)
+
+    ops = CRMOperations(mock_tools, mock_safety)
+    req = AgentRequest(tenant_id="tenant-a", actor_id="U_TEST", message="Show contacts", request_id="req-cont-list")
+    ext = CRMIntentExtraction(intent="crm_question", query="contact_list", confidence=1.0)
+    val = ValidatedExtraction(intent="crm_question", properties={}, company_name=None, contact_id=None)
+
+    resp = await ops.respond(req, ext, val, "idemp-key-1")
+
+    assert resp.status == "ok"
+    table_rows = resp.result["table"]["rows"]
+    assert len(table_rows) == 4
+    assert table_rows[0]["owner"] == "Rahul Sharma"
+    assert table_rows[1]["owner"] == "Amit Kumar"
+    assert table_rows[2]["owner"] == "Unassigned"
+    assert table_rows[3]["owner"] == "Owner not available"
+
+    # Verify Slack block rendering
+    enc = json.dumps(render_response_blocks(resp), ensure_ascii=False)
+    assert "*👤 Owner:* Rahul Sharma" in enc
+    assert "*👤 Owner:* Amit Kumar" in enc
+    assert "*👤 Owner:* Unassigned" in enc
+    assert "*👤 Owner:* Owner not available" in enc
+
+
+@pytest.mark.asyncio
+async def test_contact_details_resolves_owner_display_name(mock_tools, mock_safety):
+    """Detailed contact responses resolve hubspot_owner_id to owner name."""
+    rahul_owner = HubSpotOwner(id="owner_rahul_999", firstName="Rahul", lastName="Sharma", email="rahul@company.com")
+    mock_tools.list_owners = AsyncMock(return_value=[rahul_owner])
+    contact = HubSpotContact(
+        id="c-detail",
+        properties={"firstname": "Brian", "lastname": "Halligan", "email": "brian@hubspot.com", "hubspot_owner_id": "owner_rahul_999"},
+    )
+    mock_tools.resolve_contact = AsyncMock(return_value=type("Res", (), {"status": "found", "contact": contact, "candidates": [contact]})())
+    mock_tools.get_contact = AsyncMock(return_value=contact)
+    mock_tools.associated_records = AsyncMock(return_value=[])
+    mock_tools.hubspot_record_urls = AsyncMock(return_value=["https://hubspot.test/c-detail"])
+
+    ops = CRMOperations(mock_tools, mock_safety)
+    req = AgentRequest(tenant_id="tenant-a", actor_id="U_TEST", message="Show contact details for Brian Halligan", request_id="req-cont-detail")
+    ext = CRMIntentExtraction(intent="crm_question", query="contact_details", confidence=1.0)
+    val = ValidatedExtraction(intent="crm_question", properties={"firstname": "Brian", "lastname": "Halligan"}, company_name=None, contact_id="c-detail")
+
+    resp = await ops.respond(req, ext, val, "idemp-key-detail")
+
+    assert resp.status == "ok"
+    table_rows = resp.result["table"]["rows"]
+    assert len(table_rows) == 1
+    assert table_rows[0]["owner"] == "Rahul Sharma"
+
+    enc = json.dumps(render_response_blocks(resp), ensure_ascii=False)
+    assert "*👔 Owner:* Rahul Sharma" in enc
+
+
+@pytest.mark.asyncio
+async def test_contact_filtering_by_owner_name_rahul(mock_tools, mock_safety):
+    """Filtering contacts by owner name 'Rahul' returns only Rahul's contacts."""
+    rahul_owner = HubSpotOwner(id="owner_rahul_999", firstName="Rahul", lastName="Sharma", email="rahul@company.com")
+    amit_owner = HubSpotOwner(id="owner_amit_101", firstName="Amit", lastName="Kumar", email="amit@company.com")
+    mock_tools.list_owners = AsyncMock(return_value=[rahul_owner, amit_owner])
+    mock_tools.associated_records = AsyncMock(return_value=[])
+    mock_tools.hubspot_record_urls = AsyncMock(side_effect=lambda tenant_id, recs: [f"https://hubspot.test/{r_id}" for _, r_id in recs])
+
+    contacts = [
+        HubSpotContact(id="c1", properties={"firstname": "John", "lastname": "Doe", "email": "john@test.com", "hubspot_owner_id": "owner_rahul_999"}),
+        HubSpotContact(id="c2", properties={"firstname": "Jane", "lastname": "Smith", "email": "jane@test.com", "hubspot_owner_id": "owner_amit_101"}),
+    ]
+    mock_tools.list_all_contacts = AsyncMock(return_value=contacts)
+
+    ops = CRMOperations(mock_tools, mock_safety)
+    req = AgentRequest(tenant_id="tenant-a", actor_id="U_TEST", message="Show contacts owned by Rahul", request_id="req-filter-rahul")
+    ext = CRMIntentExtraction(intent="crm_question", query="contact_list", confidence=1.0)
+    val = ValidatedExtraction(intent="crm_question", properties={}, company_name=None, contact_id=None)
+
+    resp = await ops.respond(req, ext, val, "idemp-key-filter")
+
+    assert resp.status == "ok"
+    table_rows = resp.result["table"]["rows"]
+    assert len(table_rows) == 1
+    assert table_rows[0]["name"] == "John Doe"
+    assert table_rows[0]["owner"] == "Rahul Sharma"
+
+
+@pytest.mark.asyncio
+async def test_contact_filtering_by_owner_name_dynamic(mock_tools, mock_safety):
+    """Filtering contacts resolves owner name dynamically without hardcoding."""
+    sarah_owner = HubSpotOwner(id="owner_sarah_555", firstName="Sarah", lastName="Wilson", email="sarah@company.com")
+    amit_owner = HubSpotOwner(id="owner_amit_101", firstName="Amit", lastName="Kumar", email="amit@company.com")
+    mock_tools.list_owners = AsyncMock(return_value=[sarah_owner, amit_owner])
+    mock_tools.associated_records = AsyncMock(return_value=[])
+    mock_tools.hubspot_record_urls = AsyncMock(side_effect=lambda tenant_id, recs: [f"https://hubspot.test/{r_id}" for _, r_id in recs])
+
+    contacts = [
+        HubSpotContact(id="c1", properties={"firstname": "SarahContact", "lastname": "One", "email": "sc1@test.com", "hubspot_owner_id": "owner_sarah_555"}),
+        HubSpotContact(id="c2", properties={"firstname": "AmitContact", "lastname": "Two", "email": "ac2@test.com", "hubspot_owner_id": "owner_amit_101"}),
+    ]
+    mock_tools.list_all_contacts = AsyncMock(return_value=contacts)
+
+    ops = CRMOperations(mock_tools, mock_safety)
+    req = AgentRequest(tenant_id="tenant-a", actor_id="U_TEST", message="Show Sarah's contacts", request_id="req-filter-sarah")
+    ext = CRMIntentExtraction(intent="crm_question", query="contact_list", confidence=1.0)
+    val = ValidatedExtraction(intent="crm_question", properties={}, company_name=None, contact_id=None)
+
+    resp = await ops.respond(req, ext, val, "idemp-key-sarah")
+
+    assert resp.status == "ok"
+    table_rows = resp.result["table"]["rows"]
+    assert len(table_rows) == 1
+    assert table_rows[0]["name"] == "SarahContact One"
+    assert table_rows[0]["owner"] == "Sarah Wilson"
+
+
+def test_plan_crm_query_contact_owner_filter_extraction():
+    """plan_crm_query extracts hubspot_owner_id filter for contacts."""
+    from app.agent.crm_intelligence import plan_crm_query
+
+    plan1 = plan_crm_query("Show contacts owned by Rahul")
+    assert plan1.object == "contact"
+    assert any(f.field == "hubspot_owner_id" and f.value.casefold() == "rahul" for f in plan1.filters)
+
+    plan2 = plan_crm_query("Show Rahul's contacts")
+    assert plan2.object == "contact"
+    assert any(f.field == "hubspot_owner_id" and f.value.casefold() == "rahul" for f in plan2.filters)
+
+    plan3 = plan_crm_query("List contacts for owner Sarah")
+    assert plan3.object == "contact"
+    assert any(f.field == "hubspot_owner_id" and f.value.casefold() == "sarah" for f in plan3.filters)
+
+

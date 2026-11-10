@@ -831,6 +831,10 @@ class AccountIntelligenceAgent:
                 deterministic_plan.object in {"contact", "company"}
                 and (deterministic_plan.group_by is not None or deterministic_plan.chart_requested)
             )
+            or (
+                deterministic_plan.object in {"contact", "company"}
+                and any(f.field == "hubspot_owner_id" for f in deterministic_plan.filters)
+            )
             or re.search(
                 r"\btop\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
                 request.message,
@@ -1304,6 +1308,12 @@ class AccountIntelligenceAgent:
                 f"{exc} HubSpot property metadata permission ({metadata_scope}) is missing, "
                 "so only standard properties can be queried."
             ) from exc
+        # Resolve any owner name in filters dynamically to actual HubSpot owner ID
+        resolved_filters = await self._resolve_owner_filters(request.tenant_id, plan.filters)
+        if resolved_filters != plan.filters:
+            plan = plan.model_copy(update={"filters": resolved_filters})
+
+        known = {item.name for item in catalog}
         required = list(dict.fromkeys([
             *plan.properties,
             *(item.field for item in plan.filters),
@@ -1317,8 +1327,8 @@ class AccountIntelligenceAgent:
             *([plan.date_range.field] if plan.date_range else []),
             "name" if plan.object == "company" else "firstname",
             "lastname" if plan.object == "contact" else "name",
+            *(["hubspot_owner_id"] if "hubspot_owner_id" in known else []),
         ]))
-        known = {item.name for item in catalog}
         await _report_progress("Retrieving CRM data")
         records = await (
             self._tools.list_all_companies(
@@ -1562,6 +1572,71 @@ class AccountIntelligenceAgent:
 
         return None
 
+    async def _resolve_owner_filters(
+        self, tenant_id: str, filters: list[CRMIntelligenceFilter]
+    ) -> list[CRMIntelligenceFilter]:
+        has_owner_filter = any(f.field in {"hubspot_owner_id", "owner"} for f in filters)
+        if not has_owner_filter or not hasattr(self._tools, "list_owners"):
+            return filters
+        owners = []
+        try:
+            owners = await self._tools.list_owners(tenant_id)
+        except IntegrationError:
+            return filters
+        if not owners:
+            return filters
+
+        resolved: list[CRMIntelligenceFilter] = []
+        for f in filters:
+            if f.field in {"hubspot_owner_id", "owner"}:
+                val = str(f.value).strip()
+                if not val.isdigit():
+                    matched = None
+                    c = val.casefold()
+                    for o in owners:
+                        if str(getattr(o, "id", "")) == val:
+                            matched = o
+                            break
+                    if not matched:
+                        for o in owners:
+                            disp = getattr(o, "display_name", None)
+                            if disp and disp.casefold() == c:
+                                matched = o
+                                break
+                    if not matched:
+                        for o in owners:
+                            email = getattr(o, "email", None)
+                            if email and email.casefold() == c:
+                                matched = o
+                                break
+                    if not matched:
+                        for o in owners:
+                            fname = getattr(o, "first_name", None)
+                            if fname and fname.casefold() == c:
+                                matched = o
+                                break
+                            lname = getattr(o, "last_name", None)
+                            if lname and lname.casefold() == c:
+                                matched = o
+                                break
+                    if not matched:
+                        for o in owners:
+                            tokens = [t.casefold() for t in (getattr(o, "display_name", None) or "").split() if t]
+                            if c in tokens:
+                                matched = o
+                                break
+                    if matched:
+                        resolved.append(
+                            CRMIntelligenceFilter(
+                                field="hubspot_owner_id",
+                                operator=f.operator,
+                                value=str(matched.id),
+                            )
+                        )
+                        continue
+            resolved.append(f)
+        return resolved
+
     async def _resolve_owner_labels(self, tenant_id: str, rows: list[dict]) -> None:
         owner_ids = {
             str(row.get("hubspot_owner_id"))
@@ -1573,14 +1648,13 @@ class AccountIntelligenceAgent:
             for row in rows
             if row.get("owner") not in {None, ""}
         })
-        if not owner_ids:
-            return
         names: dict[str, str] = {}
-        try:
-            owners = await self._tools.list_owners(tenant_id)
-            names = {str(owner.id): owner.display_name for owner in owners or []}
-        except IntegrationError:
-            pass
+        if owner_ids and hasattr(self._tools, "list_owners"):
+            try:
+                owners = await self._tools.list_owners(tenant_id)
+                names = {str(owner.id): owner.display_name for owner in owners or []}
+            except IntegrationError:
+                pass
         for row in rows:
             for key in ("hubspot_owner_id", "owner"):
                 if key in row:
