@@ -2441,6 +2441,21 @@ def _render_record_card(
             line = f"\U0001F517 {link}"
             field_entries.append((key, str(raw_label), line, False))
             continue
+        elif key.endswith("_links") and isinstance(raw_value, list):
+            links = []
+            for association in raw_value:
+                if not isinstance(association, dict):
+                    continue
+                link = _slack_hubspot_link(association.get("url"))
+                if link in ("—", _MOJIBAKE_EM_DASH):
+                    continue
+                name = html.escape(str(association.get("name") or "Record"), quote=False)
+                links.append(link.replace("View in HubSpot", name))
+            displayed = ", ".join(links) if links else "Not available"
+            label = _decorate_field_label(record_type, key, str(raw_label))
+            line = f"*{label}:* {displayed}"
+            field_entries.append((key, str(raw_label), line, False))
+            continue
         else:
             is_stage_key = (
                 key.casefold() in {"stage", "dealstage", "deal_stage", "status", "dealstatus"}

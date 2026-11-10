@@ -1062,6 +1062,61 @@ async def test_contact_details_resolves_owner_display_name(mock_tools, mock_safe
 
 
 @pytest.mark.asyncio
+async def test_contact_details_resolves_associated_company_and_link(mock_tools, mock_safety):
+    """Contact details resolves associated company name and generates company HubSpot URL."""
+    rahul_owner = HubSpotOwner(id="owner_rahul_999", firstName="Rahul", lastName="Sharma", email="rahul@company.com")
+    mock_tools.list_owners = AsyncMock(return_value=[rahul_owner])
+    contact = HubSpotContact(
+        id="c-arun",
+        properties={"firstname": "Arun", "lastname": "Kumar", "email": "arun@example.com", "hubspot_owner_id": "owner_rahul_999"},
+    )
+    mock_tools.resolve_contact = AsyncMock(return_value=type("Res", (), {"status": "found", "contact": contact, "candidates": [contact]})())
+    mock_tools.get_contact = AsyncMock(return_value=contact)
+
+    cognizent_co = HubSpotCompany(id="co-cognizent", properties={"name": "Cognizent"})
+    deal_record = HubSpotDeal(id="deal-open-1", properties={"dealname": "Cloud Deal"})
+
+    async def mock_associated(tenant_id, from_type, from_id, to_type):
+        if to_type == "companies":
+            return [cognizent_co]
+        if to_type == "deals":
+            return [deal_record]
+        return []
+
+    mock_tools.associated_records = AsyncMock(side_effect=mock_associated)
+    mock_tools.hubspot_record_urls = AsyncMock(
+        side_effect=lambda tenant_id, recs: [f"https://app.hubspot.com/contacts/{tenant_id}/record/0-{'1' if r[0] == 'contacts' else '2'}/{r[1]}" for r in recs]
+    )
+
+    ops = CRMOperations(mock_tools, mock_safety)
+    req = AgentRequest(tenant_id="tenant-a", actor_id="U_TEST", message="Show Arun Kumar with his company and open deals", request_id="req-arun-details")
+    ext = CRMIntentExtraction(intent="crm_question", query="contact_details", confidence=1.0)
+    val = ValidatedExtraction(intent="crm_question", properties={"firstname": "Arun", "lastname": "Kumar"}, company_name=None, contact_id="c-arun")
+
+    resp = await ops.respond(req, ext, val, "idemp-key-arun")
+
+    assert resp.status == "ok"
+    table_rows = resp.result["table"]["rows"]
+    assert len(table_rows) == 1
+    row = table_rows[0]
+    assert row["name"] == "Arun Kumar"
+    assert row["company"] == "Cognizent"
+    assert row["associated_deals"] == "Cloud Deal"
+    assert row["associated_company_links"] == [{
+        "name": "Cognizent",
+        "url": "https://app.hubspot.com/contacts/tenant-a/record/0-2/co-cognizent",
+    }]
+    assert row["view_url"] == "https://app.hubspot.com/contacts/tenant-a/record/0-1/c-arun"
+
+    # Verify both company name and company link render in Slack mrkdwn blocks
+    enc = json.dumps(render_response_blocks(resp), ensure_ascii=False)
+    assert "*🏢 Associated Company:* Cognizent" in enc
+    assert "*🏢 Associated Company Link:* <https://app.hubspot.com/contacts/tenant-a/record/0-2/co-cognizent|Cognizent>" in enc
+    assert "<https://app.hubspot.com/contacts/tenant-a/record/0-1/c-arun|View in HubSpot>" in enc
+    assert "Cloud Deal" in enc
+
+
+@pytest.mark.asyncio
 async def test_contact_filtering_by_owner_name_rahul(mock_tools, mock_safety):
     """Filtering contacts by owner name 'Rahul' returns only Rahul's contacts."""
     rahul_owner = HubSpotOwner(id="owner_rahul_999", firstName="Rahul", lastName="Sharma", email="rahul@company.com")

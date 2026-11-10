@@ -1781,15 +1781,35 @@ class CRMOperations:
                         tenant_id, from_type="contacts", from_id=contact.id, to_type="companies"
                     )
                     associated_company = associated_companies[0] if associated_companies else None
+                    if associated_company is None:
+                        company_id = contact.properties.get("associatedcompanyid")
+                        if company_id:
+                            company = await self._tools.get_company(tenant_id, company_id)
+                            associated_company = HubSpotRecord(
+                                id=company.id, properties=company.properties
+                            )
                     deals = await self._tools.associated_records(
                         tenant_id, from_type="contacts", from_id=contact.id, to_type="deals"
                     )
+                    company_url = None
+                    if associated_company is not None:
+                        try:
+                            urls = await self._tools.hubspot_record_urls(
+                                tenant_id, [("companies", associated_company.id)]
+                            )
+                            company_url = urls[0] if urls else None
+                        except IntegrationError:
+                            pass
                     row = _contact_row(contact, None)
                     row["company"] = (
                         str(associated_company.properties.get("name") or "")
                         if associated_company
                         else ""
                     )
+                    row["associated_company_links"] = ([{
+                        "name": str(associated_company.properties.get("name") or associated_company.id),
+                        "url": company_url,
+                    }] if associated_company is not None and company_url else [])
                     row["associated_deals"] = ", ".join(
                         str(deal.properties.get("dealname") or deal.id) for deal in deals
                     )
