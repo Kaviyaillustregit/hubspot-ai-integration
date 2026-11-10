@@ -12,6 +12,7 @@ from typing import Literal
 from app.agent.crm_intelligence import (
     CRMIntelligencePlanner,
     CRMQueryPlan,
+    CRMIntelligenceFilter,
     _parse_decimal,
     _parse_hubspot_date,
     analyze_deals,
@@ -433,6 +434,28 @@ class AccountIntelligenceAgent:
             )
         )
 
+    @staticmethod
+    def _is_mql_sql_retrieval(message: str) -> bool:
+        if not re.search(
+            r"\b(?:mqls?|sqls?|marketing\s+qualified(?:\s+(?:leads?|contacts?))?|sales\s+qualified(?:\s+(?:leads?|contacts?))?)\b",
+            message,
+            re.IGNORECASE,
+        ):
+            return False
+        if re.search(
+            r"\b(?:update|change|set|modify|edit|put|assign|create|add|make|delete|remove|archive)\b",
+            message,
+            re.IGNORECASE,
+        ):
+            return False
+        if re.search(
+            r"\b(?:prioriti[sz]\w*|scor\w*|rank\w*|high[- ]potential|which\s+.{0,40}\b(?:contact|call|reach|focus))\b|^\s*(?:please\s+)?qualify\b|\bto\s+qualify\b",
+            message,
+            re.IGNORECASE,
+        ):
+            return False
+        return True
+
     async def _get_property_options(
         self, tenant_id: str, object_type: str, property_name: str
     ) -> list[dict[str, str]]:
@@ -758,7 +781,7 @@ class AccountIntelligenceAgent:
             return None
         non_deal_query = bool(
             re.search(
-                r"\b(?:contact|contacts|company|companies|leads?|prospects?|potential\s+customers?)\b",
+                r"\b(?:contact|contacts|company|companies|leads?|prospects?|potential\s+customers?|mqls?|sqls?|marketing\s+qualified|sales\s+qualified)\b",
                 request.message,
                 re.I,
             )
@@ -795,8 +818,10 @@ class AccountIntelligenceAgent:
             return None
         plan = self._recover_missing_date_range(plan, request.message)
         deterministic_plan = plan_crm_query(request.message)
+        is_mql_sql = self._is_mql_sql_retrieval(request.message)
         if (
             _LEAD_RETRIEVAL_REQUEST_PATTERN.search(request.message)
+            or is_mql_sql
             or re.search(r"\boverdue\b|\bactive\s+pipeline\b", request.message, re.I)
             or (
                 deterministic_plan.object == "deal"
@@ -813,6 +838,20 @@ class AccountIntelligenceAgent:
             )
         ):
             plan = deterministic_plan
+            if is_mql_sql:
+                target_stage = (
+                    "marketingqualifiedlead"
+                    if re.search(r"\b(?:mqls?|marketing\s+qualified)\b", request.message, re.I)
+                    else "salesqualifiedlead"
+                )
+                updated_filters = [
+                    f for f in plan.filters
+                    if f.field != "lifecyclestage"
+                ]
+                updated_filters.append(
+                    CRMIntelligenceFilter(field="lifecyclestage", operator="eq", value=target_stage)
+                )
+                plan = plan.model_copy(update={"object": "contact", "filters": updated_filters})
 
         catalog = []
         if plan.object in {"company", "contact"}:
@@ -1968,8 +2007,11 @@ class AccountIntelligenceAgent:
         if _DEAL_FOLLOW_UP_REQUEST_PATTERN.search(request.message):
             return await self._review_deals_for_follow_up(request)
 
+        is_mql_sql_retrieval = self._is_mql_sql_retrieval(request.message)
+
         if (
-            _LEAD_QUALIFICATION_REQUEST_PATTERN.search(request.message)
+            not is_mql_sql_retrieval
+            and _LEAD_QUALIFICATION_REQUEST_PATTERN.search(request.message)
             and self._parse_natural_contact_update(request) is None
             and not (
                 _CONTACT_CREATE_PATTERN.search(request.message)
@@ -1979,12 +2021,22 @@ class AccountIntelligenceAgent:
         ):
             return await self._qualify_leads(request)
 
-        if _LEAD_RETRIEVAL_REQUEST_PATTERN.search(request.message):
+        if _LEAD_RETRIEVAL_REQUEST_PATTERN.search(request.message) or is_mql_sql_retrieval:
+            target_stage = (
+                "marketingqualifiedlead"
+                if re.search(r"\b(?:mqls?|marketing\s+qualified)\b", request.message, re.I)
+                else (
+                    "salesqualifiedlead"
+                    if re.search(r"\b(?:sqls?|sales\s+qualified)\b", request.message, re.I)
+                    else None
+                )
+            )
             return await self._respond_to_extraction(
                 request,
                 CRMIntentExtraction(
                     intent="crm_question", query="contact_list", confidence=1.0,
                     question=request.message,
+                    lifecycle_stage=target_stage,
                 ),
             )
 
@@ -2242,7 +2294,10 @@ class AccountIntelligenceAgent:
         if extraction.intent == "crm_question" and extraction.query == "deal_follow_up":
             return await self._review_deals_for_follow_up(request)
         if extraction.intent == "crm_question" and extraction.query == "lead_qualification":
-            return await self._qualify_leads(request)
+            if self._is_mql_sql_retrieval(request.message):
+                extraction = extraction.model_copy(update={"query": "contact_list"})
+            else:
+                return await self._qualify_leads(request)
 
         # Companies, deals and links between records; contact-only requests continue below.
         if CRMOperations.handles(extraction, validated):

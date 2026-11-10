@@ -671,3 +671,28 @@ async def test_company_mentioned_only_inside_an_email_is_not_grounded():
     assert result.status == "invalid_request"
     assert companies.queries == []
     assert contacts.created == []
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "Show marketing qualified leads",
+        "List sales qualified leads",
+        "Show MQL contacts",
+        "List MQLs",
+        "Show SQLs",
+        "Get marketing qualified leads",
+        "List SQL contacts",
+    ],
+)
+@pytest.mark.asyncio
+async def test_mql_sql_queries_route_to_contact_retrieval_not_lead_qualification(msg):
+    contacts = FakeContacts()
+    agent, provider, _, _, _ = build(
+        extraction("crm_question", query="contact_list"),
+        contacts=contacts,
+    )
+    result = await agent.respond(request(msg))
+    assert (result.result or {}).get("kind") != "lead_qualification"
+    assert "AI LEAD QUALIFICATION" not in result.text
+

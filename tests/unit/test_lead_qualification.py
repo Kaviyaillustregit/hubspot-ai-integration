@@ -271,6 +271,13 @@ async def test_registry_limited_listing_stops_at_limit_and_uses_tenant():
     [
         "Find deals that need follow-up and prepare recommended actions.",
         "Create a contact named Jane Doe",
+        "Show marketing qualified leads",
+        "List sales qualified leads",
+        "Show MQL contacts",
+        "List MQLs",
+        "Show SQLs",
+        "Get marketing qualified leads",
+        "List SQL contacts",
     ],
 )
 async def test_other_requests_do_not_route_to_lead_qualification(message):
@@ -284,6 +291,21 @@ async def test_other_requests_do_not_route_to_lead_qualification(message):
         async def deal_pipelines(self, tenant_id):
             return []
 
+        async def list_all_contacts(self, tenant_id, *, properties=None):
+            return []
+
+        async def search_contacts(self, tenant_id, query):
+            return []
+
+        async def associated_records(self, tenant_id, **kwargs):
+            return []
+
+        async def hubspot_record_urls(self, tenant_id, records):
+            return []
+
+        async def list_owners(self, tenant_id):
+            return []
+
     provider = LeadProvider()
     try:
         response = await make_agent(NoLeadTools([]), provider).respond(req(message))
@@ -292,3 +314,21 @@ async def test_other_requests_do_not_route_to_lead_qualification(message):
     except Exception:
         return  # unrelated paths may need services not mocked here
     assert (response.result or {}).get("kind") != "lead_qualification"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Score my MQL leads",
+        "Prioritize our MQL leads",
+        "Qualify our MQL leads please",
+        "Which leads should I contact first?",
+    ],
+)
+async def test_genuine_lead_qualification_for_mql_still_routes(message):
+    tools = LeadTools([contact("1", **STRONG)], {"1": ["c1"]})
+    provider = LeadProvider()
+    response = await make_agent(tools, provider).respond(req(message))
+    assert response.result is not None
+    assert response.result["kind"] == "lead_qualification"
