@@ -95,6 +95,8 @@ COMPANY_PROPERTY_FIELDS: dict[str, str] = {
     "company_website": "website",
     "company_phone": "phone",
     "company_city": "city",
+    "company_country": "country",
+    "company_industry": "industry",
     "company_employees": "numberofemployees",
 }
 
@@ -262,9 +264,26 @@ def validate_extraction(
         raise ExtractionValidationError("contact_id", contact_id, "invalid_format")
     company_properties: dict[str, str] = {}
     for name, property_name in COMPANY_PROPERTY_FIELDS.items():
-        value = _grounded(without_emails, name, getattr(extraction, name))
+        value = _grounded(without_emails, name, getattr(extraction, name, None))
         if value is not None:
             company_properties[property_name] = value
+
+    if extraction.intent == "create_company" or (
+        extraction.company_action == "create" and not extraction.contact_action
+    ):
+        for prop in ("phone", "city", "country", "industry", "state", "website", "address"):
+            if prop in properties and prop not in company_properties:
+                company_properties[prop] = properties.pop(prop)
+        for field_name, prop_name in (
+            ("industry", "industry"),
+            ("country", "country"),
+            ("city", "city"),
+            ("phone", "phone"),
+        ):
+            if prop_name not in company_properties and getattr(extraction, field_name, None):
+                grounded_v = _grounded(without_emails, field_name, getattr(extraction, field_name))
+                if grounded_v is not None:
+                    company_properties[prop_name] = grounded_v
     for name in ("domain", "website"):
         value = company_properties.get(name)
         if value is not None and not _DOMAIN.fullmatch(value):

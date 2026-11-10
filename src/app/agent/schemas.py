@@ -179,7 +179,10 @@ class CRMIntentExtraction(BaseModel):
     company_website: str | None = Field(default=None, max_length=500)
     company_phone: str | None = Field(default=None, max_length=50)
     company_city: str | None = Field(default=None, max_length=100)
+    company_country: str | None = Field(default=None, max_length=100)
+    company_industry: str | None = Field(default=None, max_length=200)
     company_employees: str | None = Field(default=None, max_length=9)
+    industry: str | None = Field(default=None, max_length=200)
     # Deal fields. Amount, stage and pipeline are kept exactly as written.
     deal_name: str | None = Field(default=None, max_length=200)
     deal_amount: str | None = Field(default=None, max_length=50)

@@ -2192,8 +2192,17 @@ def _entity_actions(
     implied = _IMPLIED_ACTION.get(extraction.intent)
     if implied is not None and actions[implied[0]] is None:
         actions[implied[0]] = implied[1]
+    contact_mentioned = bool(
+        validated.contact_id
+        or ({"firstname", "lastname", "email"} & validated.properties.keys())
+        or (
+            validated.properties
+            and extraction.intent != "create_company"
+            and actions.get("company") != "create"
+        )
+    )
     mentioned: dict[Entity, bool] = {
-        "contact": bool(validated.properties or validated.contact_id),
+        "contact": contact_mentioned,
         "company": validated.company_name is not None,
         "deal": validated.deal_name is not None,
     }

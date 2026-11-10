@@ -766,3 +766,119 @@ async def test_combined_company_contact_deal_creation_shares_target_owner(mock_t
     assert mock_tools.create_company.call_args[0][1]["hubspot_owner_id"] == "owner_amit_101"
     assert mock_tools.create_contact.call_args[0][1]["hubspot_owner_id"] == "owner_amit_101"
     assert mock_tools.create_deal.call_args[0][1]["hubspot_owner_id"] == "owner_amit_101"
+
+
+# ==============================================================================
+# Detailed & simple company creation intent-routing tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_detailed_company_creation_extracts_all_fields_and_assigns_owner(agent, mock_tools):
+    """Detailed company creation extracts phone, city, country, industry, assigns owner, and never asks for contact."""
+    agent._ai_service.generate.side_effect = Exception("Use rule parser")
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-detailed-1", properties=dict(props))
+
+    message = (
+        "Create company named Owner Test Google Chennai with phone 3456765434, "
+        "city Chennai, country India, and industry Software and Development."
+    )
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message=message,
+        request_id="req-detailed-comp",
+    )
+
+    resp = await agent.respond(req)
+
+    assert resp.status == "ok"
+    assert "Which contact?" not in resp.text
+    assert "Owner Test Google Chennai" in resp.text
+    assert resp.result["owner_id"] == "owner_amit_101"
+    assert resp.result["owner_name"] == "Amit Kumar"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["name"] == "Owner Test Google Chennai"
+    assert call_props["phone"] == "3456765434"
+    assert call_props["city"] == "Chennai"
+    assert call_props["country"] == "India"
+    assert call_props["industry"] == "Software and Development"
+    assert call_props["hubspot_owner_id"] == "owner_amit_101"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Amit Kumar" in encoded
+
+
+@pytest.mark.asyncio
+async def test_simple_company_creation_preserves_behavior(agent, mock_tools):
+    """Simple company creation preserves existing working behavior."""
+    agent._ai_service.generate.side_effect = Exception("Use rule parser")
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-simple-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_VIKAS",
+        actor_email="vikas@company.com",
+        message="create company name with Google",
+        request_id="req-simple-comp",
+    )
+
+    resp = await agent.respond(req)
+
+    assert resp.status == "ok"
+    assert "Which contact?" not in resp.text
+    assert resp.result["owner_id"] == "owner_vikas_103"
+    assert resp.result["owner_name"] == "Vikas Kumar"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert "Google" in call_props["name"]
+    assert call_props["hubspot_owner_id"] == "owner_vikas_103"
+
+
+@pytest.mark.asyncio
+async def test_ai_extracted_detailed_company_creation(agent, mock_tools):
+    """When AI service returns create_company extraction with fields, company is created with properties and owner."""
+    extracted = CRMIntentExtraction(
+        intent="create_company",
+        company_name="Owner Test Google Chennai",
+        phone="3456765434",
+        city="Chennai",
+        country="India",
+        industry="Software and Development",
+        company_action="create",
+        confidence=0.98,
+    )
+    agent._ai_service.generate.return_value = extracted
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-ai-1", properties=dict(props))
+
+    message = (
+        "Create company named Owner Test Google Chennai with phone 3456765434, "
+        "city Chennai, country India, and industry Software and Development."
+    )
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_KAVIYA",
+        actor_email="kaviya@company.com",
+        message=message,
+        request_id="req-ai-comp",
+    )
+
+    resp = await agent.respond(req)
+
+    assert resp.status == "ok"
+    assert "Which contact?" not in resp.text
+    assert resp.result["owner_id"] == "owner_kaviya_102"
+    assert resp.result["owner_name"] == "Kaviya Murugan"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["name"] == "Owner Test Google Chennai"
+    assert call_props["phone"] == "3456765434"
+    assert call_props["city"] == "Chennai"
+    assert call_props["country"] == "India"
+    assert call_props["industry"] == "Software and Development"
+    assert call_props["hubspot_owner_id"] == "owner_kaviya_102"

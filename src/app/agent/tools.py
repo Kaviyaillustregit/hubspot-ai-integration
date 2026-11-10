@@ -29,6 +29,7 @@ COMPANY_PROPERTIES = (
     "hubspot_owner_id",
     "phone",
     "city",
+    "country",
     "industry",
     "numberofemployees",
     "lifecyclestage",

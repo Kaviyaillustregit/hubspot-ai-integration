@@ -2122,6 +2122,10 @@ class AccountIntelligenceAgent:
                     "first_name": explicit_create.first_name or extraction.first_name,
                     "last_name": explicit_create.last_name or extraction.last_name,
                     "company_name": explicit_create.company_name or extraction.company_name,
+                    "company_phone": explicit_create.company_phone or extraction.company_phone,
+                    "company_city": explicit_create.company_city or extraction.company_city,
+                    "company_country": explicit_create.company_country or extraction.company_country,
+                    "company_industry": explicit_create.company_industry or extraction.company_industry,
                     "email": explicit_create.email or extraction.email,
                     "query": None,
                     "question": None,
@@ -3771,6 +3775,24 @@ class AccountIntelligenceAgent:
             first_name = parts[0]
             last_name = parts[1] if len(parts) > 1 else None
 
+        company_phone = None
+        company_city = None
+        company_country = None
+        company_industry = None
+        if entity == "company":
+            phone_m = re.search(r"\b(?:phone|phone\s+number|tel)\s*[:=]?\s*([+\d\s()-]{5,})", details, re.I)
+            if phone_m:
+                company_phone = phone_m.group(1).strip(" ,;.")
+            city_m = re.search(r"\bcity\s*[:=]?\s*([a-zA-Z\s]+?)(?=\s*(?:[.,;!?]|$|\b(?:country|state|industry|phone|website|domain)\b))", details, re.I)
+            if city_m:
+                company_city = city_m.group(1).strip(" ,;.")
+            country_m = re.search(r"\bcountry\s*[:=]?\s*([a-zA-Z\s]+?)(?=\s*(?:[.,;!?]|$|\b(?:city|state|industry|phone|website|domain)\b))", details, re.I)
+            if country_m:
+                company_country = country_m.group(1).strip(" ,;.")
+            industry_m = re.search(r"\bindustry\s*[:=]?\s*([a-zA-Z0-9\s&/-]+?)(?=\s*(?:[.,;!?]|$|\b(?:city|country|state|phone|website|domain)\b)[?,]?)", details, re.I)
+            if industry_m:
+                company_industry = industry_m.group(1).strip(" ,;.")
+
         return CRMIntentExtraction(
             intent="create_company" if entity == "company" else "create_contact",
             confidence=0.95,
@@ -3778,6 +3800,10 @@ class AccountIntelligenceAgent:
             last_name=last_name,
             email=email_match.group(0) if email_match else None,
             company_name=name if entity == "company" else None,
+            company_phone=company_phone,
+            company_city=company_city,
+            company_country=company_country,
+            company_industry=company_industry,
             company_action="create" if entity == "company" else None,
             contact_action="create" if entity == "contact" else None,
         )
