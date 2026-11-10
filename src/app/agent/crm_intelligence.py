@@ -604,7 +604,7 @@ def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilt
         capture(r"\b([a-z0-9_\-]+)\'s\s+(?:contacts?|deals?|leads?|opportunities|records?)\b")
         or capture(
             r"\b(?:owned\s+by|assigned\s+to\s*(?:owner)?|owner\s*(?:is|equals?|=|:)?|(?:contacts?|deals?|leads?)\s+of)\s+"
-            r"([a-z0-9_\-\. ]+?)(?=\s+(?:and|with|for|in|over|under|stage|pipeline|created|amount|as|chart|graph)\b|[,;?.!]|\s*$)"
+            r"([a-z0-9_\-\. ]+?)(?=\s+(?:and|with|for|in|over|under|stage|pipeline|created|amount|as|chart|graph|that|which|who|were|was|are|is)\b|[,;?.!]|\s*$)"
         )
         or capture(r"\bowner(?:\s+id)?\s*(?:(?:is|equals?|=|:)\s*)?(\d+)\b")
         or capture(r"\bassigned\s+to\s+(?:owner\s+)?(\d+)\b")

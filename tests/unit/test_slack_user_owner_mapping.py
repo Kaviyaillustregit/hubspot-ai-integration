@@ -1190,4 +1190,31 @@ def test_plan_crm_query_contact_owner_filter_extraction():
     assert plan3.object == "contact"
     assert any(f.field == "hubspot_owner_id" and f.value.casefold() == "sarah" for f in plan3.filters)
 
+    plan4 = plan_crm_query("Which contacts owned by Rahul were created this month?")
+    assert plan4.object == "contact"
+    assert any(f.field == "hubspot_owner_id" and f.value == "rahul" for f in plan4.filters)
+    assert plan4.date_range is not None
+
+
+@pytest.mark.asyncio
+async def test_unknown_owner_rahul_triggers_zero_contact_searches(mock_tools, mock_safety):
+    """When an owner like Rahul cannot be resolved, stop immediately with zero contact searches."""
+    kaviya_owner = HubSpotOwner(id="owner_kaviya_102", firstName="Kaviya", lastName="Murugan", email="kaviya@company.com")
+    mock_tools.list_owners = AsyncMock(return_value=[kaviya_owner])
+    mock_tools.list_all_contacts = AsyncMock(return_value=[])
+    mock_tools.search_contacts = AsyncMock(return_value=[])
+
+    ops = CRMOperations(mock_tools, mock_safety)
+    req = AgentRequest(tenant_id="tenant-a", actor_id="U_TEST", message="Which contacts owned by Rahul were created this month?", request_id="req-unknown-rahul")
+    ext = CRMIntentExtraction(intent="crm_question", query="contact_list", confidence=1.0)
+    val = ValidatedExtraction(intent="crm_question", properties={}, company_name=None, contact_id=None)
+
+    resp = await ops.respond(req, ext, val, "idemp-key-unknown-rahul")
+
+    assert resp.status == "ok"
+    assert resp.text == "Rahul is not a HubSpot owner in this account. No contacts can be retrieved for this owner."
+    assert mock_tools.list_all_contacts.call_count == 0
+    assert mock_tools.search_contacts.call_count == 0
+
+
 

@@ -1581,33 +1581,48 @@ class CRMOperations:
                     raise OperationError(
                         "missing_fields", "Which contact? Please include a name or email."
                     )
-                contacts = (
-                    await self._tools.list_all_contacts(tenant_id)
-                    if query == "contact_list"
-                    else await self._tools.search_contacts(tenant_id, search_text)
-                )
                 owner_target = (
                     validated.properties.get("hubspot_owner_id")
                     or validated.properties.get("owner")
                     or _extract_owner_from_text(request.message)
                 )
+                matched_owner_id = None
                 if owner_target and hasattr(self._tools, "list_owners"):
                     try:
                         all_owners = await self._tools.list_owners(tenant_id)
                         matched = _match_owner_by_name(owner_target, all_owners or [])
                         if matched:
                             matched_owner_id = str(matched.id)
-                            contacts = [
-                                c for c in contacts
-                                if str(c.properties.get("hubspot_owner_id") or "") == matched_owner_id
-                            ]
                         elif owner_target.isdigit():
-                            contacts = [
-                                c for c in contacts
-                                if str(c.properties.get("hubspot_owner_id") or "") == owner_target
-                            ]
+                            matched_owner_id = owner_target
+                        else:
+                            owner_disp = owner_target.strip().title() if owner_target.strip().islower() else owner_target.strip()
+                            return AgentResponse(
+                                status="ok",
+                                text=f"{owner_disp} is not a HubSpot owner in this account. No contacts can be retrieved for this owner.",
+                                request_id=request.request_id,
+                                tools_used=["list_owners"],
+                                result={
+                                    "kind": "crm_records",
+                                    "title": "Contacts",
+                                    "total": 0,
+                                    "matched_records": 0,
+                                    "table": {"columns": [], "rows": []},
+                                    "records": [],
+                                },
+                            )
                     except IntegrationError:
                         pass
+                contacts = (
+                    await self._tools.list_all_contacts(tenant_id)
+                    if query == "contact_list"
+                    else await self._tools.search_contacts(tenant_id, search_text)
+                )
+                if matched_owner_id is not None:
+                    contacts = [
+                        c for c in contacts
+                        if str(c.properties.get("hubspot_owner_id") or "") == matched_owner_id
+                    ]
                 async def contact_enrichment(
                     contact: HubSpotContact,
                 ) -> tuple[str, HubSpotRecord | None, str, str | None]:
@@ -2878,7 +2893,7 @@ def _extract_owner_from_text(text: str) -> str | None:
             return val
     m = re.search(
         r"\b(?:owned\s+by|assigned\s+to\s*(?:owner)?|owner\s*(?:is|equals?|=|:)?|(?:contacts?|deals?|leads?)\s+of)\s+"
-        r"([A-Za-z0-9_\-\. ]+?)(?=\s+(?:and|with|for|in|over|under|stage|pipeline|created|amount|as|chart|graph)\b|[,;?.!]|\s*$)",
+        r"([A-Za-z0-9_\-\. ]+?)(?=\s+(?:and|with|for|in|over|under|stage|pipeline|created|amount|as|chart|graph|that|which|who|were|was|are|is)\b|[,;?.!]|\s*$)",
         norm,
         re.I,
     )

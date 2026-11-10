@@ -73,6 +73,12 @@ from app.integrations.hubspot.owners import HubSpotOwner
 from app.integrations.hubspot.properties import HubSpotPropertyDefinition
 from app.services.action_safety import ActionSafetyService
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
+
+
+class UnknownHubSpotOwnerError(Exception):
+    def __init__(self, owner_name: str) -> None:
+        super().__init__(owner_name)
+        self.owner_name = owner_name
 from app.services.quickchart import build_chart_config, generate_chart_url
 from app.services.slack_owner_mapping import resolve_slack_user_hubspot_owner
 
@@ -1309,7 +1315,24 @@ class AccountIntelligenceAgent:
                 "so only standard properties can be queried."
             ) from exc
         # Resolve any owner name in filters dynamically to actual HubSpot owner ID
-        resolved_filters = await self._resolve_owner_filters(request.tenant_id, plan.filters)
+        try:
+            resolved_filters = await self._resolve_owner_filters(request.tenant_id, plan.filters)
+        except UnknownHubSpotOwnerError as exc:
+            owner_name = exc.owner_name
+            record_type = "contacts" if plan.object == "contact" else "companies"
+            return AgentResponse(
+                status="ok",
+                text=f"{owner_name} is not a HubSpot owner in this account. No {record_type} can be retrieved for this owner.",
+                request_id=request.request_id,
+                tools_used=["list_owners"],
+                result={
+                    "kind": "unresolved_owner",
+                    "owner": owner_name,
+                    "matched_records": 0,
+                    "total": 0,
+                    "rows": [],
+                },
+            )
         if resolved_filters != plan.filters:
             plan = plan.model_copy(update={"filters": resolved_filters})
 
@@ -1583,8 +1606,6 @@ class AccountIntelligenceAgent:
             owners = await self._tools.list_owners(tenant_id)
         except IntegrationError:
             return filters
-        if not owners:
-            return filters
 
         resolved: list[CRMIntelligenceFilter] = []
         for f in filters:
@@ -1593,24 +1614,24 @@ class AccountIntelligenceAgent:
                 if not val.isdigit():
                     matched = None
                     c = val.casefold()
-                    for o in owners:
+                    for o in owners or []:
                         if str(getattr(o, "id", "")) == val:
                             matched = o
                             break
                     if not matched:
-                        for o in owners:
+                        for o in owners or []:
                             disp = getattr(o, "display_name", None)
                             if disp and disp.casefold() == c:
                                 matched = o
                                 break
                     if not matched:
-                        for o in owners:
+                        for o in owners or []:
                             email = getattr(o, "email", None)
                             if email and email.casefold() == c:
                                 matched = o
                                 break
                     if not matched:
-                        for o in owners:
+                        for o in owners or []:
                             fname = getattr(o, "first_name", None)
                             if fname and fname.casefold() == c:
                                 matched = o
@@ -1620,7 +1641,7 @@ class AccountIntelligenceAgent:
                                 matched = o
                                 break
                     if not matched:
-                        for o in owners:
+                        for o in owners or []:
                             tokens = [t.casefold() for t in (getattr(o, "display_name", None) or "").split() if t]
                             if c in tokens:
                                 matched = o
@@ -1634,6 +1655,9 @@ class AccountIntelligenceAgent:
                             )
                         )
                         continue
+                    else:
+                        raw_name = val.title() if val.islower() else val
+                        raise UnknownHubSpotOwnerError(raw_name)
             resolved.append(f)
         return resolved
 
