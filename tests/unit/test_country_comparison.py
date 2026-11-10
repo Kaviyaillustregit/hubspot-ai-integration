@@ -265,3 +265,56 @@ async def test_agent_filters_contacts_by_lead_status_in_progress():
     assert all(r["hs_lead_status"] == "IN_PROGRESS" for r in rows)
 
 
+
+
+def test_plan_three_country_comparison_query():
+    plan = plan_crm_query("How many contacts do we have in India vs US vs China?")
+    assert plan.object == "contact"
+    assert plan.group_by == "country"
+    assert plan.chart_requested is True
+    assert plan.chart_type == "bar"
+    assert "country" in plan.properties
+    country_filter = next(f for f in plan.filters if f.field == "country" and f.operator == "in")
+    vals = country_filter.value.split(",")
+    assert "india" in vals
+    assert "us" in vals
+    assert "china" in vals
+
+
+@pytest.mark.asyncio
+async def test_agent_three_country_comparison_with_zero_count():
+    contacts = [
+        HubSpotContact(id=f"in-{i}", properties={"firstname": f"IndiaUser{i}", "country": "India"})
+        for i in range(4)
+    ] + [
+        HubSpotContact(id=f"us-{i}", properties={"firstname": f"USUser{i}", "country": "US"})
+        for i in range(2)
+    ]
+    # 0 contacts in China
+    agent = make_test_agent(contacts=contacts)
+    response = await agent.respond(ask("How many contacts do we have in India vs US vs China?"))
+
+    assert response.status == "ok"
+    result = response.result
+    assert result.get("chart_title") == "Contacts by Country"
+    assert result.get("chart_type") == "bar"
+
+    chart_data = result["chart"]["data"]
+    labels = chart_data["labels"]
+    values = chart_data["datasets"][0]["data"]
+    assert "China" in labels
+    assert "India" in labels
+    assert "US" in labels
+    assert values[labels.index("China")] == 0.0
+    assert values[labels.index("India")] == 4.0
+    assert values[labels.index("US")] == 2.0
+
+    blocks = render_response_blocks(response)
+    blocks_str = str(blocks)
+    assert "Contacts by Country" in blocks_str
+    assert "China" in blocks_str
+    assert "India" in blocks_str
+    assert "US" in blocks_str
+    assert "*4* contacts" in blocks_str
+    assert "*2* contacts" in blocks_str
+    assert "*6* contacts" in blocks_str

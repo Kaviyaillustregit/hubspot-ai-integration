@@ -391,15 +391,9 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
             if field in _FIELD_ALIASES.get(object_name, {}).values():
                 return field or None
     if object_name in {"company", "contact"}:
-        comparison_geo = re.search(
-            r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
-            text,
-        )
-        if comparison_geo:
-            c1 = comparison_geo.group(1).strip().casefold()
-            c2 = comparison_geo.group(2).strip().casefold()
-            if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
-                return "country"
+        countries = _extract_comparison_countries(text)
+        if len(countries) >= 2 or (countries and "country" in text):
+            return "country"
     return None
 
 
@@ -439,6 +433,27 @@ def _country_variants(country: str) -> list[str]:
     if c in {"uae", "united arab emirates"}:
         return ["uae", "united arab emirates"]
     return [c]
+
+
+def _extract_comparison_countries(text: str) -> list[str]:
+    m = re.search(
+        r"\b(?:in|from)\s+([a-zA-Z\s,]+?(?:\s+(?:vs|versus|\band\b|,)\s+[a-zA-Z\s,]+?)+)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
+        text,
+        re.I,
+    ) or re.search(
+        r"\b([a-zA-Z\s,]+?(?:\s+(?:vs|versus)\s+[a-zA-Z\s,]+?)+)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
+        text,
+        re.I,
+    )
+    if not m:
+        return []
+    parts = re.split(r"\b(?:vs|versus|\band\b|,)\b", m.group(1), flags=re.I)
+    countries: list[str] = []
+    for p in parts:
+        cleaned = re.sub(r"^(?:the|in|from)\s+", "", p.strip(), flags=re.I).strip().casefold()
+        if cleaned in _COMMON_COUNTRIES and cleaned not in countries:
+            countries.append(cleaned)
+    return countries
 
 
 def _extract_sort_fields(message: str, object_name: str) -> list[CRMIntelligenceSort]:
@@ -621,16 +636,14 @@ def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilt
             filters.append(CRMIntelligenceFilter(field="hubspot_owner_id", value=val))
 
     if object_name in {"contact", "company"}:
-        comparison_geo = re.search(
-            r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
-            text,
-        )
-        if comparison_geo:
-            c1 = comparison_geo.group(1).strip().casefold()
-            c2 = comparison_geo.group(2).strip().casefold()
-            if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
-                variants = list(dict.fromkeys(_country_variants(c1) + _country_variants(c2)))
-                filters.append(CRMIntelligenceFilter(field="country", operator="in", value=",".join(variants)))
+        countries = _extract_comparison_countries(text)
+        if len(countries) >= 2 or (countries and "country" in text):
+            variants = []
+            for c in countries:
+                for v in _country_variants(c):
+                    if v not in variants:
+                        variants.append(v)
+            filters.append(CRMIntelligenceFilter(field="country", operator="in", value=",".join(variants)))
 
     if object_name == "contact":
         all_status_query = bool(re.search(r"\b(?:across\s+(?:all\s+)?lead\s+statuses|all\s+lead\s+statuses)\b", text))
@@ -1108,15 +1121,9 @@ def _resolve_property_candidates(message: str, object_name: str) -> list[str]:
         candidates.extend(["firstname", "lastname", "email", "jobtitle", "city"])
         if re.search(r"\b(?:creat(?:ed|ion)|createdate|latest|newest|last|recent)\b", text):
             candidates.append("createdate")
-        geo = re.search(
-            r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
-            text,
-        )
-        if geo:
-            c1 = geo.group(1).strip().casefold()
-            c2 = geo.group(2).strip().casefold()
-            if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
-                candidates.append("country")
+        countries = _extract_comparison_countries(text)
+        if len(countries) >= 2 or (countries and "country" in text):
+            candidates.append("country")
         elif re.search(r"\b(?:country|countries|nation|nations)\b", text):
             candidates.append("country")
         if "owner" in text:

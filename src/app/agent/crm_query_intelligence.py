@@ -219,6 +219,23 @@ def execute_record_query(
 
     if plan.group_by:
         buckets: dict[str, list[Any]] = defaultdict(list)
+        if plan.group_by == "country":
+            for f in plan.filters:
+                if f.field == "country" and f.operator == "in":
+                    for raw_item in str(f.value).split(","):
+                        item_lower = raw_item.strip().casefold()
+                        if not item_lower:
+                            continue
+                        if item_lower in {"us", "usa", "united states", "united states of america"}:
+                            canon = "US"
+                        elif item_lower in {"uk", "united kingdom", "great britain"}:
+                            canon = "UK"
+                        elif item_lower in {"uae", "united arab emirates"}:
+                            canon = "UAE"
+                        else:
+                            canon = raw_item.strip().title()
+                        if canon not in buckets:
+                            buckets[canon] = []
         for record in matched:
             raw = value(record, plan.group_by)
             if plan.group_by in {"month", "quarter", "year"}:
