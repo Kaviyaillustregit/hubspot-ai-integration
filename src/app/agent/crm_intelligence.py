@@ -414,6 +414,21 @@ _COMMON_COUNTRIES = {
     "united states of america", "us", "usa", "vietnam",
 }
 
+_LEAD_STATUS_MAP: dict[str, str] = {
+    "attempted to contact": "ATTEMPTED_TO_CONTACT",
+    "attempted_to_contact": "ATTEMPTED_TO_CONTACT",
+    "open deal": "OPEN_DEAL",
+    "open_deal": "OPEN_DEAL",
+    "in progress": "IN_PROGRESS",
+    "in_progress": "IN_PROGRESS",
+    "bad timing": "BAD_TIMING",
+    "bad_timing": "BAD_TIMING",
+    "unqualified": "UNQUALIFIED",
+    "connected": "CONNECTED",
+    "open": "OPEN",
+    "new": "NEW",
+}
+
 
 def _country_variants(country: str) -> list[str]:
     c = country.strip().casefold()
@@ -616,6 +631,24 @@ def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilt
             if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
                 variants = list(dict.fromkeys(_country_variants(c1) + _country_variants(c2)))
                 filters.append(CRMIntelligenceFilter(field="country", operator="in", value=",".join(variants)))
+
+    if object_name == "contact":
+        all_status_query = bool(re.search(r"\b(?:across\s+(?:all\s+)?lead\s+statuses|all\s+lead\s+statuses)\b", text))
+        if not all_status_query:
+            status_match = None
+            for phrase, enum_val in _LEAD_STATUS_MAP.items():
+                if re.search(rf"\b{phrase}\b", text):
+                    if re.search(r"\b(?:lead\s+status|status)\b", text) or phrase in {
+                        "attempted to contact", "attempted_to_contact",
+                        "open deal", "open_deal",
+                        "in progress", "in_progress",
+                        "bad timing", "bad_timing",
+                        "unqualified",
+                    }:
+                        status_match = enum_val
+                        break
+            if status_match:
+                filters.append(CRMIntelligenceFilter(field="hs_lead_status", operator="eq", value=status_match))
     return filters
 
 
@@ -942,8 +975,13 @@ def plan_crm_query(message: str) -> CRMQueryPlan:
                 and item.value.casefold() in {"open", "won", "lost", "closed"}
             )
         ]
-    if object_name == "contact" and re.search(
-        r"\b(?:leads?|potential\s+customers?|prospects?)\b", _normalise_text(message)
+    has_lead_status_filter = any(f.field == "hs_lead_status" for f in filters)
+    is_lead_status_query = bool(re.search(r"\blead\s+status(?:es)?\b", normalized_message))
+    if (
+        object_name == "contact"
+        and not has_lead_status_filter
+        and not is_lead_status_query
+        and re.search(r"\b(?:leads?|potential\s+customers?|prospects?)\b", normalized_message)
     ):
         filters = [
             *filters,
@@ -1083,7 +1121,9 @@ def _resolve_property_candidates(message: str, object_name: str) -> list[str]:
             candidates.append("country")
         if "owner" in text:
             candidates.append("hubspot_owner_id")
-        if re.search(r"\b(?:lead\s+status|hs_lead_status)\b", text):
+        if re.search(r"\b(?:lead\s+status(?:es)?|hs_lead_status|status)\b", text) or any(
+            re.search(rf"\b{p}\b", text) for p in _LEAD_STATUS_MAP
+        ):
             candidates.append("hs_lead_status")
     return candidates
 

@@ -209,3 +209,59 @@ async def test_show_last_10_contacts_created_preserves_timestamp_precision_and_s
     assert names[9] == "Seenu"
     assert "test1" not in names
 
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_enum"),
+    [
+        ("In progress", "IN_PROGRESS"),
+        ("New", "NEW"),
+        ("Open", "OPEN"),
+        ("Open deal", "OPEN_DEAL"),
+        ("Unqualified", "UNQUALIFIED"),
+        ("Attempted to contact", "ATTEMPTED_TO_CONTACT"),
+        ("Connected", "CONNECTED"),
+        ("Bad timing", "BAD_TIMING"),
+    ],
+)
+def test_plan_lead_status_queries_all_eight_statuses(phrase: str, expected_enum: str):
+    plan = plan_crm_query(f"List all contacts who are lead status {phrase}")
+    assert plan.object == "contact"
+    assert "hs_lead_status" in plan.properties
+    assert any(
+        f.field == "hs_lead_status" and f.operator == "eq" and f.value == expected_enum
+        for f in plan.filters
+    )
+    # Must not add redundant lifecycle stage lead filter
+    assert not any(f.field == "lifecyclestage" for f in plan.filters)
+
+
+def test_plan_all_contacts_across_lead_statuses():
+    plan = plan_crm_query("List all contacts across lead statuses")
+    assert plan.object == "contact"
+    assert "hs_lead_status" in plan.properties
+    assert not any(f.field == "hs_lead_status" for f in plan.filters)
+
+
+@pytest.mark.asyncio
+async def test_agent_filters_contacts_by_lead_status_in_progress():
+    contacts = [
+        HubSpotContact(id="c-1", properties={"firstname": "Alice", "hs_lead_status": "IN_PROGRESS"}),
+        HubSpotContact(id="c-2", properties={"firstname": "Bob", "hs_lead_status": "NEW"}),
+        HubSpotContact(id="c-3", properties={"firstname": "Charlie", "hs_lead_status": "OPEN_DEAL"}),
+        HubSpotContact(id="c-4", properties={"firstname": "David", "hs_lead_status": "UNQUALIFIED"}),
+        HubSpotContact(id="c-5", properties={"firstname": "Eve", "hs_lead_status": "ATTEMPTED_TO_CONTACT"}),
+        HubSpotContact(id="c-6", properties={"firstname": "Frank", "hs_lead_status": "CONNECTED"}),
+        HubSpotContact(id="c-7", properties={"firstname": "Grace", "hs_lead_status": "BAD_TIMING"}),
+        HubSpotContact(id="c-8", properties={"firstname": "Heidi", "hs_lead_status": "IN_PROGRESS"}),
+    ]
+    agent = make_test_agent(contacts=contacts)
+    response = await agent.respond(ask("List all contacts who are lead status In progress"))
+
+    assert response.status == "ok"
+    result = response.result
+    rows = result["table"]["rows"]
+    assert len(rows) == 2
+    assert {r["firstname"] for r in rows} == {"Alice", "Heidi"}
+    assert all(r["hs_lead_status"] == "IN_PROGRESS" for r in rows)
+
+
