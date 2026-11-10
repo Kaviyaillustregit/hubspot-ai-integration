@@ -1431,6 +1431,15 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
     table = _validated_table(result.get("table")) or _grouped_result_table(result)
     grouped = _is_grouped_result(result)
     if isinstance(chart_url, str) and chart_url:
+        rec_type = _record_detail_type(result) or (
+            result.get("plan", {}).get("object")
+            if isinstance(result.get("plan"), dict)
+            else None
+        ) or (
+            result.get("object")
+            if isinstance(result.get("object"), str)
+            else None
+        ) or _infer_record_type_for_columns(table.get("columns", []) if table else [])
         chart_title = result.get("chart_title")
         title = str(chart_title or heading)
         blocks = [_section(heading)]
@@ -1458,8 +1467,19 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
                     include_heading=False,
                     include_summary=False,
                     structured_rows=grouped,
+                    record_type=rec_type,
                 )
             )
+            matched_count = (
+                result.get("summary", {}).get("matched_records")
+                if isinstance(result.get("summary"), dict)
+                else None
+            )
+            if grouped and matched_count is not None and len(table.get("rows", [])) > 1:
+                unit = "contacts" if rec_type in {"contact", "contacts"} else ("companies" if rec_type in {"company", "companies"} else "deals")
+                if matched_count == 1:
+                    unit = "contact" if rec_type in {"contact", "contacts"} else ("company" if rec_type in {"company", "companies"} else "deal")
+                blocks.append(_context(f"*{matched_count}* {unit}"))
         details_table = _validated_table(result.get("details_table"))
         if details_table is not None:
             blocks.append(_section("*Deal records*"))
@@ -1550,14 +1570,14 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
             # only the summary here to avoid showing every row twice.
             summary = response.text.splitlines()[0] if response.text else ""
             blocks = _render_table_response(
-                heading, summary, table, show_missing=True, structured_rows=grouped
+                heading, summary, table, show_missing=True, structured_rows=grouped, record_type=rec_type
             )
             details_table = _validated_table(result.get("details_table"))
             if details_table is not None:
                 blocks.append(_section("*Deal records*"))
                 blocks.extend(_render_table_response(
                     "", "", details_table, show_missing=True, include_heading=False,
-                    include_summary=False,
+                    include_summary=False, record_type="deal"
                 ))
             notice = _details_pagination_notice(result)
             if notice:
@@ -1566,7 +1586,7 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
 
 
         return _render_table_response(
-            heading, response.text, table, structured_rows=grouped
+            heading, response.text, table, structured_rows=grouped, record_type=rec_type
         )
 
     text = response.text
@@ -1746,6 +1766,7 @@ def _render_table_response(
     include_heading: bool = True,
     include_summary: bool = True,
     structured_rows: bool = False,
+    record_type: str | None = None,
 ) -> list[Block]:
     names = {
         str(row.get("dealname"))
@@ -1784,12 +1805,12 @@ def _render_table_response(
 
     rendered_rows = 0
     limit_reached = False
-    record_type = _infer_record_type_for_columns(columns)
+    record_type = record_type or _infer_record_type_for_columns(columns)
     is_crm_card = not structured_rows and record_type in {"deal", "contact", "company"}
 
     for row in rows:
         row_blocks = _render_table_row(
-            columns, row, show_missing=show_missing, structured=structured_rows
+            columns, row, show_missing=show_missing, structured=structured_rows, record_type=record_type
         )
         remaining_rows = len(rows) - rendered_rows - 1
         row_separator = int(remaining_rows > 0)
@@ -2288,11 +2309,13 @@ def _render_table_row(
     *,
     show_missing: bool = False,
     structured: bool = False,
+    record_type: str | None = None,
 ) -> list[Block]:
-    is_deal_row = any(column.get("key") in {"dealname", "dealstage", "closedate"} for column in columns) or any(
+    if record_type is None:
+        record_type = _infer_record_type_for_columns(columns)
+    is_deal_row = record_type == "deal" or any(column.get("key") in {"dealname", "dealstage", "closedate"} for column in columns) or any(
         "deal" in column.get("label", "").casefold() for column in columns
     )
-    record_type = _infer_record_type_for_columns(columns)
     if record_type == "deal":
         is_deal_row = True
     lines: list[str] = []
@@ -2393,7 +2416,7 @@ def _render_table_row(
         return [_section("No record details available.")]
 
     if structured:
-        return _render_grouped_row(grouped_fields)
+        return _render_grouped_row(grouped_fields, record_type=record_type)
 
     render_items = _pair_record_field_lines(record_type, field_entries, return_pairs=True)
     return _render_paired_field_lines_as_blocks(render_items)
@@ -2509,7 +2532,7 @@ def _render_record_card(
         blocks.append(_context("No record details are available."))
     return blocks
 
-def _render_grouped_row(fields: list[tuple[str, str, str]]) -> list[Block]:
+def _render_grouped_row(fields: list[tuple[str, str, str]], record_type: str | None = None) -> list[Block]:
     """Render group names and metrics as a compact single-column summary."""
     group_keys = {"group", "label", "dealstage", "pipeline", "stage"}
     metric_labels = {
@@ -2553,14 +2576,24 @@ def _render_grouped_row(fields: list[tuple[str, str, str]]) -> list[Block]:
 
     metrics: list[str] = []
     seen_metrics: set[tuple[str, str]] = set()
+    has_count_metric = False
     for key, label, value in fields:
         normalized_key = key.casefold()
         if normalized_key in group_keys:
             continue
-        if normalized_key == "count":
+        if normalized_key in {"count", "count_id", "count id", "count_id_value"}:
+            if has_count_metric:
+                continue
             stripped_val = value.strip("*").strip()
             count = int(stripped_val) if stripped_val.isdigit() else None
-            metrics.append(f"*{stripped_val}* {'deal' if count == 1 else 'deals'}")
+            if record_type in {"contact", "contacts"}:
+                unit = "contact" if count == 1 else "contacts"
+            elif record_type in {"company", "companies"}:
+                unit = "company" if count == 1 else "companies"
+            else:
+                unit = "deal" if count == 1 else "deals"
+            metrics.append(f"*{stripped_val}* {unit}")
+            has_count_metric = True
             continue
         display_label = metric_labels.get(normalized_key, label)
         if normalized_key in metric_labels:

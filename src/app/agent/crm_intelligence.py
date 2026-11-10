@@ -63,6 +63,8 @@ _COMPANY_FIELD_ALIASES: dict[str, str] = {
     "hubspot_owner_id": "hubspot_owner_id",
     "phone": "phone",
     "city": "city",
+    "country": "country",
+    "nation": "country",
     "industry": "industry",
     "employees": "numberofemployees",
     "numberofemployees": "numberofemployees",
@@ -85,6 +87,8 @@ _CONTACT_FIELD_ALIASES: dict[str, str] = {
     "company": "associatedcompanyid",
     "city": "city",
     "state": "state",
+    "country": "country",
+    "nation": "country",
     "industry": "industry",
     "owner": "hubspot_owner_id",
     "owner_id": "hubspot_owner_id",
@@ -386,7 +390,40 @@ def _extract_group_field(message: str, object_name: str) -> str | None:
             field = _normalise_field_name(candidate, object_name)
             if field in _FIELD_ALIASES.get(object_name, {}).values():
                 return field or None
+    if object_name in {"company", "contact"}:
+        comparison_geo = re.search(
+            r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
+            text,
+        )
+        if comparison_geo:
+            c1 = comparison_geo.group(1).strip().casefold()
+            c2 = comparison_geo.group(2).strip().casefold()
+            if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
+                return "country"
     return None
+
+
+_COMMON_COUNTRIES = {
+    "afghanistan", "albania", "algeria", "argentina", "australia", "austria", "bangladesh",
+    "belgium", "brazil", "canada", "chile", "china", "colombia", "denmark", "egypt",
+    "finland", "france", "germany", "greece", "india", "indonesia", "ireland", "israel",
+    "italy", "japan", "kenya", "malaysia", "mexico", "netherlands", "new zealand",
+    "nigeria", "norway", "pakistan", "philippines", "poland", "portugal", "russia",
+    "saudi arabia", "singapore", "south africa", "south korea", "spain", "sweden",
+    "switzerland", "thailand", "turkey", "uae", "uk", "united kingdom", "united states",
+    "united states of america", "us", "usa", "vietnam",
+}
+
+
+def _country_variants(country: str) -> list[str]:
+    c = country.strip().casefold()
+    if c in {"us", "usa", "united states", "united states of america"}:
+        return ["us", "usa", "united states", "united states of america"]
+    if c in {"uk", "united kingdom", "great britain"}:
+        return ["uk", "united kingdom", "great britain"]
+    if c in {"uae", "united arab emirates"}:
+        return ["uae", "united arab emirates"]
+    return [c]
 
 
 def _extract_sort_fields(message: str, object_name: str) -> list[CRMIntelligenceSort]:
@@ -567,6 +604,18 @@ def _extract_filters(message: str, object_name: str) -> list[CRMIntelligenceFilt
             "pipeline", "me", "my", "who", "what", "which", "today", "yesterday", "one", "none", "unassigned",
         }:
             filters.append(CRMIntelligenceFilter(field="hubspot_owner_id", value=val))
+
+    if object_name in {"contact", "company"}:
+        comparison_geo = re.search(
+            r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
+            text,
+        )
+        if comparison_geo:
+            c1 = comparison_geo.group(1).strip().casefold()
+            c2 = comparison_geo.group(2).strip().casefold()
+            if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
+                variants = list(dict.fromkeys(_country_variants(c1) + _country_variants(c2)))
+                filters.append(CRMIntelligenceFilter(field="country", operator="in", value=",".join(variants)))
     return filters
 
 
@@ -1011,8 +1060,21 @@ def _resolve_property_candidates(message: str, object_name: str) -> list[str]:
             candidates.extend(["dealname", "amount", "dealstage", "closedate"])
     elif object_name == "company":
         candidates.extend(["name", "hubspot_owner_id", "industry", "city", "numberofemployees"])
+        if re.search(r"\b(?:country|countries|nation|nations)\b", text):
+            candidates.append("country")
     else:
         candidates.extend(["firstname", "lastname", "email", "jobtitle", "city"])
+        geo = re.search(
+            r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
+            text,
+        )
+        if geo:
+            c1 = geo.group(1).strip().casefold()
+            c2 = geo.group(2).strip().casefold()
+            if c1 in _COMMON_COUNTRIES or c2 in _COMMON_COUNTRIES or "country" in text:
+                candidates.append("country")
+        elif re.search(r"\b(?:country|countries|nation|nations)\b", text):
+            candidates.append("country")
         if "owner" in text:
             candidates.append("hubspot_owner_id")
         if re.search(r"\b(?:lead\s+status|hs_lead_status)\b", text):

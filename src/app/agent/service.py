@@ -1461,7 +1461,7 @@ class AccountIntelligenceAgent:
                         values.append(float(row.get(value_key) or 0))
                     except (TypeError, ValueError):
                         values.append(0.0)
-                chart_title = f"{record_type.title()} by {plan.group_by or 'requested metric'}"
+                chart_title = f"{record_type.title()} by {plan.group_by.replace('_', ' ').title() if plan.group_by else 'requested metric'}"
                 value_label = (
                     "Record count"
                     if value_key == "count"

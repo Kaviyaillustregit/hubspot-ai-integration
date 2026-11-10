@@ -204,6 +204,20 @@ def execute_record_query(
                     key = f"Q{(field_date.month - 1) // 3 + 1} {field_date.year}"
                 else:
                     key = str(field_date.year)
+            elif plan.group_by == "country":
+                if raw not in {None, ""}:
+                    raw_str = str(raw).strip()
+                    raw_lower = raw_str.casefold()
+                    if raw_lower in {"us", "usa", "united states", "united states of america"}:
+                        key = "US"
+                    elif raw_lower in {"uk", "united kingdom", "great britain"}:
+                        key = "UK"
+                    elif raw_lower in {"uae", "united arab emirates"}:
+                        key = "UAE"
+                    else:
+                        key = raw_str.title()
+                else:
+                    key = "Unknown"
             else:
                 if raw not in {None, ""}:
                     key = str(raw)
