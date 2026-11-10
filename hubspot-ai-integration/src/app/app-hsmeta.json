@@ -8,7 +8,8 @@
     "auth": {
       "type": "oauth",
       "redirectUrls": [
-        "http://localhost:8000/api/v1/auth/hubspot/callback"
+        "http://localhost:8000/api/v1/auth/hubspot/callback",
+         "https://hubspot-ai-integration-ei1y.onrender.com/api/v1/auth/hubspot/callback"
       ],
       "requiredScopes": [
         "crm.objects.contacts.read",
@@ -17,7 +18,8 @@
         "crm.objects.companies.write",
         "crm.objects.deals.read",
         "crm.objects.deals.write",
-        "crm.schemas.deals.read"
+        "crm.schemas.deals.read",
+        "crm.objects.owners.read"
        
       ],
       "optionalScopes": [],

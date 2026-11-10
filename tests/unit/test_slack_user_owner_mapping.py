@@ -11,7 +11,13 @@ from app.agent.schemas import AgentRequest, AgentResponse, CRMIntentExtraction
 from app.agent.service import AccountIntelligenceAgent, _ContactDraft
 from app.agent.tools import HubSpotToolRegistry
 from app.integrations.errors import IntegrationError
-from app.integrations.hubspot.models import HubSpotContact
+from app.integrations.hubspot.models import (
+    HubSpotCompany,
+    HubSpotContact,
+    HubSpotDeal,
+    HubSpotPipeline,
+    HubSpotPipelineStage,
+)
 from app.integrations.hubspot.owners import HubSpotOwner
 from app.integrations.slack.home import render_response_blocks
 from app.services.action_safety import ActionSafetyService
@@ -419,3 +425,344 @@ async def test_owner_name_display_three_states():
     enc_unresolved = json.dumps(render_response_blocks(r_unresolved), ensure_ascii=False)
     assert "*👤 Owner:* Owner not available" in enc_unresolved
     assert "999888777" not in enc_unresolved
+
+
+# ==============================================================================
+# Company creation owner assignment tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_amit_creates_company_assigned_to_amit(mock_tools, mock_safety):
+    """Amit's Slack account creates company assigned to Amit Kumar's HubSpot owner ID."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-amit-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message="Create company Acme Corp",
+        request_id="req-comp-amit",
+    )
+    extraction = CRMIntentExtraction(intent="create_company", company_action="create", company_name="Acme Corp", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_company", properties={}, company_name="Acme Corp", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-comp-amit")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_amit_101"
+    assert resp.result["owner_name"] == "Amit Kumar"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["hubspot_owner_id"] == "owner_amit_101"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Amit Kumar" in encoded
+
+
+@pytest.mark.asyncio
+async def test_kaviya_creates_company_assigned_to_kaviya(mock_tools, mock_safety):
+    """Kaviya's Slack account creates company assigned to Kaviya Murugan's HubSpot owner ID."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-kaviya-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_KAVIYA",
+        actor_email="kaviya@company.com",
+        message="Create company TechNova",
+        request_id="req-comp-kaviya",
+    )
+    extraction = CRMIntentExtraction(intent="create_company", company_action="create", company_name="TechNova", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_company", properties={}, company_name="TechNova", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-comp-kaviya")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_kaviya_102"
+    assert resp.result["owner_name"] == "Kaviya Murugan"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["hubspot_owner_id"] == "owner_kaviya_102"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Kaviya Murugan" in encoded
+
+
+@pytest.mark.asyncio
+async def test_vikas_creates_company_assigned_to_vikas(mock_tools, mock_safety):
+    """Vikas's Slack account creates company assigned to Vikas Kumar's HubSpot owner ID."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-vikas-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_VIKAS",
+        actor_email="vikas@company.com",
+        message="Create company Global Logistics",
+        request_id="req-comp-vikas",
+    )
+    extraction = CRMIntentExtraction(intent="create_company", company_action="create", company_name="Global Logistics", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_company", properties={}, company_name="Global Logistics", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-comp-vikas")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_vikas_103"
+    assert resp.result["owner_name"] == "Vikas Kumar"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["hubspot_owner_id"] == "owner_vikas_103"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Vikas Kumar" in encoded
+
+
+@pytest.mark.asyncio
+async def test_unmatched_user_creates_company_fails_safely(mock_tools, mock_safety):
+    """Unmatched Slack user creating company fails safely without creating company or assigning default owner."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_UNKNOWN",
+        actor_email="unregistered@outside.com",
+        message="Create company Rogue Co",
+        request_id="req-comp-unknown",
+    )
+    extraction = CRMIntentExtraction(intent="create_company", company_action="create", company_name="Rogue Co", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_company", properties={}, company_name="Rogue Co", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-comp-fail")
+    assert resp.status == "owner_mapping_unavailable"
+    assert "HubSpot owner mapping is unavailable" in resp.text
+    mock_tools.create_company.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_company_owner_persistence_verification_failed(mock_tools, mock_safety):
+    """If HubSpot fails to persist assigned owner on company, failure is raised."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.return_value = HubSpotCompany(id="comp-no-owner", properties={"name": "NoOwner Co", "hubspot_owner_id": None})
+    mock_tools.get_company.return_value = HubSpotCompany(id="comp-no-owner", properties={"name": "NoOwner Co", "hubspot_owner_id": None})
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message="Create company NoOwner Co",
+        request_id="req-comp-verify-fail",
+    )
+    extraction = CRMIntentExtraction(intent="create_company", company_action="create", company_name="NoOwner Co", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_company", properties={}, company_name="NoOwner Co", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-comp-verify-fail")
+    assert resp.status == "owner_assignment_failed"
+    assert "could not be verified in HubSpot" in resp.text
+
+
+# ==============================================================================
+# Deal creation owner assignment tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_amit_creates_deal_assigned_to_amit(mock_tools, mock_safety):
+    """Amit's Slack account creates deal assigned to Amit Kumar's HubSpot owner ID."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_deal.return_value = AsyncMock(status="not_found", deal=None)
+    mock_tools.deal_pipelines.return_value = [
+        HubSpotPipeline(id="default", label="Sales Pipeline", stages=[HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled")])
+    ]
+    mock_tools.create_deal.side_effect = lambda t, props: HubSpotDeal(id="deal-amit-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message="Create deal Enterprise Expansion for $50,000",
+        request_id="req-deal-amit",
+    )
+    extraction = CRMIntentExtraction(intent="create_deal", deal_action="create", deal_name="Enterprise Expansion", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_deal", properties={}, company_name=None, deal_name="Enterprise Expansion", deal_amount="50000", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-deal-amit")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_amit_101"
+    assert resp.result["owner_name"] == "Amit Kumar"
+
+    call_props = mock_tools.create_deal.call_args[0][1]
+    assert call_props["hubspot_owner_id"] == "owner_amit_101"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Amit Kumar" in encoded
+
+
+@pytest.mark.asyncio
+async def test_kaviya_creates_deal_assigned_to_kaviya(mock_tools, mock_safety):
+    """Kaviya's Slack account creates deal assigned to Kaviya Murugan's HubSpot owner ID."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_deal.return_value = AsyncMock(status="not_found", deal=None)
+    mock_tools.deal_pipelines.return_value = [
+        HubSpotPipeline(id="default", label="Sales Pipeline", stages=[HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled")])
+    ]
+    mock_tools.create_deal.side_effect = lambda t, props: HubSpotDeal(id="deal-kaviya-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_KAVIYA",
+        actor_email="kaviya@company.com",
+        message="Create deal Q4 Upsell",
+        request_id="req-deal-kaviya",
+    )
+    extraction = CRMIntentExtraction(intent="create_deal", deal_action="create", deal_name="Q4 Upsell", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_deal", properties={}, company_name=None, deal_name="Q4 Upsell", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-deal-kaviya")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_kaviya_102"
+    assert resp.result["owner_name"] == "Kaviya Murugan"
+
+    call_props = mock_tools.create_deal.call_args[0][1]
+    assert call_props["hubspot_owner_id"] == "owner_kaviya_102"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Kaviya Murugan" in encoded
+
+
+@pytest.mark.asyncio
+async def test_vikas_creates_deal_assigned_to_vikas(mock_tools, mock_safety):
+    """Vikas's Slack account creates deal assigned to Vikas Kumar's HubSpot owner ID."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_deal.return_value = AsyncMock(status="not_found", deal=None)
+    mock_tools.deal_pipelines.return_value = [
+        HubSpotPipeline(id="default", label="Sales Pipeline", stages=[HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled")])
+    ]
+    mock_tools.create_deal.side_effect = lambda t, props: HubSpotDeal(id="deal-vikas-1", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_VIKAS",
+        actor_email="vikas@company.com",
+        message="Create deal Global Freight Contract",
+        request_id="req-deal-vikas",
+    )
+    extraction = CRMIntentExtraction(intent="create_deal", deal_action="create", deal_name="Global Freight Contract", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_deal", properties={}, company_name=None, deal_name="Global Freight Contract", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-deal-vikas")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_vikas_103"
+    assert resp.result["owner_name"] == "Vikas Kumar"
+
+    call_props = mock_tools.create_deal.call_args[0][1]
+    assert call_props["hubspot_owner_id"] == "owner_vikas_103"
+
+    blocks = render_response_blocks(resp)
+    encoded = json.dumps(blocks, ensure_ascii=False)
+    assert "👤 Owner: Vikas Kumar" in encoded
+
+
+@pytest.mark.asyncio
+async def test_unmatched_user_creates_deal_fails_safely(mock_tools, mock_safety):
+    """Unmatched Slack user creating deal fails safely without creating deal."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_deal.return_value = AsyncMock(status="not_found", deal=None)
+    mock_tools.deal_pipelines.return_value = [
+        HubSpotPipeline(id="default", label="Sales Pipeline", stages=[HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled")])
+    ]
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_UNKNOWN",
+        actor_email="unregistered@outside.com",
+        message="Create deal Mystery Deal",
+        request_id="req-deal-unknown",
+    )
+    extraction = CRMIntentExtraction(intent="create_deal", deal_action="create", deal_name="Mystery Deal", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_deal", properties={}, company_name=None, deal_name="Mystery Deal", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-deal-fail")
+    assert resp.status == "owner_mapping_unavailable"
+    assert "HubSpot owner mapping is unavailable" in resp.text
+    mock_tools.create_deal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_deal_owner_persistence_verification_failed(mock_tools, mock_safety):
+    """If HubSpot fails to persist assigned owner on deal, failure is raised."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_deal.return_value = AsyncMock(status="not_found", deal=None)
+    mock_tools.deal_pipelines.return_value = [
+        HubSpotPipeline(id="default", label="Sales Pipeline", stages=[HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled")])
+    ]
+    mock_tools.create_deal.return_value = HubSpotDeal(id="deal-no-owner", properties={"dealname": "FailedOwner Deal", "hubspot_owner_id": None})
+    mock_tools.get_deal.return_value = HubSpotDeal(id="deal-no-owner", properties={"dealname": "FailedOwner Deal", "hubspot_owner_id": None})
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message="Create deal FailedOwner Deal",
+        request_id="req-deal-verify-fail",
+    )
+    extraction = CRMIntentExtraction(intent="create_deal", deal_action="create", deal_name="FailedOwner Deal", confidence=0.95)
+    validated = ValidatedExtraction(intent="create_deal", properties={}, company_name=None, deal_name="FailedOwner Deal", contact_id=None)
+
+    resp = await ops.respond(req, extraction, validated, "idemp-deal-verify-fail")
+    assert resp.status == "owner_assignment_failed"
+    assert "could not be verified in HubSpot" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_combined_company_contact_deal_creation_shares_target_owner(mock_tools, mock_safety):
+    """Creating Company, Contact, and Deal together assigns matched owner to all three records."""
+    ops = CRMOperations(mock_tools, mock_safety)
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.resolve_contact.return_value = AsyncMock(contact=None)
+    mock_tools.resolve_deal.return_value = AsyncMock(status="not_found", deal=None)
+    mock_tools.deal_pipelines.return_value = [
+        HubSpotPipeline(id="default", label="Sales Pipeline", stages=[HubSpotPipelineStage(id="appointmentscheduled", label="Appointment Scheduled")])
+    ]
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-combo", properties=dict(props))
+    mock_tools.create_contact.side_effect = lambda t, props: HubSpotContact(id="cont-combo", properties=dict(props))
+    mock_tools.create_deal.side_effect = lambda t, props: HubSpotDeal(id="deal-combo", properties=dict(props))
+
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message="Create Acme Co, add contact John Smith john@acme.com, and create deal Big Deal",
+        request_id="req-combo",
+    )
+    extraction = CRMIntentExtraction(
+        intent="multi_step",
+        company_action="create",
+        company_name="Acme Co",
+        contact_action="create",
+        deal_action="create",
+        deal_name="Big Deal",
+        confidence=0.95,
+    )
+    validated = ValidatedExtraction(
+        intent="multi_step",
+        company_name="Acme Co",
+        properties={"firstname": "John", "lastname": "Smith", "email": "john@acme.com"},
+        deal_name="Big Deal",
+        contact_id=None,
+    )
+
+    resp = await ops.respond(req, extraction, validated, "idemp-combo")
+    assert resp.status == "ok"
+    assert resp.result["owner_id"] == "owner_amit_101"
+    assert resp.result["owner_name"] == "Amit Kumar"
+
+    assert mock_tools.create_company.call_args[0][1]["hubspot_owner_id"] == "owner_amit_101"
+    assert mock_tools.create_contact.call_args[0][1]["hubspot_owner_id"] == "owner_amit_101"
+    assert mock_tools.create_deal.call_args[0][1]["hubspot_owner_id"] == "owner_amit_101"

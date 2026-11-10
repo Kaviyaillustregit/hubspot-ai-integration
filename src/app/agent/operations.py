@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from time import perf_counter
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from app.agent.crm_query import (
     DealFilter,
@@ -48,6 +48,7 @@ from app.integrations.hubspot.models import (
     HubSpotPipelineStage,
     HubSpotRecord,
 )
+from app.integrations.hubspot.owners import HubSpotOwner
 from app.services.action_safety import ActionSafetyService, ConfirmedAction
 from app.services.slack_owner_mapping import resolve_slack_user_hubspot_owner
 from app.services.hubspot_contacts import HubSpotDuplicateContactError
@@ -228,12 +229,43 @@ class _Plan:
     # Structured summaries of what was written, for the web assistant's result cards.
     cards: list[dict[str, str]] = field(default_factory=list)
     step: str = ""
+    target_owner: HubSpotOwner | None = None
+
+
+def _has_owner_lookup(tools: Any) -> bool:
+    if hasattr(tools, "owner_lookup_available"):
+        return bool(tools.owner_lookup_available)
+    if hasattr(tools, "list_owners"):
+        if hasattr(tools.list_owners, "return_value") and isinstance(tools.list_owners.return_value, (list, tuple)):
+            return True
+        if hasattr(tools.list_owners, "side_effect") and tools.list_owners.side_effect is not None:
+            return True
+    return False
 
 
 class CRMOperations:
     def __init__(self, tools: HubSpotToolRegistry, action_safety: ActionSafetyService) -> None:
         self._tools = tools
         self._safety = action_safety
+
+    async def _resolve_plan_owner(
+        self,
+        request: AgentRequest,
+        plan: _Plan,
+        entity_name: str,
+    ) -> HubSpotOwner | None:
+        if plan.target_owner is not None:
+            return plan.target_owner
+        if not _has_owner_lookup(self._tools):
+            return None
+        owner, err_msg = await resolve_slack_user_hubspot_owner(request, self._tools)
+        if not owner:
+            raise OperationError(
+                "owner_mapping_unavailable",
+                f"I couldn't create the {entity_name} because your HubSpot owner mapping is unavailable: {err_msg}",
+            )
+        plan.target_owner = owner
+        return owner
 
     async def _resolve_owner_labels(self, tenant_id: str, rows: list[dict]) -> None:
         owner_ids = {
@@ -517,12 +549,18 @@ class CRMOperations:
                 extra={"tenant_id": request.tenant_id},
             )
 
+        summary = _single_create_summary(plan)
+        result: dict[str, Any] = {"kind": "crm_records", "title": "CRM Updated", **summary}
+        if plan.target_owner is not None:
+            result.setdefault("owner_id", str(plan.target_owner.id))
+            result.setdefault("owner_name", plan.target_owner.display_name)
+
         return AgentResponse(
             status="ok",
             text="\n".join(plan.lines),
             request_id=request.request_id,
             tools_used=[],
-            result={"kind": "crm_records", "title": "CRM Updated", **_single_create_summary(plan)},
+            result=result,
             cards=plan.cards,
         )
 
@@ -554,6 +592,10 @@ class CRMOperations:
                     )
             elif actions["company"] == "create":
                 plan.company_to_create = {"name": name, **validated.company_properties}
+                if not plan.company_to_create.get("hubspot_owner_id"):
+                    owner = await self._resolve_plan_owner(request, plan, "company")
+                    if owner is not None:
+                        plan.company_to_create["hubspot_owner_id"] = str(owner.id)
             else:
                 raise OperationError(
                     "company_not_found",
@@ -575,22 +617,10 @@ class CRMOperations:
                 plan.lines.append(f"ℹ️ Contact {label} already exists — used the existing record")
             else:
                 plan.contact_to_create = dict(validated.properties)
-                has_owner_lookup = False
-                if hasattr(self._tools, "owner_lookup_available") and self._tools.owner_lookup_available is True:
-                    has_owner_lookup = True
-                elif hasattr(self._tools, "list_owners"):
-                    if hasattr(self._tools.list_owners, "return_value") and isinstance(self._tools.list_owners.return_value, (list, tuple)):
-                        has_owner_lookup = True
-                    elif hasattr(self._tools.list_owners, "side_effect") and self._tools.list_owners.side_effect is not None:
-                        has_owner_lookup = True
-                if not plan.contact_to_create.get("hubspot_owner_id") and has_owner_lookup:
-                    owner, err_msg = await resolve_slack_user_hubspot_owner(request, self._tools)
-                    if not owner:
-                        raise OperationError(
-                            "owner_mapping_unavailable",
-                            f"I couldn't create the contact because your HubSpot owner mapping is unavailable: {err_msg}",
-                        )
-                    plan.contact_to_create["hubspot_owner_id"] = str(owner.id)
+                if not plan.contact_to_create.get("hubspot_owner_id"):
+                    owner = await self._resolve_plan_owner(request, plan, "contact")
+                    if owner is not None:
+                        plan.contact_to_create["hubspot_owner_id"] = str(owner.id)
         elif actions["contact"] == "reference":
             plan.contact = await self._resolve_contact(request, validated)
 
@@ -655,6 +685,10 @@ class CRMOperations:
                     )
                 plan.deal_to_create["dealtype"] = matching_options[0].value
             plan.deal_stage_label = stage.label
+            if not plan.deal_to_create.get("hubspot_owner_id"):
+                owner = await self._resolve_plan_owner(request, plan, "deal")
+                if owner is not None:
+                    plan.deal_to_create["hubspot_owner_id"] = str(owner.id)
         elif actions["deal"] == "reference":
             plan.deal = await self._resolve_deal(request, validated.deal_name or "")
 
@@ -668,7 +702,24 @@ class CRMOperations:
         tenant_id = request.tenant_id
         if plan.company_to_create is not None:
             plan.step = f"Creating company {plan.company_to_create['name']}"
+            target_owner_id = plan.company_to_create.get("hubspot_owner_id")
             plan.company = await self._tools.create_company(tenant_id, plan.company_to_create)
+            if target_owner_id:
+                persisted_owner_id = plan.company.properties.get("hubspot_owner_id")
+                if not persisted_owner_id and hasattr(self._tools, "get_company"):
+                    try:
+                        saved_company = await self._tools.get_company(tenant_id, plan.company.id)
+                        persisted_owner_id = saved_company.properties.get("hubspot_owner_id")
+                        if persisted_owner_id:
+                            plan.company = saved_company
+                    except Exception:
+                        pass
+                if str(persisted_owner_id or "") != str(target_owner_id):
+                    raise OperationError(
+                        "owner_assignment_failed",
+                        f"Company was created in HubSpot, but assigning ownership to "
+                        f"{target_owner_id} could not be verified in HubSpot.",
+                    )
             plan.written["company_id"] = plan.company.id
             company_card = _company_card_summary(plan.company)
             company_card["hubspot_url"] = (
@@ -718,7 +769,24 @@ class CRMOperations:
         if plan.deal_to_create is not None:
             name = plan.deal_to_create["dealname"]
             plan.step = f"Creating deal {name}"
+            target_owner_id = plan.deal_to_create.get("hubspot_owner_id")
             plan.deal = await self._tools.create_deal(tenant_id, plan.deal_to_create)
+            if target_owner_id:
+                persisted_owner_id = plan.deal.properties.get("hubspot_owner_id")
+                if not persisted_owner_id and hasattr(self._tools, "get_deal"):
+                    try:
+                        saved_deal = await self._tools.get_deal(tenant_id, plan.deal.id)
+                        persisted_owner_id = saved_deal.properties.get("hubspot_owner_id")
+                        if persisted_owner_id:
+                            plan.deal = saved_deal
+                    except Exception:
+                        pass
+                if str(persisted_owner_id or "") != str(target_owner_id):
+                    raise OperationError(
+                        "owner_assignment_failed",
+                        f"Deal was created in HubSpot, but assigning ownership to "
+                        f"{target_owner_id} could not be verified in HubSpot.",
+                    )
             plan.written["deal_id"] = plan.deal.id
             amount = plan.deal_to_create.get("amount")
             details = " — ".join(
@@ -2697,7 +2765,11 @@ def _single_create_summary(plan: _Plan) -> dict[str, str]:
         label = _contact_label(plan.contact, plan.contact_to_create or {}) or plan.contact.id
     else:
         return {}
-    return {"title": f"{entity} created", "message": f"{label} was successfully added to HubSpot."}
+    summary = {"title": f"{entity} created", "message": f"{label} was successfully added to HubSpot."}
+    if plan.target_owner is not None:
+        summary["owner_id"] = str(plan.target_owner.id)
+        summary["owner_name"] = plan.target_owner.display_name
+    return summary
 
 
 async def _existing_records_response(

@@ -1599,11 +1599,15 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
         return rendered
 
     chunks = _split_text(text)
-    return [
+    blocks = [
         _section(heading),
         *(_section(chunk) for chunk in chunks),
-        *_record_link_blocks(response),
     ]
+    owner_name = result.get("owner_name")
+    if isinstance(owner_name, str) and owner_name and owner_name != "Unassigned":
+        blocks.append(_context("👤 Owner: " + html.escape(owner_name, quote=False)))
+    blocks.extend(_record_link_blocks(response))
+    return blocks
 
 
 def _record_link_blocks(response: AgentResponse) -> list[Block]:
