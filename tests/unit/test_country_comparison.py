@@ -67,6 +67,7 @@ class MockPropertiesService:
                 HubSpotPropertyDefinition(name="jobtitle", label="Job Title"),
                 HubSpotPropertyDefinition(name="city", label="City"),
                 HubSpotPropertyDefinition(name="country", label="Country"),
+                HubSpotPropertyDefinition(name="createdate", label="Create Date", type="date"),
                 HubSpotPropertyDefinition(name="lifecyclestage", label="Lifecycle Stage"),
                 HubSpotPropertyDefinition(name="hs_lead_status", label="Lead Status"),
             ]
@@ -161,3 +162,50 @@ async def test_agent_country_comparison_generates_chart_and_accurate_footer():
     assert "*82* contacts" in blocks_str
     assert "82 deals" not in blocks_str
     assert "Count Id: 82" not in blocks_str
+
+
+def test_plan_show_last_10_contacts_created():
+    from app.agent.crm_intelligence import CRMIntelligenceSort
+    plan = plan_crm_query("Show last 10 contacts created")
+    assert plan.object == "contact"
+    assert plan.limit == 10
+    assert plan.sort == [CRMIntelligenceSort(field="createdate", direction="desc")]
+    assert "createdate" in plan.properties
+
+
+@pytest.mark.asyncio
+async def test_show_last_10_contacts_created_preserves_timestamp_precision_and_selection():
+    # 8 contacts created Nov 6
+    nov6 = [
+        HubSpotContact(id=f"c-nov6-{i}", properties={"firstname": f"UserNov6_{i}", "createdate": f"2026-11-06T10:0{i}:00Z"})
+        for i in range(8)
+    ]
+    # 3 contacts created Nov 5 with different timestamps:
+    # Naveen (18:00), Seenu (14:00), test1 (08:00)
+    naveen = HubSpotContact(id="c-naveen", properties={"firstname": "Naveen", "createdate": "2026-11-05T18:00:00Z"})
+    seenu = HubSpotContact(id="c-seenu", properties={"firstname": "Seenu", "createdate": "2026-11-05T14:00:00Z"})
+    test1 = HubSpotContact(id="c-test1", properties={"firstname": "test1", "createdate": "2026-11-05T08:00:00Z"})
+    # 5 older contacts created Nov 4
+    nov4 = [
+        HubSpotContact(id=f"c-nov4-{i}", properties={"firstname": f"UserNov4_{i}", "createdate": f"2026-11-04T10:0{i}:00Z"})
+        for i in range(5)
+    ]
+    all_contacts = nov6 + [test1, seenu, naveen] + nov4  # purposely unsorted in repo
+    agent = make_test_agent(contacts=all_contacts)
+
+    response = await agent.respond(ask("Show last 10 contacts created"))
+    assert response.status == "ok"
+    result = response.result
+    rows = result["table"]["rows"]
+
+    # Must select exactly 10 records
+    assert len(rows) == 10
+    assert result["summary"]["matched_records"] == 16
+    assert result["summary"]["returned_records"] == 10
+
+    # Names in order: 8 Nov 6 records first, then Naveen (18:00), then Seenu (14:00). test1 (08:00) is 11th, excluded!
+    names = [r.get("firstname") for r in rows]
+    assert names[8] == "Naveen"
+    assert names[9] == "Seenu"
+    assert "test1" not in names
+

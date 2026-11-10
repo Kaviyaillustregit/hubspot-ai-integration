@@ -174,18 +174,45 @@ def execute_record_query(
             matched.append(record)
 
     for sort in reversed(plan.sort):
+        def sort_val(record: Any) -> Any:
+            raw_val = value(record, sort.field)
+            if raw_val is None:
+                return None
+            if sort.field.endswith("date") or "date" in sort.field:
+                text_date = str(raw_val)
+                try:
+                    dt = datetime.fromisoformat(text_date.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=UTC)
+                    return dt
+                except (TypeError, ValueError, OverflowError):
+                    try:
+                        return datetime.combine(date.fromisoformat(text_date[:10]), datetime.min.time(), tzinfo=UTC)
+                    except (TypeError, ValueError):
+                        pass
+            return typed(raw_val, sort.field)
+
+        def sort_key(record: Any) -> tuple:
+            sv = sort_val(record)
+            rec_id = str(getattr(record, "id", "") or "")
+            try:
+                rec_id_val = int(rec_id)
+            except (ValueError, TypeError):
+                rec_id_val = rec_id
+            return (sv, rec_id_val)
+
         present = [
             record
             for record in matched
-            if typed(value(record, sort.field), sort.field) is not None
+            if sort_val(record) is not None
         ]
         missing = [
             record
             for record in matched
-            if typed(value(record, sort.field), sort.field) is None
+            if sort_val(record) is None
         ]
         present.sort(
-            key=lambda record: typed(value(record, sort.field), sort.field),
+            key=sort_key,
             reverse=sort.direction == "desc",
         )
         matched = present + missing

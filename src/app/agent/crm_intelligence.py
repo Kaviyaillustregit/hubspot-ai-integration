@@ -432,9 +432,9 @@ def _extract_sort_fields(message: str, object_name: str) -> list[CRMIntelligence
     date_field = (
         "createdate" if re.search(r"\b(?:creat(?:ed|ion)|createdate)\b", text) else "closedate"
     )
-    if re.search(r"\b(?:latest|newest|most recent|recent)\b", text):
+    if re.search(r"\b(?:latest|newest|most recent|recent|last)\b", text):
         sorts.append(CRMIntelligenceSort(field=date_field, direction="desc"))
-    elif re.search(r"\b(?:oldest|earliest)\b", text):
+    elif re.search(r"\b(?:oldest|earliest|first)\b", text):
         sorts.append(CRMIntelligenceSort(field=date_field, direction="asc"))
     amount_sort = re.search(r"\b(highest|largest|biggest|lowest|smallest|top)\b", text)
     if amount_sort:
@@ -454,14 +454,14 @@ def _extract_sort_fields(message: str, object_name: str) -> list[CRMIntelligence
 
 def _extract_limit(message: str) -> int | None:
     match = re.search(
-        r"(?:top|latest|newest|oldest|earliest|first|bottom|highest|lowest|largest|smallest)"
+        r"(?:top|latest|newest|oldest|earliest|first|last|bottom|highest|lowest|largest|smallest)"
         r"\s+(\d+)",
         _normalise_text(message),
     )
     if match:
         return int(match.group(1))
     word_limit = re.search(
-        r"\b(?:top|first|bottom|highest|lowest|largest|smallest)\s+"
+        r"\b(?:top|first|last|bottom|highest|lowest|largest|smallest)\s+"
         r"(one|two|three|four|five|six|seven|eight|nine|ten)\b",
         _normalise_text(message),
     )
@@ -471,7 +471,7 @@ def _extract_limit(message: str) -> int | None:
             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
         }[word_limit.group(1)]
     match = re.search(
-        r"\b(\d+)\s+(?:most\s+recent|latest|newest|oldest|earliest)\b",
+        r"\b(\d+)\s+(?:most\s+recent|latest|newest|oldest|earliest|last)\b",
         _normalise_text(message),
     )
     if match:
@@ -915,12 +915,14 @@ def plan_crm_query(message: str) -> CRMQueryPlan:
         else None
     )
     default_sort = []
-    if object_name == "deal":
-        default_sort = (
-            [CRMIntelligenceSort(field="closedate", direction="desc")]
-            if "latest" in _normalise_text(message) or "newest" in _normalise_text(message)
-            else []
+    if object_name in {"deal", "contact", "company"}:
+        date_f = (
+            "createdate"
+            if object_name in {"contact", "company"} or re.search(r"\b(?:creat(?:ed|ion)|createdate)\b", normalized_message)
+            else "closedate"
         )
+        if re.search(r"\b(?:latest|newest|recent|last)\b", normalized_message):
+            default_sort = [CRMIntelligenceSort(field=date_f, direction="desc")]
     filters = _extract_filters(message, object_name)
     pipeline_status_summary = bool(
         object_name == "deal"
@@ -1062,8 +1064,12 @@ def _resolve_property_candidates(message: str, object_name: str) -> list[str]:
         candidates.extend(["name", "hubspot_owner_id", "industry", "city", "numberofemployees"])
         if re.search(r"\b(?:country|countries|nation|nations)\b", text):
             candidates.append("country")
+        if re.search(r"\b(?:creat(?:ed|ion)|createdate|latest|newest|last|recent)\b", text):
+            candidates.append("createdate")
     else:
         candidates.extend(["firstname", "lastname", "email", "jobtitle", "city"])
+        if re.search(r"\b(?:creat(?:ed|ion)|createdate|latest|newest|last|recent)\b", text):
+            candidates.append("createdate")
         geo = re.search(
             r"\b(?:in|from)\s+([a-zA-Z\s]+?)\s+(?:vs|versus)\s+(?:the\s+)?([a-zA-Z\s]+?)(?:\?|[.,;!]|$|\s+(?:chart|graph|plot))",
             text,
