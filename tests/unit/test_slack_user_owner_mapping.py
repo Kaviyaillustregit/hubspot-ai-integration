@@ -804,7 +804,7 @@ async def test_detailed_company_creation_extracts_all_fields_and_assigns_owner(a
     assert call_props["phone"] == "3456765434"
     assert call_props["city"] == "Chennai"
     assert call_props["country"] == "India"
-    assert call_props["industry"] == "Software and Development"
+    assert call_props["industry"] == "COMPUTER_SOFTWARE"
     assert call_props["hubspot_owner_id"] == "owner_amit_101"
 
     blocks = render_response_blocks(resp)
@@ -880,5 +880,108 @@ async def test_ai_extracted_detailed_company_creation(agent, mock_tools):
     assert call_props["phone"] == "3456765434"
     assert call_props["city"] == "Chennai"
     assert call_props["country"] == "India"
-    assert call_props["industry"] == "Software and Development"
+    assert call_props["industry"] == "COMPUTER_SOFTWARE"
     assert call_props["hubspot_owner_id"] == "owner_kaviya_102"
+
+
+@pytest.mark.asyncio
+async def test_cognizent_detailed_company_creation_maps_industry_and_owner(agent, mock_tools):
+    """The failing Cognizent request maps 'Software and Development' to 'COMPUTER_SOFTWARE' and creates company."""
+    agent._ai_service.generate.side_effect = Exception("Use rule parser")
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-cognizent-1", properties=dict(props))
+
+    message = (
+        "Create a new company record named Cognizent with phone 3456765434, "
+        "city Chennai, country India, and industry Software and Development."
+    )
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message=message,
+        request_id="req-cognizent-1",
+    )
+
+    resp = await agent.respond(req)
+
+    assert resp.status == "ok"
+    assert "Which contact?" not in resp.text
+    assert "Cognizent" in resp.text
+    assert resp.result["owner_id"] == "owner_amit_101"
+    assert resp.result["owner_name"] == "Amit Kumar"
+
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["name"] == "Cognizent"
+    assert call_props["phone"] == "3456765434"
+    assert call_props["city"] == "Chennai"
+    assert call_props["country"] == "India"
+    assert call_props["industry"] == "COMPUTER_SOFTWARE"
+    assert call_props["hubspot_owner_id"] == "owner_amit_101"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_company_industry_returns_clarification(agent, mock_tools):
+    """When an unsupported industry is requested, return clear clarification without creating company."""
+    agent._ai_service.generate.side_effect = Exception("Use rule parser")
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+
+    message = (
+        "Create company named Quantum Corp with phone 1234567890, "
+        "city Boston, country USA, and industry Quantum Cloud Time Travel."
+    )
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_AMIT",
+        actor_email="amit@company.com",
+        message=message,
+        request_id="req-unsupported-ind",
+    )
+
+    resp = await agent.respond(req)
+
+    assert resp.status == "needs_clarification"
+    assert "Quantum Cloud Time Travel" in resp.text
+    assert "supported HubSpot industry option" in resp.text
+    mock_tools.create_company.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_company_industry_uses_discovered_options_when_available(agent, mock_tools):
+    """When property discovery provides tenant-specific industry options, resolve against them."""
+    agent._ai_service.generate.side_effect = Exception("Use rule parser")
+    mock_tools.resolve_company.return_value = AsyncMock(status="not_found", company=None)
+    mock_tools.create_company.side_effect = lambda t, props: HubSpotCompany(id="comp-custom-1", properties=dict(props))
+
+    # Mock discovered properties on tools
+    industry_prop = type(
+        "PropDef",
+        (),
+        {
+            "name": "industry",
+            "options": [
+                {"value": "CUSTOM_DEV_SHOP", "label": "Custom Software Development"},
+                {"value": "BIOTECH_RESEARCH", "label": "Biotechnology Research"},
+            ],
+        },
+    )()
+    mock_tools.discover_properties = AsyncMock(return_value=[industry_prop])
+
+    message = (
+        "Create company named DevCraft with phone 9876543210, "
+        "city Seattle, country USA, and industry Custom Software Development."
+    )
+    req = AgentRequest(
+        tenant_id="tenant-a",
+        actor_id="U_VIKAS",
+        actor_email="vikas@company.com",
+        message=message,
+        request_id="req-custom-ind",
+    )
+
+    resp = await agent.respond(req)
+
+    assert resp.status == "ok"
+    call_props = mock_tools.create_company.call_args[0][1]
+    assert call_props["industry"] == "CUSTOM_DEV_SHOP"
+

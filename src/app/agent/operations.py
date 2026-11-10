@@ -243,6 +243,185 @@ def _has_owner_lookup(tools: Any) -> bool:
     return False
 
 
+HUBSPOT_STANDARD_INDUSTRIES: list[dict[str, str]] = [
+    {"value": "ACCOUNTING", "label": "Accounting"},
+    {"value": "AIRLINES_AVIATION", "label": "Airlines/Aviation"},
+    {"value": "ALTERNATIVE_DISPUTE_RESOLUTION", "label": "Alternative Dispute Resolution"},
+    {"value": "ALTERNATIVE_MEDICINE", "label": "Alternative Medicine"},
+    {"value": "ANIMATION", "label": "Animation"},
+    {"value": "APPAREL_FASHION", "label": "Apparel & Fashion"},
+    {"value": "ARCHITECTURE_PLANNING", "label": "Architecture & Planning"},
+    {"value": "ARTS_AND_CRAFTS", "label": "Arts and Crafts"},
+    {"value": "AUTOMOTIVE", "label": "Automotive"},
+    {"value": "AVIATION_AEROSPACE", "label": "Aviation & Aerospace"},
+    {"value": "BANKING", "label": "Banking"},
+    {"value": "BIOTECHNOLOGY", "label": "Biotechnology"},
+    {"value": "BROADCAST_MEDIA", "label": "Broadcast Media"},
+    {"value": "BUILDING_MATERIALS", "label": "Building Materials"},
+    {"value": "BUSINESS_SUPPLIES_AND_EQUIPMENT", "label": "Business Supplies and Equipment"},
+    {"value": "CAPITAL_MARKETS", "label": "Capital Markets"},
+    {"value": "CHEMICALS", "label": "Chemicals"},
+    {"value": "CIVIC_SOCIAL_ORGANIZATION", "label": "Civic & Social Organization"},
+    {"value": "CIVIL_ENGINEERING", "label": "Civil Engineering"},
+    {"value": "COMMERCIAL_REAL_ESTATE", "label": "Commercial Real Estate"},
+    {"value": "COMPUTER_AND_NETWORK_SECURITY", "label": "Computer & Network Security"},
+    {"value": "COMPUTER_GAMES", "label": "Computer Games"},
+    {"value": "COMPUTER_HARDWARE", "label": "Computer Hardware"},
+    {"value": "COMPUTER_NETWORKING", "label": "Computer Networking"},
+    {"value": "COMPUTER_SOFTWARE", "label": "Computer Software"},
+    {"value": "CONSTRUCTION", "label": "Construction"},
+    {"value": "CONSUMER_ELECTRONICS", "label": "Consumer Electronics"},
+    {"value": "CONSUMER_GOODS", "label": "Consumer Goods"},
+    {"value": "CONSUMER_SERVICES", "label": "Consumer Services"},
+    {"value": "COSMETICS", "label": "Cosmetics"},
+    {"value": "DAIRY", "label": "Dairy"},
+    {"value": "DEFENSE_SPACE", "label": "Defense & Space"},
+    {"value": "DESIGN", "label": "Design"},
+    {"value": "EDUCATION_MANAGEMENT", "label": "Education Management"},
+    {"value": "E_LEARNING", "label": "E-Learning"},
+    {"value": "ELECTRICAL_ELECTRONIC_MANUFACTURING", "label": "Electrical/Electronic Manufacturing"},
+    {"value": "ENTERTAINMENT", "label": "Entertainment"},
+    {"value": "ENVIRONMENTAL_SERVICES", "label": "Environmental Services"},
+    {"value": "EVENTS_SERVICES", "label": "Events Services"},
+    {"value": "EXECUTIVE_OFFICE", "label": "Executive Office"},
+    {"value": "FACILITIES_SERVICES", "label": "Facilities Services"},
+    {"value": "FARMING", "label": "Farming"},
+    {"value": "FINANCIAL_SERVICES", "label": "Financial Services"},
+    {"value": "FINE_ART", "label": "Fine Art"},
+    {"value": "FISHERY", "label": "Fishery"},
+    {"value": "FOOD_BEVERAGES", "label": "Food & Beverages"},
+    {"value": "FOOD_PRODUCTION", "label": "Food Production"},
+    {"value": "FUND_RAISING", "label": "Fund-Raising"},
+    {"value": "FURNITURE", "label": "Furniture"},
+    {"value": "GAMBLING_CASINOS", "label": "Gambling & Casinos"},
+    {"value": "GLASS_CERAMICS_CONCRETE", "label": "Glass, Ceramics & Concrete"},
+    {"value": "GOVERNMENT_ADMINISTRATION", "label": "Government Administration"},
+    {"value": "GOVERNMENT_RELATIONS", "label": "Government Relations"},
+    {"value": "GRAPHIC_DESIGN", "label": "Graphic Design"},
+    {"value": "HEALTH_WELLNESS_AND_FITNESS", "label": "Health, Wellness and Fitness"},
+    {"value": "HIGHER_EDUCATION", "label": "Higher Education"},
+    {"value": "HOSPITAL_HEALTH_CARE", "label": "Hospital & Health Care"},
+    {"value": "HOSPITALITY", "label": "Hospitality"},
+    {"value": "HUMAN_RESOURCES", "label": "Human Resources"},
+    {"value": "IMPORT_AND_EXPORT", "label": "Import and Export"},
+    {"value": "INDIVIDUAL_FAMILY_SERVICES", "label": "Individual & Family Services"},
+    {"value": "INDUSTRIAL_AUTOMATION", "label": "Industrial Automation"},
+    {"value": "INFORMATION_SERVICES", "label": "Information Services"},
+    {"value": "INFORMATION_TECHNOLOGY_AND_SERVICES", "label": "Information Technology and Services"},
+    {"value": "INSURANCE", "label": "Insurance"},
+    {"value": "INTERNATIONAL_AFFAIRS", "label": "International Affairs"},
+    {"value": "INTERNATIONAL_TRADE_AND_DEVELOPMENT", "label": "International Trade and Development"},
+    {"value": "INTERNET", "label": "Internet"},
+    {"value": "INVESTMENT_BANKING", "label": "Investment Banking"},
+    {"value": "INVESTMENT_MANAGEMENT", "label": "Investment Management"},
+    {"value": "JUDICIARY", "label": "Judiciary"},
+    {"value": "LAW_ENFORCEMENT", "label": "Law Enforcement"},
+    {"value": "LAW_PRACTICE", "label": "Law Practice"},
+    {"value": "LEGAL_SERVICES", "label": "Legal Services"},
+    {"value": "LEGISLATIVE_OFFICE", "label": "Legislative Office"},
+    {"value": "LEISURE_TRAVEL_TOURISM", "label": "Leisure, Travel & Tourism"},
+    {"value": "LIBRARIES", "label": "Libraries"},
+    {"value": "LOGISTICS_AND_SUPPLY_CHAIN", "label": "Logistics and Supply Chain"},
+    {"value": "MANAGEMENT_CONSULTING", "label": "Management Consulting"},
+    {"value": "MARITIME", "label": "Maritime"},
+    {"value": "MARKETING_AND_ADVERTISING", "label": "Marketing and Advertising"},
+    {"value": "MARKET_RESEARCH", "label": "Market Research"},
+    {"value": "MECHANICAL_OR_INDUSTRIAL_ENGINEERING", "label": "Mechanical or Industrial Engineering"},
+    {"value": "MEDIA_PRODUCTION", "label": "Media Production"},
+    {"value": "MEDICAL_DEVICES", "label": "Medical Devices"},
+    {"value": "MEDICAL_PRACTICE", "label": "Medical Practice"},
+    {"value": "MENTAL_HEALTH_CARE", "label": "Mental Health Care"},
+    {"value": "MILITARY", "label": "Military"},
+    {"value": "MINING_METALS", "label": "Mining & Metals"},
+    {"value": "MOTION_PICTURES_AND_FILM", "label": "Motion Pictures and Film"},
+    {"value": "MUSEUMS_AND_INSTITUTIONS", "label": "Museums and Institutions"},
+    {"value": "MUSIC", "label": "Music"},
+    {"value": "NANOTECHNOLOGY", "label": "Nanotechnology"},
+    {"value": "NEWSPAPERS", "label": "Newspapers"},
+    {"value": "NON_PROFIT_ORGANIZATION_MANAGEMENT", "label": "Non-Profit Organization Management"},
+    {"value": "OIL_ENERGY", "label": "Oil & Energy"},
+    {"value": "ONLINE_MEDIA", "label": "Online Media"},
+    {"value": "OUTSOURCING_OFFSHORING", "label": "Outsourcing/Offshoring"},
+    {"value": "PACKAGE_FREIGHT_DELIVERY", "label": "Package/Freight Delivery"},
+    {"value": "PACKAGING_AND_CONTAINERS", "label": "Packaging and Containers"},
+    {"value": "PAPER_FOREST_PRODUCTS", "label": "Paper & Forest Products"},
+    {"value": "PERFORMING_ARTS", "label": "Performing Arts"},
+    {"value": "PHARMACEUTICALS", "label": "Pharmaceuticals"},
+    {"value": "PHILANTHROPY", "label": "Philanthropy"},
+    {"value": "PHOTOGRAPHY", "label": "Photography"},
+    {"value": "PLASTICS", "label": "Plastics"},
+    {"value": "POLITICAL_ORGANIZATION", "label": "Political Organization"},
+    {"value": "PRIMARY_SECONDARY_EDUCATION", "label": "Primary/Secondary Education"},
+    {"value": "PRINTING", "label": "Printing"},
+    {"value": "PROFESSIONAL_TRAINING_COACHING", "label": "Professional Training & Coaching"},
+    {"value": "PROGRAM_DEVELOPMENT", "label": "Program Development"},
+    {"value": "PUBLIC_POLICY", "label": "Public Policy"},
+    {"value": "PUBLIC_RELATIONS_AND_COMMUNICATIONS", "label": "Public Relations and Communications"},
+    {"value": "PUBLIC_SAFETY", "label": "Public Safety"},
+    {"value": "PUBLISHING", "label": "Publishing"},
+    {"value": "RAILROAD_MANUFACTURE", "label": "Railroad Manufacture"},
+    {"value": "RANCHING", "label": "Ranching"},
+    {"value": "REAL_ESTATE", "label": "Real Estate"},
+    {"value": "RECREATIONAL_FACILITIES_AND_SERVICES", "label": "Recreational Facilities and Services"},
+    {"value": "RELIGIOUS_INSTITUTIONS", "label": "Religious Institutions"},
+    {"value": "RENEWABLES_ENVIRONMENT", "label": "Renewables & Environment"},
+    {"value": "RESEARCH", "label": "Research"},
+    {"value": "RESTAURANTS", "label": "Restaurants"},
+    {"value": "RETAIL", "label": "Retail"},
+    {"value": "SECURITY_AND_INVESTIGATIONS", "label": "Security and Investigations"},
+    {"value": "SEMICONDUCTORS", "label": "Semiconductors"},
+    {"value": "SHIPBUILDING", "label": "Shipbuilding"},
+    {"value": "SPORTING_GOODS", "label": "Sporting Goods"},
+    {"value": "SPORTS", "label": "Sports"},
+    {"value": "STAFFING_AND_RECRUITING", "label": "Staffing and Recruiting"},
+    {"value": "SUPERMARKETS", "label": "Supermarkets"},
+    {"value": "TELECOMMUNICATIONS", "label": "Telecommunications"},
+    {"value": "TEXTILES", "label": "Textiles"},
+    {"value": "THINK_TANKS", "label": "Think Tanks"},
+    {"value": "TOBACCO", "label": "Tobacco"},
+    {"value": "TRANSLATION_AND_LOCALIZATION", "label": "Translation and Localization"},
+    {"value": "TRANSPORTATION_TRUCKING_RAILROAD", "label": "Transportation/Trucking/Railroad"},
+    {"value": "UTILITIES", "label": "Utilities"},
+    {"value": "VENTURE_CAPITAL_PRIVATE_EQUITY", "label": "Venture Capital & Private Equity"},
+    {"value": "VETERINARY", "label": "Veterinary"},
+    {"value": "WAREHOUSING", "label": "Warehousing"},
+    {"value": "WHOLESALE", "label": "Wholesale"},
+    {"value": "WINE_AND_SPIRITS", "label": "Wine and Spirits"},
+    {"value": "WIRELESS", "label": "Wireless"},
+    {"value": "WRITING_AND_EDITING", "label": "Writing and Editing"},
+]
+
+_INDUSTRY_SEMANTIC_MAP: dict[str, str] = {
+    "software and development": "COMPUTER_SOFTWARE",
+    "software & development": "COMPUTER_SOFTWARE",
+    "software development": "COMPUTER_SOFTWARE",
+    "software": "COMPUTER_SOFTWARE",
+    "computer software": "COMPUTER_SOFTWARE",
+    "it": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "it services": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "information technology": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "information technology & services": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "information technology and services": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "tech": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "technology": "INFORMATION_TECHNOLOGY_AND_SERVICES",
+    "finance": "FINANCIAL_SERVICES",
+    "financial services": "FINANCIAL_SERVICES",
+    "banking": "BANKING",
+    "healthcare": "HOSPITAL_HEALTH_CARE",
+    "health care": "HOSPITAL_HEALTH_CARE",
+    "real estate": "REAL_ESTATE",
+    "consulting": "MANAGEMENT_CONSULTING",
+    "marketing": "MARKETING_AND_ADVERTISING",
+    "advertising": "MARKETING_AND_ADVERTISING",
+    "retail": "RETAIL",
+    "insurance": "INSURANCE",
+    "telecom": "TELECOMMUNICATIONS",
+    "telecommunications": "TELECOMMUNICATIONS",
+    "education": "EDUCATION_MANAGEMENT",
+    "manufacturing": "ELECTRICAL_ELECTRONIC_MANUFACTURING",
+}
+
+
 class CRMOperations:
     def __init__(self, tools: HubSpotToolRegistry, action_safety: ActionSafetyService) -> None:
         self._tools = tools
@@ -296,6 +475,63 @@ class CRMOperations:
                             row[key] = labels[val_str]
                         elif val_str.isdigit():
                             row[key] = "Owner not available"
+
+    async def _resolve_company_industry(
+        self, tenant_id: str, raw_industry: str
+    ) -> str:
+        if not raw_industry or not raw_industry.strip():
+            return raw_industry
+
+        cleaned = raw_industry.strip()
+        norm = re.sub(r"[^0-9a-z]", "", cleaned.casefold())
+
+        options: list[dict[str, str]] = []
+        if hasattr(self._tools, "discover_properties"):
+            try:
+                defs = await self._tools.discover_properties(tenant_id, "companies")
+                for prop_def in defs or []:
+                    if getattr(prop_def, "name", None) == "industry":
+                        prop_opts = getattr(prop_def, "options", None) or []
+                        options = [
+                            {
+                                "value": str(opt.get("value") if isinstance(opt, dict) else getattr(opt, "value", "")),
+                                "label": str(opt.get("label") if isinstance(opt, dict) else getattr(opt, "label", "")),
+                            }
+                            for opt in prop_opts
+                            if (opt.get("value") if isinstance(opt, dict) else getattr(opt, "value", None))
+                        ]
+                        break
+            except Exception:
+                pass
+
+        if not options:
+            options = HUBSPOT_STANDARD_INDUSTRIES
+
+        valid_values = {opt["value"] for opt in options}
+
+        for opt in options:
+            val_norm = re.sub(r"[^0-9a-z]", "", opt["value"].casefold())
+            lbl_norm = re.sub(r"[^0-9a-z]", "", opt["label"].casefold())
+            if norm == val_norm or norm == lbl_norm:
+                return opt["value"]
+
+        synonym_target = _INDUSTRY_SEMANTIC_MAP.get(cleaned.casefold()) or _INDUSTRY_SEMANTIC_MAP.get(norm)
+        if synonym_target and synonym_target in valid_values:
+            return synonym_target
+
+        label_matches = [
+            opt["value"] for opt in options
+            if norm in re.sub(r"[^0-9a-z]", "", opt["label"].casefold())
+            or re.sub(r"[^0-9a-z]", "", opt["label"].casefold()) in norm
+        ]
+        if len(label_matches) == 1:
+            return label_matches[0]
+
+        raise OperationError(
+            "needs_clarification",
+            f"I couldn't match the industry “{raw_industry}” to a supported HubSpot industry option. "
+            "Please provide a supported industry shown in HubSpot.",
+        )
 
     @staticmethod
     def handles(extraction: CRMIntentExtraction, validated: ValidatedExtraction) -> bool:
@@ -591,7 +827,12 @@ class CRMOperations:
                         f"ℹ️ Company {label} already exists — used the existing record"
                     )
             elif actions["company"] == "create":
-                plan.company_to_create = {"name": name, **validated.company_properties}
+                company_props = dict(validated.company_properties)
+                if company_props.get("industry"):
+                    company_props["industry"] = await self._resolve_company_industry(
+                        tenant_id, company_props["industry"]
+                    )
+                plan.company_to_create = {"name": name, **company_props}
                 if not plan.company_to_create.get("hubspot_owner_id"):
                     owner = await self._resolve_plan_owner(request, plan, "company")
                     if owner is not None:
@@ -878,6 +1119,10 @@ class CRMOperations:
         if not validated.company_name:
             raise OperationError("missing_fields", "Which company should I update?")
         changes = dict(validated.company_properties)
+        if changes.get("industry"):
+            changes["industry"] = await self._resolve_company_industry(
+                request.tenant_id, changes["industry"]
+            )
         if not changes:
             raise OperationError(
                 "missing_fields",
