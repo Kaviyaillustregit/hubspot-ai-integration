@@ -28,7 +28,7 @@ from app.agent.crm_query import (
     resolve_stage_ids,
     to_hubspot_filter_group,
 )
-from app.agent.extraction import ValidatedExtraction
+from app.agent.extraction import VALID_LEAD_STATUSES, ValidatedExtraction
 from app.agent.schemas import AgentRequest, AgentResponse, CRMIntentExtraction, CRMQueryName
 from app.agent.tools import HubSpotToolRegistry
 from app.integrations.errors import (
@@ -532,6 +532,59 @@ class CRMOperations:
             "Please provide a supported industry shown in HubSpot.",
         )
 
+    async def _resolve_company_lead_status(
+        self, tenant_id: str, raw_status: str
+    ) -> str:
+        if not raw_status or not str(raw_status).strip():
+            return raw_status
+
+        cleaned = str(raw_status).strip()
+        norm = re.sub(r"[^0-9a-z]", "", cleaned.casefold())
+
+        options: list[dict[str, str]] = []
+        if hasattr(self._tools, "discover_properties"):
+            try:
+                defs = await self._tools.discover_properties(tenant_id, "companies")
+                for prop_def in defs or []:
+                    if getattr(prop_def, "name", None) in {"hs_lead_status", "lead_status"}:
+                        prop_opts = getattr(prop_def, "options", None) or []
+                        options = [
+                            {
+                                "value": str(opt.get("value") if isinstance(opt, dict) else getattr(opt, "value", "")),
+                                "label": str(opt.get("label") if isinstance(opt, dict) else getattr(opt, "label", "")),
+                            }
+                            for opt in prop_opts
+                            if (opt.get("value") if isinstance(opt, dict) else getattr(opt, "value", None))
+                        ]
+                        break
+            except Exception:
+                pass
+
+        if not options:
+            options = [
+                {"value": canonical, "label": label.title()}
+                for label, canonical in VALID_LEAD_STATUSES.items()
+            ]
+
+        valid_values = {opt["value"] for opt in options}
+
+        for opt in options:
+            val_norm = re.sub(r"[^0-9a-z]", "", opt["value"].casefold())
+            lbl_norm = re.sub(r"[^0-9a-z]", "", opt["label"].casefold())
+            if norm == val_norm or norm == lbl_norm:
+                return opt["value"]
+
+        if cleaned.casefold() in VALID_LEAD_STATUSES:
+            return VALID_LEAD_STATUSES[cleaned.casefold()]
+        if norm in VALID_LEAD_STATUSES:
+            return VALID_LEAD_STATUSES[norm]
+
+        raise OperationError(
+            "needs_clarification",
+            f"I couldn't match the lead status “{raw_status}” to a supported HubSpot lead status option. "
+            "Please provide a supported lead status shown in HubSpot.",
+        )
+
     @staticmethod
     def handles(extraction: CRMIntentExtraction, validated: ValidatedExtraction) -> bool:
         """True when a request goes beyond the original contact-only flows."""
@@ -840,6 +893,10 @@ class CRMOperations:
                     company_props["industry"] = await self._resolve_company_industry(
                         tenant_id, company_props["industry"]
                     )
+                if company_props.get("hs_lead_status"):
+                    company_props["hs_lead_status"] = await self._resolve_company_lead_status(
+                        tenant_id, company_props["hs_lead_status"]
+                    )
                 plan.company_to_create = {"name": name, **company_props}
                 if not plan.company_to_create.get("hubspot_owner_id"):
                     owner = await self._resolve_plan_owner(request, plan, "company")
@@ -1135,11 +1192,15 @@ class CRMOperations:
             changes["industry"] = await self._resolve_company_industry(
                 request.tenant_id, changes["industry"]
             )
+        if changes.get("hs_lead_status"):
+            changes["hs_lead_status"] = await self._resolve_company_lead_status(
+                request.tenant_id, changes["hs_lead_status"]
+            )
         if not changes:
             raise OperationError(
                 "missing_fields",
                 f"What should I change on {validated.company_name}, and to what value? "
-                "I can update a company's website, domain, phone number or city.",
+                "I can update a company's website, domain, phone number, city, industry, or lead status.",
             )
         try:
             company = await self._resolve_company(request, validated.company_name)

@@ -33,6 +33,8 @@ CONTACT_PROPERTY_FIELDS: dict[str, str] = {
     "country": "country",
     "description": "description",
     "contact_owner": "hubspot_owner_id",
+    "zip": "zip",
+    "postal_code": "zip",
 }
 
 CONTACT_PROPERTY_ALIASES: dict[str, str] = {
@@ -48,6 +50,8 @@ CONTACT_PROPERTY_ALIASES: dict[str, str] = {
     "owner": "hubspot_owner_id", "contact owner": "hubspot_owner_id", "rep": "hubspot_owner_id",
     "website": "website", "url": "website",
     "address": "address", "city": "city", "state": "state", "country": "country",
+    "street address": "address", "street": "address", "streetaddress": "address",
+    "postal code": "zip", "postalcode": "zip", "postal": "zip", "zip code": "zip", "zipcode": "zip", "zip": "zip", "pincode": "zip", "pin code": "zip",
     "company": "company", "company name": "company",
     "description": "description", "notes": "description",
 }
@@ -101,8 +105,13 @@ COMPANY_PROPERTY_FIELDS: dict[str, str] = {
     "company_website": "website",
     "company_phone": "phone",
     "company_city": "city",
+    "company_state": "state",
     "company_country": "country",
+    "company_address": "address",
+    "company_zip": "zip",
+    "company_postal_code": "zip",
     "company_industry": "industry",
+    "company_lead_status": "hs_lead_status",
     "company_employees": "numberofemployees",
 }
 
@@ -251,6 +260,9 @@ def validate_extraction(
                 if resolved_key == "lifecyclestage":
                     norm_s = " ".join(val_str.casefold().replace("_", " ").replace("-", " ").split())
                     properties["lifecyclestage"] = VALID_LIFECYCLE_STAGES.get(norm_s, val_str)
+                elif resolved_key == "hs_lead_status":
+                    norm_ls = " ".join(val_str.casefold().replace("_", " ").replace("-", " ").split())
+                    properties["hs_lead_status"] = VALID_LEAD_STATUSES.get(norm_ls, val_str.upper())
                 else:
                     properties[resolved_key] = val_str
 
@@ -259,6 +271,15 @@ def validate_extraction(
         norm_stage = " ".join(str(raw_stage).strip().casefold().replace("_", " ").replace("-", " ").split())
         canonical = VALID_LIFECYCLE_STAGES.get(norm_stage, norm_stage)
         properties["lifecyclestage"] = canonical
+
+    raw_ls = getattr(extraction, "lead_status", None) or getattr(extraction, "company_lead_status", None) or properties.get("hs_lead_status")
+    if raw_ls is not None:
+        norm_ls = " ".join(str(raw_ls).strip().casefold().replace("_", " ").replace("-", " ").split())
+        properties["hs_lead_status"] = VALID_LEAD_STATUSES.get(norm_ls, str(raw_ls).upper())
+
+    raw_zip = getattr(extraction, "zip", None) or getattr(extraction, "postal_code", None) or getattr(extraction, "company_zip", None) or getattr(extraction, "company_postal_code", None) or properties.get("zip")
+    if raw_zip is not None:
+        properties["zip"] = str(raw_zip).strip()
 
     email = properties.get("email")
     if email is not None and not _EMAIL.fullmatch(email):
@@ -274,10 +295,14 @@ def validate_extraction(
         if value is not None:
             company_properties[property_name] = value
 
-    if extraction.intent == "create_company" or (
-        extraction.company_action == "create" and not extraction.contact_action
-    ):
-        for prop in ("phone", "city", "country", "industry", "state", "website", "address"):
+    is_company_op = (
+        extraction.intent in {"create_company", "update_company"}
+        or (extraction.company_action in {"create", "update"} and not extraction.contact_action)
+    )
+    if is_company_op:
+        for prop in (
+            "phone", "city", "country", "industry", "state", "website", "address", "zip", "hs_lead_status", "lifecyclestage"
+        ):
             if prop in properties and prop not in company_properties:
                 company_properties[prop] = properties.pop(prop)
         for field_name, prop_name in (
@@ -285,11 +310,21 @@ def validate_extraction(
             ("country", "country"),
             ("city", "city"),
             ("phone", "phone"),
+            ("state", "state"),
+            ("address", "address"),
+            ("zip", "zip"),
+            ("postal_code", "zip"),
+            ("lead_status", "hs_lead_status"),
+            ("company_lead_status", "hs_lead_status"),
         ):
             if prop_name not in company_properties and getattr(extraction, field_name, None):
                 grounded_v = _grounded(without_emails, field_name, getattr(extraction, field_name))
                 if grounded_v is not None:
-                    company_properties[prop_name] = grounded_v
+                    if prop_name == "hs_lead_status":
+                        norm_ls = " ".join(str(grounded_v).strip().casefold().replace("_", " ").replace("-", " ").split())
+                        company_properties[prop_name] = VALID_LEAD_STATUSES.get(norm_ls, str(grounded_v).upper())
+                    else:
+                        company_properties[prop_name] = grounded_v
     for name in ("domain", "website"):
         value = company_properties.get(name)
         if value is not None and not _DOMAIN.fullmatch(value):
