@@ -9,6 +9,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
+from app.agent.currency import (
+    CurrencyParsingError,
+    ParsedCurrencyAmount,
+    normalize_currency_code,
+    parse_currency_amount,
+)
 from app.agent.schemas import CRMIntentExtraction, CRMIntentName
 
 # Extraction field -> HubSpot contact property. No other property is ever written.
@@ -294,6 +300,30 @@ def validate_extraction(
         raise ExtractionValidationError("company_employees", employees, "invalid_format")
 
     amount_text = _grounded(without_emails, "deal_amount", extraction.deal_amount)
+    parsed_deal_amount: ParsedCurrencyAmount | None = None
+    if amount_text is not None:
+        try:
+            parsed_deal_amount = parse_currency_amount(amount_text, field_name="deal_amount")
+            deal_amount_val = parsed_deal_amount.amount_str
+        except CurrencyParsingError as exc:
+            raise ExtractionValidationError(exc.field, exc.value, exc.code) from exc
+        except (InvalidOperation, ValueError) as exc:
+            raise ExtractionValidationError("deal_amount", amount_text, "invalid_format") from exc
+    else:
+        deal_amount_val = None
+
+    raw_currency = _grounded(without_emails, "deal_currency", extraction.deal_currency)
+    deal_currency_val: str | None = None
+    if raw_currency is not None:
+        deal_currency_val = normalize_currency_code(raw_currency)
+        if deal_currency_val is None:
+            raise ExtractionValidationError("deal_currency", raw_currency, "invalid_format")
+        if parsed_deal_amount and parsed_deal_amount.currency:
+            if parsed_deal_amount.currency != deal_currency_val:
+                raise ExtractionValidationError("deal_currency", raw_currency, "ambiguous")
+    elif parsed_deal_amount and parsed_deal_amount.currency:
+        deal_currency_val = parsed_deal_amount.currency
+
     close_date_text = _grounded(
         without_emails, "deal_close_date", extraction.deal_close_date
     )
@@ -304,7 +334,7 @@ def validate_extraction(
         contact_id=contact_id,
         company_properties=company_properties,
         deal_name=_grounded(without_emails, "deal_name", extraction.deal_name),
-        deal_amount=normalize_amount(amount_text) if amount_text is not None else None,
+        deal_amount=deal_amount_val,
         deal_stage=_grounded(without_emails, "deal_stage", extraction.deal_stage),
         deal_pipeline=_grounded(without_emails, "deal_pipeline", extraction.deal_pipeline),
         deal_close_date=(
@@ -314,7 +344,7 @@ def validate_extraction(
         ),
         deal_type=_grounded(without_emails, "deal_type", extraction.deal_type),
         deal_owner=_grounded(without_emails, "deal_owner", extraction.deal_owner),
-        deal_currency=_grounded(without_emails, "deal_currency", extraction.deal_currency),
+        deal_currency=deal_currency_val,
         requested_fields=_grounded_requested_fields(visible, extraction.requested_fields),
     )
 
@@ -375,22 +405,14 @@ def visible_text(message: str) -> str:
 
 
 def normalize_amount(text: str) -> str:
-    """Parse "$50,000", "75000", "50k" or "1.5 million" into a plain decimal string."""
-    matched = _AMOUNT.fullmatch(text.strip())
-    if matched is None:
-        raise ExtractionValidationError("deal_amount", text, "invalid_format")
-    whole, fraction, scale = matched.groups()
+    """Parse monetary amounts (including Indian numbering and international currencies) into a plain decimal string."""
     try:
-        amount = Decimal(whole.replace(",", "") + (f".{fraction}" if fraction else ""))
-    except InvalidOperation as exc:
+        parsed = parse_currency_amount(text, field_name="deal_amount")
+        return parsed.amount_str
+    except CurrencyParsingError as exc:
+        raise ExtractionValidationError(exc.field, exc.value, exc.code) from exc
+    except (InvalidOperation, ValueError) as exc:
         raise ExtractionValidationError("deal_amount", text, "invalid_format") from exc
-    if scale:
-        amount *= _AMOUNT_MULTIPLIERS[scale.lower()]
-    if amount > _MAX_AMOUNT:
-        raise ExtractionValidationError("deal_amount", text, "invalid_format")
-    if amount == amount.to_integral_value():
-        return str(int(amount))
-    return f"{amount.quantize(Decimal('0.01'))}"
 
 
 def normalize_deal_close_date(text: str, *, today: date | None = None) -> str:

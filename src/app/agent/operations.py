@@ -589,14 +589,23 @@ class CRMOperations:
                         "I couldn't identify the deal type you requested. "
                         "Please provide the exact type shown in HubSpot.",
                     )
-                if validated.deal_currency is not None or _DEAL_CURRENCY_REQUEST_PATTERN.search(
-                    request.message
-                ):
-                    raise OperationError(
-                        "needs_clarification",
-                        "I can't verify this HubSpot account's supported deal currencies. "
-                        "Please use the account's configured currency and resend the request.",
-                    )
+                has_curr_phrase = bool(_DEAL_CURRENCY_REQUEST_PATTERN.search(request.message))
+                if has_curr_phrase or validated.deal_currency is not None:
+                    supported_currencies = await self._tools.supported_deal_currencies(request.tenant_id)
+                    if supported_currencies is not None:
+                        curr = validated.deal_currency
+                        if curr is not None and curr.upper() not in {c.upper() for c in supported_currencies}:
+                            raise OperationError(
+                                "needs_clarification",
+                                f"'{curr}' is not a supported currency for this HubSpot account. "
+                                f"Supported currencies are: {', '.join(sorted(supported_currencies))}.",
+                            )
+                    elif has_curr_phrase:
+                        raise OperationError(
+                            "needs_clarification",
+                            "I can't verify this HubSpot account's supported deal currencies. "
+                            "Please use the account's configured currency and resend the request.",
+                        )
                 if (
                     validated.deal_owner is not None
                     or _DEAL_OWNER_REQUEST_PATTERN.search(request.message)
@@ -894,6 +903,10 @@ class CRMOperations:
             }
             if validated.deal_amount is not None:
                 plan.deal_to_create["amount"] = validated.deal_amount
+            if validated.deal_currency is not None:
+                supported_currencies = await self._tools.supported_deal_currencies(tenant_id)
+                if supported_currencies is not None and validated.deal_currency.upper() in {c.upper() for c in supported_currencies}:
+                    plan.deal_to_create["deal_currency_code"] = validated.deal_currency.upper()
             if validated.deal_close_date is not None:
                 plan.deal_to_create["closedate"] = validated.deal_close_date
             if validated.deal_type is not None:

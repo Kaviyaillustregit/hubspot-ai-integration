@@ -56,6 +56,7 @@ class FakeCRM:
             HubSpotPropertyOption(label="New Business", value="newbusiness"),
             HubSpotPropertyOption(label="Existing Business", value="existingbusiness"),
         ]
+        self.supported_currencies: set[str] | None = None
 
     def new_id(self, prefix: str) -> str:
         return f"{prefix}-{len(self.companies) + len(self.contacts) + len(self.deals) + 1}"
@@ -186,6 +187,10 @@ class FakeDeals:
         self.crm.deals[deal_id].update(properties)
         self.crm.writes.append(f"update deal {deal_id} {properties}")
         return HubSpotDeal(id=deal_id, properties=self.crm.deals[deal_id])
+
+    @property
+    def supported_currencies(self) -> set[str] | None:
+        return getattr(self.crm, "supported_currencies", None)
 
     async def list_pipelines(self, context):
         self.crm.check(context, "read:deals")
@@ -823,6 +828,53 @@ async def test_deal_type_and_owner_requests_do_not_guess_account_values(h):
     assert currency.status == "needs_clarification"
     assert "supported deal currencies" in currency.text
     assert len(h.crm.writes) == 1
+
+
+async def test_create_deal_with_indian_rupee_and_comma_grouping(h):
+    """Verify deal creation supports Indian Rupees and Indian comma grouping."""
+    result = await h.say(
+        "Create a deal called Bangalore Expansion worth ₹2,50,000.",
+        "create_deal",
+        deal_name="Bangalore Expansion",
+        deal_amount="₹2,50,000",
+    )
+    assert result.status == "ok"
+    assert "Deal created: Bangalore Expansion" in result.text
+    deal = h.crm.deals["deal-1"]
+    assert deal["dealname"] == "Bangalore Expansion"
+    assert deal["amount"] == "250000"
+
+
+async def test_create_deal_validates_currency_against_supported_portal_currencies(h):
+    """Verify configured supported currencies are validated and passed to HubSpot."""
+    h.crm.supported_currencies = {"USD", "INR"}
+    result = await h.say(
+        "Create a deal called Mumbai HQ worth ₹2,50,000 in currency INR.",
+        "create_deal",
+        deal_name="Mumbai HQ",
+        deal_amount="₹2,50,000",
+        deal_currency="INR",
+    )
+    assert result.status == "ok"
+    deal = h.crm.deals["deal-1"]
+    assert deal["dealname"] == "Mumbai HQ"
+    assert deal["amount"] == "250000"
+    assert deal["deal_currency_code"] == "INR"
+
+
+async def test_create_deal_rejects_unsupported_currency_with_no_mutation(h):
+    """Verify an unsupported currency fails validation and mutates zero CRM records."""
+    h.crm.supported_currencies = {"USD", "INR"}
+    result = await h.say(
+        "Create a deal called Europe Deal worth €50,000 in currency EUR.",
+        "create_deal",
+        deal_name="Europe Deal",
+        deal_amount="€50,000",
+        deal_currency="EUR",
+    )
+    assert result.status == "needs_clarification"
+    assert "'EUR' is not a supported currency" in result.text
+    assert h.crm.deals == {}
 
 
 async def test_deal_type_label_maps_to_hubspot_account_value(h):

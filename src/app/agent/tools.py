@@ -749,6 +749,23 @@ class HubSpotToolRegistry:
     async def deal_type_options(self, tenant_id: str) -> list[HubSpotPropertyOption]:
         return await self._deals.get_deal_type_options(self._context(tenant_id))
 
+    async def supported_deal_currencies(self, tenant_id: str) -> set[str] | None:
+        if hasattr(self._deals, "supported_currencies"):
+            val = getattr(self._deals, "supported_currencies")
+            return set(val) if val is not None else None
+        if hasattr(self._deals, "get_supported_currencies"):
+            val = await self._deals.get_supported_currencies(self._context(tenant_id))
+            return set(val) if val is not None else None
+        if self.property_discovery_available:
+            try:
+                properties = await self.discover_properties(tenant_id, "deals")
+                for prop in properties:
+                    if prop.name in {"deal_currency_code", "currency", "dealcurrencycode"}:
+                        return {opt.value.upper() for opt in prop.options if not opt.hidden}
+            except Exception:
+                pass
+        return None
+
     async def associate(
         self,
         tenant_id: str,
