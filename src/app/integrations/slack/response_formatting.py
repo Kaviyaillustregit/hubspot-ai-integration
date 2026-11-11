@@ -860,8 +860,51 @@ def render_crud_card(
                 if fv:
                     candidates.append((k, k.replace("_", " ").title(), fv))
         elif rt == "company":
-            for k in ("domain", "industry", "city", "phone", "hubspot_owner_id", "createdate"):
-                v = data.get(k)
+            for k in ("domain", "industry", "phone", "city", "status", "hubspot_owner_id", "createdate"):
+                if k == "phone":
+                    v = (
+                        data.get("phone")
+                        or data.get("company_phone")
+                        or data.get("telephone")
+                        or data.get("mobilephone")
+                        or data.get("phone_number")
+                        or (data.get("properties") or {}).get("phone")
+                        or (data.get("properties") or {}).get("company_phone")
+                        or (data.get("properties") or {}).get("telephone")
+                        or (data.get("properties") or {}).get("mobilephone")
+                        or (data.get("properties") or {}).get("phone_number")
+                    )
+                elif k == "industry":
+                    v = (
+                        data.get("industry")
+                        or data.get("company_industry")
+                        or (data.get("properties") or {}).get("industry")
+                        or (data.get("properties") or {}).get("company_industry")
+                    )
+                elif k == "domain":
+                    v = (
+                        data.get("domain")
+                        or data.get("website")
+                        or (data.get("properties") or {}).get("domain")
+                        or (data.get("properties") or {}).get("website")
+                    )
+                elif k == "city":
+                    v = (
+                        data.get("city")
+                        or data.get("company_city")
+                        or (data.get("properties") or {}).get("city")
+                        or (data.get("properties") or {}).get("company_city")
+                    )
+                elif k in {"hubspot_owner_id", "owner"}:
+                    v = (
+                        data.get("owner")
+                        or data.get("owner_name")
+                        or data.get("owner_id")
+                        or data.get("hubspot_owner_id")
+                        or (data.get("properties") or {}).get("hubspot_owner_id")
+                    )
+                else:
+                    v = data.get(k) or (data.get("properties") or {}).get(k)
                 fv = _fmt_crud_val(k, v)
                 if fv:
                     candidates.append((k, k.replace("_", " ").title(), fv))
@@ -993,10 +1036,61 @@ def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
                     changes[part.strip()] = "Updated"
 
     data = dict(result)
+    # Merge nested properties into data if present
+    props = result.get("properties")
+    if isinstance(props, dict):
+        for pk, pv in props.items():
+            data.setdefault(pk, pv)
+
     if cards:
         data.update(cards[0])
+        card_props = cards[0].get("properties")
+        if isinstance(card_props, dict):
+            for pk, pv in card_props.items():
+                data.setdefault(pk, pv)
+
     if changes and isinstance(changes, dict):
         data.setdefault("changes", changes)
+
+    # For companies, resolve phone, industry, domain from properties, aliases, detail, and text
+    if obj_type == "company":
+        if not data.get("phone"):
+            for pk in ("phone", "company_phone", "telephone", "mobilephone", "phone_number"):
+                if data.get(pk):
+                    data["phone"] = data[pk]
+                    break
+        if not data.get("phone"):
+            phone_m = re.search(
+                r"\b(?:phone|company\s*phone|tel|telephone)(?:\s*(?:number|#))?[:\s=]+([+0-9()\-.\s]{7,25})",
+                text,
+                re.IGNORECASE,
+            )
+            if phone_m:
+                data["phone"] = phone_m.group(1).strip()
+
+        if not data.get("industry"):
+            if data.get("company_industry"):
+                data["industry"] = data["company_industry"]
+        if not data.get("industry"):
+            ind_m = re.search(
+                r"\bindustry[:\s=]+([a-zA-Z0-9\s&/_-]+?)(?=\n|$|\s*•|\s*,\s*)",
+                text,
+                re.IGNORECASE,
+            )
+            if ind_m:
+                data["industry"] = ind_m.group(1).strip()
+
+        if not data.get("domain") and not data.get("website"):
+            if cards and isinstance(cards[0].get("detail"), str) and "." in cards[0]["detail"]:
+                data["domain"] = cards[0]["detail"].strip()
+            else:
+                dom_m = re.search(
+                    r"\b(?:domain|website)[:\s=]+([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+                    text,
+                    re.IGNORECASE,
+                )
+                if dom_m:
+                    data["domain"] = dom_m.group(1).strip()
 
     # Ensure phone property is retrieved for contacts from properties, text, or recent cache
     if obj_type == "contact" and not data.get("phone"):

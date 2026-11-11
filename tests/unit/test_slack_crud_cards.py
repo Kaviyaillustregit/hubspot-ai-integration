@@ -242,3 +242,74 @@ def test_contact_crud_card_phone_and_no_duplicate_owner_and_header_button():
     assert len(owner_blocks) == 1, f"Expected Owner Alex Rivera once, found {len(owner_blocks)} times"
     context_blocks = [b for b in blocks if b.get("type") == "context"]
     assert len(context_blocks) == 0, "No duplicate legacy context blocks should be appended"
+
+
+def test_company_crud_card_apple_example():
+    """Live test regression: Create company Apple with domain apple.com, phone 3478675645, industry Software."""
+    url = "https://app.hubspot.com/contacts/123/record/0-2/apple-101"
+    response = AgentResponse(
+        status="ok",
+        text="Company Apple created in HubSpot.\n• Domain: apple.com\n• Phone: 3478675645\n• Industry: Software",
+        request_id="req-company-apple",
+        result={
+            "kind": "company_created",
+            "name": "Apple",
+            "domain": "apple.com",
+            "phone": "3478675645",
+            "industry": "Software",
+            "hubspot_url": url,
+        },
+    )
+
+    blocks = render_response_blocks(response)
+
+    # 1. Header has Apple and View in HubSpot button
+    header_block = next(
+        b for b in blocks
+        if b.get("type") == "section" and b.get("text", {}).get("text", "").startswith("🏢")
+    )
+    assert "*<https://app.hubspot.com/contacts/123/record/0-2/apple-101|Apple>* (Company)" in header_block["text"]["text"]
+    assert header_block.get("accessory") is not None
+    assert header_block["accessory"]["text"]["text"] == "View in HubSpot ↗"
+
+    # 2. Fields section contains Domain, Phone, and Industry in 2-column fields grid
+    field_block = next(b for b in blocks if b.get("type") == "section" and "fields" in b)
+    assert "accessory" not in field_block
+    field_texts = " ".join(f["text"] for f in field_block["fields"])
+    assert "*🌐 Domain:* apple.com" in field_texts
+    assert "*📞 Phone:* 3478675645" in field_texts
+    assert "*🏭 Industry:* Software" in field_texts
+    assert len(field_block["fields"]) in {2, 4}
+
+
+def test_company_crud_card_apple_example_nested_properties():
+    """Verify Apple company creation when properties are nested under properties dict or aliases."""
+    url = "https://app.hubspot.com/contacts/123/record/0-2/apple-102"
+    response = AgentResponse(
+        status="ok",
+        text="Company Apple created successfully.",
+        request_id="req-company-apple-props",
+        result={
+            "kind": "crm_records",
+            "title": "Company created",
+            "operation": "create",
+            "object_type": "company",
+            "name": "Apple",
+            "properties": {
+                "domain": "apple.com",
+                "phone": "3478675645",
+                "industry": "Software",
+                "status": "Active",
+            },
+            "hubspot_url": url,
+        },
+    )
+
+    blocks = render_response_blocks(response)
+    field_block = next(b for b in blocks if b.get("type") == "section" and "fields" in b)
+    field_texts = " ".join(f["text"] for f in field_block["fields"])
+    assert "*🌐 Domain:* apple.com" in field_texts
+    assert "*📞 Phone:* 3478675645" in field_texts
+    assert "*🏭 Industry:* Software" in field_texts
+    assert "*🔄 Status:* Active" in field_texts
+    assert len(field_block["fields"]) == 4
