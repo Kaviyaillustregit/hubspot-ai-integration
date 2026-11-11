@@ -842,8 +842,11 @@ def render_crud_card(
     else:  # CREATE
         candidates: list[tuple[str, str, str]] = []
         if rt == "contact":
-            for k in ("email", "phone", "company", "jobtitle", "hubspot_owner_id", "createdate"):
-                v = data.get(k)
+            for k in ("email", "phone", "company", "jobtitle", "owner", "createdate"):
+                if k == "owner":
+                    v = data.get("owner") or data.get("owner_name") or data.get("owner_id") or data.get("hubspot_owner_id")
+                else:
+                    v = data.get(k)
                 fv = _fmt_crud_val(k, v)
                 if fv:
                     candidates.append((k, k.replace("_", " ").title(), fv))
@@ -889,10 +892,13 @@ def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
     cards = response.cards or []
     text = response.text or ""
 
+    kind = result.get("kind")
     is_mutation = bool(
         result.get("card") is True
         or result.get("crud_card") is True
         or result.get("operation") in {"create", "update", "delete", "archive"}
+        or kind in {"company_created", "deal_created"}
+        or (kind == "contact_created" and any("create_contact" in t for t in tools_used))
         or any(
             t in title
             for t in (
@@ -904,6 +910,7 @@ def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
         )
         or any(
             tool in {
+                "create_company", "create_deal",
                 "update_contact", "update_company", "update_deal",
                 "delete_contact", "delete_company", "delete_deal",
             }
@@ -1001,6 +1008,13 @@ def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
     if clean_summary:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": clean_summary}})
     blocks.extend(card_blocks)
+
+    owner_name = result.get("owner_name")
+    if isinstance(owner_name, str) and owner_name and owner_name != "Unassigned":
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "👤 Owner: " + html.escape(owner_name, quote=False)}],
+        })
 
     if operation != "delete" and record_url:
         blocks.append({

@@ -1590,6 +1590,12 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
         )
 
     text = response.text
+    from app.integrations.slack.response_formatting import render_crud_response_card
+
+    crud_card_blocks = render_crud_response_card(response)
+    if crud_card_blocks is not None:
+        return crud_card_blocks
+
     if kind == "contact_created":
         name = result.get("name")
         company = result.get("company_name")
@@ -1617,12 +1623,6 @@ def _build_response_blocks(response: AgentResponse) -> list[Block]:
             rendered.append(_context("  ·  ".join(metadata)))
         rendered.extend(_record_link_blocks(response))
         return rendered
-
-    from app.integrations.slack.response_formatting import render_crud_response_card
-
-    crud_card_blocks = render_crud_response_card(response)
-    if crud_card_blocks is not None:
-        return crud_card_blocks
 
     chunks = _split_text(text)
     blocks = [
