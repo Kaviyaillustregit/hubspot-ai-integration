@@ -713,35 +713,22 @@ def render_crud_card(
     if not is_delete and isinstance(url_candidate, str) and url_candidate.strip():
         u = url_candidate.strip()
         parsed = urlsplit(u)
-    if not is_delete and isinstance(url_candidate, str) and url_candidate.strip():
-        u = url_candidate.strip()
-        parsed = urlsplit(u)
-        if parsed.scheme == 'https' and not any(c in u for c in '<>|" '):
-            valid_url = u
+        if parsed.scheme == "https" and not any(c in u for c in '<>|" '):
             valid_url = u
 
     # 1. Divider
     card_blocks: list[Block] = [{"type": "divider"}]
 
     # 2. Header
-    if valid_url:
-        header_text = f"{emoji} *<{valid_url}|{escaped_name}>* ({badge})"
-        header_block: Block = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-            "accessory": {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "View in HubSpot ↗", "emoji": True},
-                "url": valid_url,
-                "action_id": "view_in_hubspot",
-            },
-        }
-    else:
-        header_text = f"{emoji} *{escaped_name}* ({badge})"
-        header_block = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-        }
+    header_text = (
+        f"{emoji} *<{valid_url}|{escaped_name}>* ({badge})"
+        if valid_url
+        else f"{emoji} *{escaped_name}* ({badge})"
+    )
+    header_block: Block = {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text},
+    }
     card_blocks.append(header_block)
 
     def _fmt_crud_val(k: str, v: object) -> str:
@@ -877,10 +864,18 @@ def render_crud_card(
         else:
             fields = ["*🔄 Status:* Active", f"*📅 Created:* {today_date}"]
 
-    card_blocks.append({
+    fields_block: Block = {
         "type": "section",
         "fields": [{"type": "mrkdwn", "text": f} for f in fields],
-    })
+    }
+    if valid_url and not is_delete:
+        fields_block["accessory"] = {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "View in HubSpot ↗", "emoji": True},
+            "url": valid_url,
+            "action_id": "view_in_hubspot",
+        }
+    card_blocks.append(fields_block)
     return card_blocks
 
 

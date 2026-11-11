@@ -52,14 +52,14 @@ def test_crud_cards_create_renders_all_required_elements(object_type, expected_e
         if b.get("type") == "section" and b.get("text", {}).get("text", "").startswith(expected_emoji)
     )
     assert f"*<{url}|New {expected_badge}>* ({expected_badge})" in header_block["text"]["text"]
+    assert "accessory" not in header_block
 
-    accessory = header_block.get("accessory")
-    assert accessory is not None, "CREATE card must contain right-side accessory button"
+    field_block = next(b for b in blocks if b.get("type") == "section" and "fields" in b)
+    accessory = field_block.get("accessory")
+    assert accessory is not None, "CREATE card fields section must contain right-side accessory button"
     assert accessory["type"] == "button"
     assert accessory["text"]["text"] == "View in HubSpot ↗"
     assert accessory["url"] == url
-
-    field_block = next(b for b in blocks if b.get("type") == "section" and "fields" in b)
     fields = field_block["fields"]
     assert len(fields) in {2, 4}, f"Fields must be balanced 2 or 4, got {len(fields)}"
 
@@ -105,9 +105,10 @@ def test_crud_cards_update_shows_changes_and_view_button(object_type, expected_e
         if b.get("type") == "section" and b.get("text", {}).get("text", "").startswith(expected_emoji)
     )
     assert f"*<{url}|Acme {expected_badge}>* ({expected_badge})" in header_block["text"]["text"]
-    assert header_block.get("accessory", {}).get("text", {}).get("text") == "View in HubSpot ↗"
+    assert "accessory" not in header_block
 
     field_block = next(b for b in blocks if b.get("type") == "section" and "fields" in b)
+    assert field_block.get("accessory", {}).get("text", {}).get("text") == "View in HubSpot ↗"
     fields = field_block["fields"]
     assert len(fields) in {2, 4}
 
@@ -181,7 +182,8 @@ def test_shared_render_crud_card_direct_invocation():
     assert len(card) == 3
     assert card[0]["type"] == "divider"
     assert "💼 *<https://app.hubspot.com/contacts/123/record/0-3/456|Big Enterprise Deal>* (Deal)" in card[1]["text"]["text"]
-    assert card[1]["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    assert "accessory" not in card[1]
+    assert card[2]["accessory"]["text"]["text"] == "View in HubSpot ↗"
     field_texts = " ".join(f["text"] for f in card[2]["fields"])
     assert "$120,000" in field_texts
     assert "Closed Won" in field_texts
