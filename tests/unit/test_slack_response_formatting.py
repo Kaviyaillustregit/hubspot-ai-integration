@@ -471,10 +471,11 @@ def test_single_deal_detail_renders_as_crm_record_card():
     assert f"<{url}|Cloud Migration Project>" in header_text
     assert "`Deal`" in header_text
     assert "*💰 Amount:* $250,000" in header_text
-    assert header_block["accessory"]["text"]["text"] == "View in HubSpot ↗"
-    assert header_block["accessory"]["url"] == url
+    link_block = blocks[divider_indices[0] + 2]
+    assert link_block["type"] == "section"
+    assert link_block["fields"][1]["text"] == f"<{url}|View in HubSpot ↗>"
 
-    fields_block = blocks[divider_indices[0] + 2]
+    fields_block = blocks[divider_indices[0] + 3]
     fields = fields_block["fields"]
     assert len(fields) == 4
     assert fields[0]["text"] == "*🏢 Company:* Not available"
@@ -542,9 +543,10 @@ def test_operations_deal_list_renders_as_crm_record_cards():
     assert f"<{url1}|Acme Renewal>" in h1["text"]["text"]
     assert "`Deal`" in h1["text"]["text"]
     assert "*💰 Amount:* $100,000" in h1["text"]["text"]
-    assert h1["accessory"]["text"]["text"] == "View in HubSpot ↗"
+    link1 = blocks[divider_indices[0] + 2]
+    assert link1["fields"][1]["text"] == f"<{url1}|View in HubSpot ↗>"
 
-    f1 = blocks[divider_indices[0] + 2]["fields"]
+    f1 = blocks[divider_indices[0] + 3]["fields"]
     assert len(f1) == 4
     assert f1[0]["text"] == "*🏢 Company:* Acme Corp"
     assert f1[1]["text"] == "*🟡 Stage:* Qualified To Buy"
@@ -556,7 +558,10 @@ def test_operations_deal_list_renders_as_crm_record_cards():
     assert f"<{url2}|Beta Expansion>" in h2["text"]["text"]
     assert "*💰 Amount:* $50,000" in h2["text"]["text"]
 
-    f2 = blocks[divider_indices[1] + 2]["fields"]
+    link2 = blocks[divider_indices[1] + 2]
+    assert link2["fields"][1]["text"] == f"<{url2}|View in HubSpot ↗>"
+
+    f2 = blocks[divider_indices[1] + 3]["fields"]
     assert len(f2) == 4
     assert f2[0]["text"] == "*🏢 Company:* Not available"
     assert f2[1]["text"] == "*⚪ Stage:* Prospecting"
@@ -1646,18 +1651,19 @@ def test_deal_card_structure_header_accessory_button_and_paired_fields():
     divider_indices = [i for i, b in enumerate(blocks) if b.get("type") == "divider"]
     assert len(divider_indices) >= 1
 
-    # 2. Header with emoji, hyperlinked title, badge, and accessory button
+    # 2. Header with emoji, hyperlinked title, badge
     header_block = blocks[divider_indices[0] + 1]
     assert header_block["type"] == "section"
     assert "💼" in header_block["text"]["text"]
     assert f"<{url}|Enterprise Renewal>" in header_block["text"]["text"]
     assert "`Deal`" in header_block["text"]["text"]
-    assert header_block["accessory"]["type"] == "button"
-    assert header_block["accessory"]["text"]["text"] == "View in HubSpot ↗"
-    assert header_block["accessory"]["url"] == url
+
+    link_block = blocks[divider_indices[0] + 2]
+    assert link_block["type"] == "section"
+    assert link_block["fields"][1]["text"] == f"<{url}|View in HubSpot ↗>"
 
     # 3. Fields in section block (strictly 4)
-    fields_block = blocks[divider_indices[0] + 2]
+    fields_block = blocks[divider_indices[0] + 3]
     assert fields_block["type"] == "section"
     fields = fields_block["fields"]
     assert len(fields) == 4
@@ -2116,10 +2122,10 @@ def test_normal_crm_intelligence_query_activates_deal_cards_with_header_amount_a
     assert f"<{url1}|AI Transformation Project>" in h1["text"]["text"]
     assert "`Deal`" in h1["text"]["text"]
     assert "*💰 Amount:* $850,000" in h1["text"]["text"]
-    assert h1["accessory"]["text"]["text"] == "View in HubSpot ↗"
-    assert h1["accessory"]["url"] == url1
+    link1 = blocks[dividers[0] + 2]
+    assert link1["fields"][1]["text"] == f"<{url1}|View in HubSpot ↗>"
 
-    f1 = blocks[dividers[0] + 2]["fields"]
+    f1 = blocks[dividers[0] + 3]["fields"]
     assert len(f1) == 4
     assert f1[0]["text"] == "*🏢 Company:* Acme Corp"
     assert f1[1]["text"] == "*🟡 Stage:* Qualified To Buy"
@@ -2131,7 +2137,10 @@ def test_normal_crm_intelligence_query_activates_deal_cards_with_header_amount_a
     assert f"<{url2}|Cloud Upgrade>" in h2["text"]["text"]
     assert "*💰 Amount:* $125,000" in h2["text"]["text"]
 
-    f2 = blocks[dividers[1] + 2]["fields"]
+    link2 = blocks[dividers[1] + 2]
+    assert link2["fields"][1]["text"] == f"<{url2}|View in HubSpot ↗>"
+
+    f2 = blocks[dividers[1] + 3]["fields"]
     assert len(f2) == 4
     assert f2[0]["text"] == "*🏢 Company:* Not available"
     assert f2[1]["text"] == "*🟡 Stage:* Contract Sent"
@@ -2185,10 +2194,10 @@ def test_normal_crm_intelligence_query_activates_contact_cards():
     assert "👤" in header["text"]["text"]
     assert f"<{url}|Maria Johnson>" in header["text"]["text"]
     assert "`Contact`" in header["text"]["text"]
-    assert header["accessory"]["text"]["text"] == "View in HubSpot ↗"
-    assert header["accessory"]["url"] == url
+    link = blocks[dividers[0] + 2]
+    assert link["fields"][1]["text"] == f"<{url}|View in HubSpot ↗>"
 
-    fields = blocks[dividers[0] + 2]["fields"]
+    fields = blocks[dividers[0] + 3]["fields"]
     assert len(fields) >= 4
     assert "*📅 Create date:* 2026-09-17" in json.dumps(fields, ensure_ascii=False)
 
@@ -2239,10 +2248,10 @@ def test_normal_crm_intelligence_query_activates_company_cards():
     assert "🏢" in header["text"]["text"]
     assert f"<{url}|Global Holding>" in header["text"]["text"]
     assert "`Company`" in header["text"]["text"]
-    assert header["accessory"]["text"]["text"] == "View in HubSpot ↗"
-    assert header["accessory"]["url"] == url
+    link = blocks[dividers[0] + 2]
+    assert link["fields"][1]["text"] == f"<{url}|View in HubSpot ↗>"
 
-    fields = blocks[dividers[0] + 2]["fields"]
+    fields = blocks[dividers[0] + 3]["fields"]
     assert len(fields) == 4
     assert fields[0]["text"] == "*🌐 Company domain:* globalholding.com"
     assert fields[1]["text"] == "*🏭 Industry:* Finance"

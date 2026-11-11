@@ -2066,26 +2066,13 @@ def _render_crm_record_card(
 
     if valid_url:
         header_text = f"{emoji} *<{valid_url}|{escaped_title}>* `{badge}`{amt_line}"
-        header_block: Block = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-            "accessory": {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "View in HubSpot ↗",
-                    "emoji": True,
-                },
-                "url": valid_url,
-                "action_id": "view_in_hubspot",
-            },
-        }
     else:
         header_text = f"{emoji} *{escaped_title}* `{badge}`{amt_line}"
-        header_block = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-        }
+
+    header_block: Block = {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text},
+    }
 
     col_map = {col.get("key", ""): col.get("label", "") for col in columns}
 
@@ -2292,6 +2279,15 @@ def _render_crm_record_card(
         {"type": "divider"},
         header_block,
     ]
+
+    if valid_url:
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": " "},
+                {"type": "mrkdwn", "text": f"<{valid_url}|View in HubSpot ↗>"},
+            ],
+        })
 
     for i in range(0, len(card_fields), 10):
         chunk = card_fields[i : i + 10]
