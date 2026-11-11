@@ -293,6 +293,11 @@ _CONFIRM_ACTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_AFFIRMATIVE_CONFIRM_PATTERN = re.compile(
+    r"^\s*(?:<@[^>]+>\s*)?(?:please\s+)?(?:yes(?:\s+please)?|confirm|proceed|go\s+ahead|do\s+it|do\s+that|go\s+for\s+it|approve|sure|yep|yeah|ok|okay)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
 _EMAIL_PATTERN = re.compile(
     r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
     re.IGNORECASE,
@@ -1707,6 +1712,18 @@ class AccountIntelligenceAgent:
     async def _respond_internal(self, request: AgentRequest) -> AgentResponse:
         confirmation_action_id = self._confirmation_action_id(request.message)
 
+        if confirmation_action_id is None and _AFFIRMATIVE_CONFIRM_PATTERN.match(request.message):
+            if hasattr(self._action_safety, "get_latest_pending_action"):
+                pending = await self._action_safety.get_latest_pending_action(
+                    tenant_id=request.tenant_id,
+                    actor_id=request.actor_id,
+                    channel_id=request.channel_id,
+                )
+                if pending is not None:
+                    action_channel = pending.payload.get("_channel_id") if isinstance(pending.payload, dict) else None
+                    if not (action_channel and request.channel_id and action_channel != request.channel_id):
+                        confirmation_action_id = pending.id
+
         if confirmation_action_id is not None:
             confirmed_action = await self._action_safety.confirm_and_claim_action(
                 action_id=confirmation_action_id,
@@ -1716,6 +1733,22 @@ class AccountIntelligenceAgent:
             )
 
             if confirmed_action is None:
+                if hasattr(self._action_safety, "get_action_record"):
+                    record_info = await self._action_safety.get_action_record(
+                        action_id=confirmation_action_id,
+                        tenant_id=request.tenant_id,
+                        actor_id=request.actor_id,
+                    )
+                    if record_info and record_info.get("is_expired"):
+                        return AgentResponse(
+                            status="expired_confirmation",
+                            text=(
+                                "That confirmation request has expired (confirmations expire after 5 minutes for safety). "
+                                "Would you like me to prepare a fresh confirmation for this change?"
+                            ),
+                            request_id=request.request_id,
+                            tools_used=[],
+                        )
                 return self._safe(
                     "invalid_confirmation",
                     (
@@ -1730,7 +1763,7 @@ class AccountIntelligenceAgent:
 
                     properties = {}
                     for key, value in confirmed_action.payload.items():
-                        if key == "contact_id":
+                        if key == "contact_id" or key.startswith("_"):
                             continue
                         canon_key = resolve_contact_property_name(key) or key
                         canon_key = canon_key.strip().lower().replace(" ", "_").replace("-", "_")
@@ -3769,6 +3802,7 @@ class AccountIntelligenceAgent:
             resource_type="contact",
             payload={
                 "contact_id": contact_update_intent.contact_id,
+                "_channel_id": request.channel_id,
                 **contact_update_intent.properties,
             },
         )
@@ -3846,6 +3880,7 @@ class AccountIntelligenceAgent:
             resource_type="contact",
             payload={
                 "contact_id": contact_delete_intent.contact_id,
+                "_channel_id": request.channel_id,
             },
         )
 

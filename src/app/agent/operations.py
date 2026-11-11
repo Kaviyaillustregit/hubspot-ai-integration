@@ -1157,6 +1157,7 @@ class CRMOperations:
                 "company_name": label,
                 "properties": changes,
                 "summary": summary,
+                "_channel_id": request.channel_id,
             },
         )
         return _pending_response(
@@ -1191,7 +1192,7 @@ class CRMOperations:
             actor_id=request.actor_id,
             action_type="delete_company",
             resource_type="company",
-            payload={"company_id": company.id, "company_name": label},
+            payload={"company_id": company.id, "company_name": label, "_channel_id": request.channel_id},
         )
         return _pending_response(
             request,
@@ -1266,6 +1267,7 @@ class CRMOperations:
                 "deal_name": label,
                 "properties": changes,
                 "summary": summary,
+                "_channel_id": request.channel_id,
             },
         )
         return _pending_response(

@@ -233,6 +233,60 @@ class ActionSafetyService:
 
             return confirmed_action
 
+    async def get_latest_pending_action(
+        self,
+        *,
+        tenant_id: str,
+        actor_id: str,
+        channel_id: str | None = None,
+    ) -> ConfirmedAction | None:
+        async with UnitOfWork(self._session_factory) as unit_of_work:
+            if unit_of_work.session is None:
+                raise RuntimeError("UnitOfWork session is unavailable")
+            repo = PendingActionRepository(unit_of_work.session)
+            record = await repo.get_latest_pending(tenant_id=tenant_id, actor_id=actor_id)
+            if record is None:
+                return None
+            payload = dict(record.payload)
+            action_channel = payload.get("_channel_id")
+            if action_channel and channel_id and action_channel != channel_id:
+                return None
+            return ConfirmedAction(
+                id=record.id,
+                tenant_id=record.tenant_id,
+                actor_id=record.actor_id,
+                action_type=record.action_type,
+                resource_type=record.resource_type,
+                payload=payload,
+            )
+
+    async def get_action_record(
+        self,
+        *,
+        action_id: str,
+        tenant_id: str,
+        actor_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        async with UnitOfWork(self._session_factory) as unit_of_work:
+            if unit_of_work.session is None:
+                raise RuntimeError("UnitOfWork session is unavailable")
+            repo = PendingActionRepository(unit_of_work.session)
+            record = await repo.get_by_id(action_id=action_id, tenant_id=tenant_id, actor_id=actor_id)
+            if record is None:
+                return None
+            now = datetime.now(UTC)
+            return {
+                "id": record.id,
+                "tenant_id": record.tenant_id,
+                "actor_id": record.actor_id,
+                "action_type": record.action_type,
+                "resource_type": record.resource_type,
+                "payload": dict(record.payload),
+                "status": record.status,
+                "expires_at": record.expires_at,
+                "is_expired": record.expires_at <= now,
+            }
+
     async def confirm_and_claim(
         self,
         *,

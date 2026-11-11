@@ -97,6 +97,40 @@ class PendingActionRepository:
         record.confirmed_at = now
         return record
 
+    async def get_by_id(
+        self,
+        *,
+        action_id: str,
+        tenant_id: str,
+        actor_id: str | None = None,
+    ) -> PendingActionRecord | None:
+        stmt = select(PendingActionRecord).where(
+            PendingActionRecord.id == action_id,
+            PendingActionRecord.tenant_id == tenant_id,
+        )
+        if actor_id:
+            stmt = stmt.where(PendingActionRecord.actor_id == actor_id)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_latest_pending(
+        self,
+        *,
+        tenant_id: str,
+        actor_id: str,
+    ) -> PendingActionRecord | None:
+        result = await self._session.execute(
+            select(PendingActionRecord)
+            .where(
+                PendingActionRecord.tenant_id == tenant_id,
+                PendingActionRecord.actor_id == actor_id,
+                PendingActionRecord.status == "pending",
+            )
+            .order_by(PendingActionRecord.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def set_status(
         self,
         *,
