@@ -2285,7 +2285,7 @@ def _render_crm_record_card(
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": " "},
-                {"type": "mrkdwn", "text": f"<{valid_url}|View in HubSpot ↗>"},
+                {"type": "mrkdwn", "text": f"*<{valid_url}|[ View in HubSpot ↗ ]>*"},
             ],
         })
 
