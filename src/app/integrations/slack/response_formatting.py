@@ -12,9 +12,9 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from app.agent.schemas import AgentResponse
@@ -530,3 +530,482 @@ def _split_text_at_limit(text: str, limit: int) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+# -------------------------------------------------------------------------
+# Shared CRUD response card formatting
+# -------------------------------------------------------------------------
+
+_MOJIBAKE_EM_DASH = "—".encode("utf-8").decode("latin-1")
+
+
+def _format_crud_date(val: object) -> str:
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available"
+    if isinstance(val, (int, float)):
+        try:
+            ts = float(val)
+            if ts > 1e11:
+                ts /= 1000.0
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return str(val)
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d")
+    if isinstance(val, date):
+        return val.strftime("%Y-%m-%d")
+    s = str(val).strip()
+    if not s or s.casefold() in {"not available", "none", "null", "—"}:
+        return "Not available"
+    iso_match = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
+    if iso_match:
+        return iso_match.group(1)
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%b %d, %Y at %H:%M:%S %z",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return s
+
+
+def _format_crud_amount(val: object) -> str:
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available"
+    if isinstance(val, (int, float, Decimal)):
+        try:
+            d = Decimal(str(val))
+            if d == d.to_integral():
+                return f"${int(d):,}"
+            return f"${d:,.2f}"
+        except Exception:
+            return f"${val}"
+    s = str(val).strip()
+    if not s or s.casefold() in {"not available", "none", "null", "—"}:
+        return "Not available"
+    if s.startswith("$"):
+        return s
+    cleaned = re.sub(r"^[A-Z]{3}\s*", "", s, flags=re.IGNORECASE).replace(",", "").strip()
+    try:
+        d = Decimal(cleaned)
+        if d == d.to_integral():
+            return f"${int(d):,}"
+        return f"${d:,.2f}"
+    except (InvalidOperation, ValueError):
+        return f"${s}"
+
+
+def _resolve_crud_owner(val: object, row: dict[str, Any]) -> str:
+    for key in ("owner_name", "hubspot_owner_name"):
+        cand = row.get(key)
+        if isinstance(cand, str) and cand.strip() and not cand.strip().isdigit():
+            return cand.strip()
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Unassigned"
+    s = str(val).strip()
+    if not s or s.casefold() in {"unassigned", "none", "null", "—"}:
+        return "Unassigned"
+    if s.isdigit():
+        return "Owner not available"
+    if s.casefold() in {"owner not available", "not available"}:
+        return "Owner not available"
+    return s
+
+
+def _resolve_crud_company(val: object, row: dict[str, Any]) -> str:
+    for key in ("company_name", "companyname", "associated_company_name", "account_name"):
+        cand = row.get(key)
+        if isinstance(cand, str) and cand.strip() and not cand.strip().isdigit():
+            return cand.strip()
+    if val is None or val == "" or val == "—" or val == _MOJIBAKE_EM_DASH:
+        return "Not available"
+    s = str(val).strip()
+    if not s or s.casefold() in {"not available", "none", "null", "—"}:
+        return "Not available"
+    if s.isdigit():
+        return "Not available"
+    return s
+
+
+def render_crud_card(
+    record_type: str,
+    operation: str,
+    row: dict[str, Any] | None = None,
+    *,
+    record_name: str | None = None,
+    record_url: str | None = None,
+    changes: dict[str, Any] | None = None,
+    today_date: str | None = None,
+) -> list[Block]:
+    """Render a consistent Block Kit response card for CREATE, UPDATE, and DELETE operations.
+
+    1. Divider: {"type": "divider"}
+    2. Header: {emoji} *<{url}|{name}>* ({badge}) + View in HubSpot ↗ accessory button.
+       (Accessory button omitted on DELETE).
+    3. Fields: 2 or 4 balanced fields in a 2-column grid.
+       - Owner / company IDs resolved to display names.
+       - Monetary amounts formatted with currency ($).
+       - Dates formatted as YYYY-MM-DD.
+       - Missing fields handled gracefully without None or raw internal IDs.
+    """
+    if today_date is None:
+        today_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    data = dict(row or {})
+    op = (operation or "create").casefold()
+    is_delete = op in {"delete", "archive"}
+    is_update = op in {"update", "edit"}
+
+    rt = (record_type or "record").casefold()
+    for cand in ("contact", "company", "deal"):
+        if cand in rt:
+            rt = cand
+            break
+
+    emoji_map = {"contact": "👤", "company": "🏢", "deal": "💼"}
+    badge_map = {"contact": "Contact", "company": "Company", "deal": "Deal"}
+    emoji = emoji_map.get(rt, "📄")
+    badge = badge_map.get(rt, "Record")
+
+    name = record_name
+    if not name:
+        if rt == "contact":
+            first = data.get("firstname") or data.get("first_name")
+            last = data.get("lastname") or data.get("last_name")
+            f_clean = str(first).strip() if first and str(first).strip() != "None" else ""
+            l_clean = str(last).strip() if last and str(last).strip() != "None" else ""
+            if f_clean and l_clean:
+                name = f"{f_clean} {l_clean}"
+            elif f_clean or l_clean:
+                name = f_clean or l_clean
+        elif rt == "deal":
+            for k in ("dealname", "deal_name", "title"):
+                if data.get(k):
+                    name = str(data[k]).strip()
+                    break
+        elif rt == "company":
+            for k in ("company_name", "companyname"):
+                if data.get(k):
+                    name = str(data[k]).strip()
+                    break
+    if not name:
+        for k in ("name", "title", "label"):
+            if data.get(k) and not str(data[k]).strip().casefold().startswith("http"):
+                name = str(data[k]).strip()
+                break
+    if not name:
+        name = badge
+    escaped_name = html.escape(str(name), quote=False)
+
+    url_candidate = record_url or data.get("hubspot_url") or data.get("view_url") or data.get("url")
+    valid_url = None
+    if not is_delete and isinstance(url_candidate, str) and url_candidate.strip():
+        u = url_candidate.strip()
+        parsed = urlsplit(u)
+    if not is_delete and isinstance(url_candidate, str) and url_candidate.strip():
+        u = url_candidate.strip()
+        parsed = urlsplit(u)
+        if parsed.scheme == 'https' and not any(c in u for c in '<>|" '):
+            valid_url = u
+            valid_url = u
+
+    # 1. Divider
+    card_blocks: list[Block] = [{"type": "divider"}]
+
+    # 2. Header
+    if valid_url:
+        header_text = f"{emoji} *<{valid_url}|{escaped_name}>* ({badge})"
+        header_block: Block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View in HubSpot ↗", "emoji": True},
+                "url": valid_url,
+                "action_id": "view_in_hubspot",
+            },
+        }
+    else:
+        header_text = f"{emoji} *{escaped_name}* ({badge})"
+        header_block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+        }
+    card_blocks.append(header_block)
+
+    def _fmt_crud_val(k: str, v: object) -> str:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if not s or s.casefold() in {"none", "null", "undefined", "—", _MOJIBAKE_EM_DASH}:
+            return ""
+        k_lower = k.casefold()
+        if k_lower in {"owner", "hubspot_owner_id", "owner_id"}:
+            res = _resolve_crud_owner(s, data)
+            return "" if res in {"Owner not available", "Unassigned"} and not s else res
+        if k_lower in {"company", "company_id", "associatedcompanyid", "associated_company"}:
+            res = _resolve_crud_company(s, data)
+            return "" if res == "Not available" and not s else res
+        if any(x in k_lower for x in ("amount", "revenue", "price", "total")):
+            return _format_crud_amount(v)
+        if any(x in k_lower for x in ("date", "closedate", "createdate")):
+            return _format_crud_date(v)
+        if k_lower.endswith("_id") or k_lower in {"id", "hs_object_id"}:
+            return ""
+        return html.escape(s, quote=False)
+
+    def _crud_field_mrkdwn(key: str, label: str, val: str) -> str:
+        k_l = key.casefold()
+        l_l = label.casefold()
+        if "email" in k_l or "email" in l_l:
+            e, lbl = "📧", "Email"
+        elif "phone" in k_l or "phone" in l_l:
+            e, lbl = "📞", "Phone"
+        elif "domain" in k_l or "website" in k_l:
+            e, lbl = "🌐", "Domain"
+        elif "industry" in k_l:
+            e, lbl = "🏭", "Industry"
+        elif "city" in k_l or "location" in k_l:
+            e, lbl = "📍", "City"
+        elif "amount" in k_l or "revenue" in k_l:
+            e, lbl = "💰", "Amount"
+        elif "stage" in k_l:
+            e, lbl = "📊", "Stage"
+        elif "date" in k_l or "close" in k_l:
+            e, lbl = "📅", (label if label else "Close Date")
+        elif "owner" in k_l:
+            e, lbl = "👤", "Owner"
+        elif "company" in k_l or "account" in k_l:
+            e, lbl = "🏢", "Company"
+        elif "title" in k_l or "job" in k_l:
+            e, lbl = "💼", "Job Title"
+        elif "status" in k_l or "status" in l_l:
+            e, lbl = "🔄", label if label else "Status"
+        elif "deleted" in l_l or "archived" in l_l:
+            e, lbl = "🗑️", label
+        elif "updated" in l_l:
+            e, lbl = "🔄", "Updated"
+        else:
+            e = emoji_map.get(rt, "📌")
+            lbl = label.replace("_", " ").title()
+        return f"*{e} {lbl}:* {val}"
+
+    fields: list[str] = []
+
+    if is_delete:
+        fields.append("*🗑️ Status:* Archived")
+        if rt == "contact":
+            ident_val = _fmt_crud_val("email", data.get("email"))
+            if ident_val:
+                fields.append(_crud_field_mrkdwn("email", "Email", ident_val))
+        elif rt == "company":
+            ident_val = _fmt_crud_val("domain", data.get("domain") or data.get("website"))
+            if ident_val:
+                fields.append(_crud_field_mrkdwn("domain", "Domain", ident_val))
+        elif rt == "deal":
+            ident_val = _fmt_crud_val("amount", data.get("amount"))
+            if ident_val:
+                fields.append(_crud_field_mrkdwn("amount", "Amount", ident_val))
+
+        if len(fields) == 1:
+            fields.append(f"*📅 Archived Date:* {today_date}")
+
+    elif is_update:
+        ch = changes or data.get("changes") or data.get("properties") or {}
+        for k, v in ch.items():
+            f_val = _fmt_crud_val(k, v)
+            if f_val:
+                fields.append(_crud_field_mrkdwn(k, k.replace("_", " ").title(), f_val))
+
+        if len(fields) >= 4:
+            fields = fields[:4]
+        elif len(fields) == 3:
+            fields.append(f"*📅 Updated:* {today_date}")
+        elif len(fields) == 2:
+            pass
+        elif len(fields) == 1:
+            fields.append(f"*📅 Updated:* {today_date}")
+        else:
+            fields = ["*🔄 Status:* Updated", f"*📅 Updated:* {today_date}"]
+
+    else:  # CREATE
+        candidates: list[tuple[str, str, str]] = []
+        if rt == "contact":
+            for k in ("email", "phone", "company", "jobtitle", "hubspot_owner_id", "createdate"):
+                v = data.get(k)
+                fv = _fmt_crud_val(k, v)
+                if fv:
+                    candidates.append((k, k.replace("_", " ").title(), fv))
+        elif rt == "company":
+            for k in ("domain", "industry", "city", "phone", "hubspot_owner_id", "createdate"):
+                v = data.get(k)
+                fv = _fmt_crud_val(k, v)
+                if fv:
+                    candidates.append((k, k.replace("_", " ").title(), fv))
+        elif rt == "deal":
+            for k in ("amount", "dealstage", "closedate", "company", "hubspot_owner_id"):
+                v = data.get(k)
+                fv = _fmt_crud_val(k, v)
+                if fv:
+                    candidates.append((k, k.replace("_", " ").title(), fv))
+
+        for k, lbl, val in candidates:
+            fields.append(_crud_field_mrkdwn(k, lbl, val))
+
+        if len(fields) >= 4:
+            fields = fields[:4]
+        elif len(fields) == 3:
+            fields.append(f"*📅 Created:* {today_date}")
+        elif len(fields) == 2:
+            pass
+        elif len(fields) == 1:
+            fields.append(f"*📅 Created:* {today_date}")
+        else:
+            fields = ["*🔄 Status:* Active", f"*📅 Created:* {today_date}"]
+
+    card_blocks.append({
+        "type": "section",
+        "fields": [{"type": "mrkdwn", "text": f} for f in fields],
+    })
+    return card_blocks
+
+
+def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
+    """Inspect an AgentResponse and render consistent CRUD response card blocks if applicable."""
+    result = response.result or {}
+    title = str(result.get("title") or "")
+    tools_used = response.tools_used or []
+    cards = response.cards or []
+    text = response.text or ""
+
+    is_mutation = bool(
+        result.get("card") is True
+        or result.get("crud_card") is True
+        or result.get("operation") in {"create", "update", "delete", "archive"}
+        or any(
+            t in title
+            for t in (
+                "Company Updated", "Deal Updated", "Contact Updated",
+                "Company Archived", "Deal Archived", "Contact Archived",
+                "Company Deleted", "Deal Deleted", "Contact Deleted",
+                "Company created", "Deal created", "Contact created",
+            )
+        )
+        or any(
+            tool in {
+                "update_contact", "update_company", "update_deal",
+                "delete_contact", "delete_company", "delete_deal",
+            }
+            for tool in tools_used
+        )
+    )
+
+    if not is_mutation:
+        return None
+
+    obj_type = result.get("object_type") or result.get("record_type")
+    if not obj_type:
+        for cand in ("contact", "company", "deal"):
+            if cand in title.casefold():
+                obj_type = cand
+                break
+        if not obj_type and cards:
+            obj_type = cards[0].get("kind")
+        if not obj_type:
+            for tool in tools_used:
+                for cand in ("contact", "company", "deal"):
+                    if cand in tool:
+                        obj_type = cand
+                        break
+        if not obj_type:
+            for cand in ("contact", "company", "deal"):
+                if cand in text.casefold():
+                    obj_type = cand
+                    break
+
+    if not obj_type:
+        return None
+
+    operation = result.get("operation")
+    if not operation:
+        if any(w in title.casefold() for w in ("archive", "delete")) or any("delete_" in t for t in tools_used) or "archived in hubspot" in text.casefold() or "deleted successfully" in text.casefold():
+            operation = "delete"
+        elif "update" in title.casefold() or any("update_" in t for t in tools_used) or "updated successfully" in text.casefold():
+            operation = "update"
+        else:
+            operation = "create"
+
+    record_name = result.get("record_name") or result.get("name")
+    if not record_name and cards:
+        record_name = cards[0].get("name")
+    if not record_name:
+        name_match = re.search(
+            r"(?:Company|Deal|Contact)\s+([A-Za-z0-9._\s-]+?)\s+(?:updated|archived|deleted|created|was created)",
+            text,
+            re.IGNORECASE,
+        )
+        if name_match:
+            record_name = name_match.group(1).strip()
+
+    record_url = result.get("hubspot_url")
+    if not record_url and cards:
+        record_url = cards[0].get("hubspot_url")
+
+    changes = result.get("changes") or result.get("properties")
+    if not changes and operation == "update":
+        changes_match = re.search(r"• Changes:\s*(.*)", text)
+        if changes_match:
+            raw_changes = changes_match.group(1).strip()
+            changes = {}
+            for part in raw_changes.split(","):
+                if ":" in part:
+                    k, _, v = part.partition(":")
+                    changes[k.strip()] = v.strip()
+                elif part.strip():
+                    changes[part.strip()] = "Updated"
+
+    data = dict(result)
+    if cards:
+        data.update(cards[0])
+    if changes and isinstance(changes, dict):
+        data.setdefault("changes", changes)
+
+    card_blocks = render_crud_card(
+        obj_type,
+        operation,
+        data,
+        record_name=record_name,
+        record_url=record_url,
+        changes=changes,
+    )
+
+    clean_summary = re.sub(
+        r"(?im)^\s*•\s*(?:HubSpot|Contact|Company|Deal)\s*ID:\s*`?[0-9a-zA-Z_-]+`?\s*\n?",
+        "",
+        text,
+    ).strip()
+
+
+    blocks: list[Block] = []
+    if clean_summary:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": clean_summary}})
+    blocks.extend(card_blocks)
+
+    if operation != "delete" and record_url:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"<{record_url}|View in HubSpot>"},
+        })
+
+    return blocks
