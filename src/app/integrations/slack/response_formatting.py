@@ -729,6 +729,13 @@ def render_crud_card(
         "type": "section",
         "text": {"type": "mrkdwn", "text": header_text},
     }
+    if valid_url and not is_delete:
+        header_block["accessory"] = {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "View in HubSpot ↗", "emoji": True},
+            "url": valid_url,
+            "action_id": "view_in_hubspot",
+        }
     card_blocks.append(header_block)
 
     def _fmt_crud_val(k: str, v: object) -> str:
@@ -831,9 +838,24 @@ def render_crud_card(
         if rt == "contact":
             for k in ("email", "phone", "company", "jobtitle", "owner", "createdate"):
                 if k == "owner":
-                    v = data.get("owner") or data.get("owner_name") or data.get("owner_id") or data.get("hubspot_owner_id")
+                    v = (
+                        data.get("owner")
+                        or data.get("owner_name")
+                        or data.get("owner_id")
+                        or data.get("hubspot_owner_id")
+                        or (data.get("properties") or {}).get("hubspot_owner_id")
+                    )
+                elif k == "phone":
+                    v = (
+                        data.get("phone")
+                        or data.get("mobilephone")
+                        or data.get("telephone")
+                        or data.get("phone_number")
+                        or (data.get("properties") or {}).get("phone")
+                        or (data.get("properties") or {}).get("mobilephone")
+                    )
                 else:
-                    v = data.get(k)
+                    v = data.get(k) or (data.get("properties") or {}).get(k)
                 fv = _fmt_crud_val(k, v)
                 if fv:
                     candidates.append((k, k.replace("_", " ").title(), fv))
@@ -868,13 +890,6 @@ def render_crud_card(
         "type": "section",
         "fields": [{"type": "mrkdwn", "text": f} for f in fields],
     }
-    if valid_url and not is_delete:
-        fields_block["accessory"] = {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "View in HubSpot ↗", "emoji": True},
-            "url": valid_url,
-            "action_id": "view_in_hubspot",
-        }
     card_blocks.append(fields_block)
     return card_blocks
 
@@ -983,6 +998,42 @@ def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
     if changes and isinstance(changes, dict):
         data.setdefault("changes", changes)
 
+    # Ensure phone property is retrieved for contacts from properties, text, or recent cache
+    if obj_type == "contact" and not data.get("phone"):
+        props = result.get("properties") or {}
+        if isinstance(props, dict):
+            for pk in ("phone", "mobilephone", "telephone", "phone_number"):
+                if props.get(pk):
+                    data["phone"] = str(props[pk])
+                    break
+    if obj_type == "contact" and not data.get("phone"):
+        phone_match = re.search(
+            r"\b(?:phone|mobile|tel|cell)(?:\s*(?:number|#))?[:\s]+([+0-9()\-.\s]{7,25})",
+            text,
+            re.IGNORECASE,
+        )
+        if phone_match:
+            data["phone"] = phone_match.group(1).strip()
+    if obj_type == "contact" and not data.get("phone"):
+        try:
+            from app.agent.service import AccountIntelligenceAgent
+
+            recent_contacts = getattr(AccountIntelligenceAgent, "_shared_recent_contacts", {})
+            for info in recent_contacts.values():
+                if info.get("id") == result.get("contact_id") or (
+                    result.get("name") and info.get("name") == result.get("name")
+                ):
+                    r_props = info.get("properties") or {}
+                    if isinstance(r_props, dict):
+                        for pk in ("phone", "mobilephone", "telephone", "phone_number"):
+                            if r_props.get(pk):
+                                data["phone"] = str(r_props[pk])
+                                break
+                if data.get("phone"):
+                    break
+        except Exception:
+            pass
+
     card_blocks = render_crud_card(
         obj_type,
         operation,
@@ -998,23 +1049,8 @@ def render_crud_response_card(response: AgentResponse) -> list[Block] | None:
         text,
     ).strip()
 
-
     blocks: list[Block] = []
     if clean_summary:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": clean_summary}})
     blocks.extend(card_blocks)
-
-    owner_name = result.get("owner_name")
-    if isinstance(owner_name, str) and owner_name and owner_name != "Unassigned":
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "👤 Owner: " + html.escape(owner_name, quote=False)}],
-        })
-
-    if operation != "delete" and record_url:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"<{record_url}|View in HubSpot>"},
-        })
-
     return blocks
